@@ -1,0 +1,9 @@
+extends: "configs/base_model.yaml"
+
+experiment:
+  name: "latent_grpo_uncertainty"
+  state_mode: "latent"
+
+uncertainty_bonus:
+  enabled: true
+  # TODO: Set final beta schedule.

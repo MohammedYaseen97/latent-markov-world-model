@@ -1,0 +1,19 @@
+extends: "configs/final_parity/base_parity.yaml"
+
+experiment:
+  arm: "token_markov_grpo"
+  description: "Yuan-style token-space Markov state arm."
+
+method:
+  state_mode: "token_markov"
+  token_markov:
+    enabled: true
+    # TODO(parity-freeze): finalize architecture to match Yuan intent.
+    predictor_type: null
+    predictor_hidden_dims: null
+    transition_context_window: null
+    predictor_checkpoint: null
+  latent_state:
+    enabled: false
+  uncertainty_bonus:
+    enabled: false

@@ -1,0 +1,14 @@
+extends: "configs/final_parity/base_parity.yaml"
+
+experiment:
+  arm: "baseline_grpo"
+  description: "History-as-state GRPO baseline."
+
+method:
+  state_mode: "history_as_state"
+  token_markov:
+    enabled: false
+  latent_state:
+    enabled: false
+  uncertainty_bonus:
+    enabled: false

@@ -1,0 +1,9 @@
+evaluation:
+  benchmark: "MATH-Beyond"
+  primary_claim_set: "ceiling_41"
+  primary_claim_path: "data/math_beyond_ceiling_41.jsonl"
+  optional_full_set_path: "data/math_beyond_full_181.jsonl"
+  metrics: ["pass@1", "pass@16", "pass@1024"]
+  # For this project, pass@1024 on the 41-problem ceiling set is mandatory.
+  claim_metric: "pass@1024"
+  # TODO: Finalize decode/eval settings for parity runs.

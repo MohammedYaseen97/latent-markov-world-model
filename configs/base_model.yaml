@@ -1,0 +1,6 @@
+model:
+  name: "Qwen2.5-1.5B"
+  tokenizer_name: "Qwen2.5-1.5B"
+  dtype: "bfloat16"
+
+# TODO: Finalize model loading and precision strategy.

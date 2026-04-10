@@ -1,0 +1,25 @@
+extends: "configs/final_parity/base_parity.yaml"
+
+experiment:
+  arm: "latent_grpo_uncertainty"
+  description: "VAE latent state conditioning with KL-based intrinsic uncertainty bonus."
+
+method:
+  state_mode: "latent"
+  token_markov:
+    enabled: false
+  latent_state:
+    enabled: true
+    encoder_type: "mlp"
+    # TODO(parity-freeze): keep same latent settings as train_latent_grpo.yaml.
+    latent_dim: null
+    pooling_last_n_tokens: null
+    offline_pretrain_enabled: true
+    freeze_vae_during_rl: null
+  uncertainty_bonus:
+    enabled: true
+    formula: "r_total = r_task + beta_t * KL(q(z|tau)||p(z))"
+    # TODO(parity-freeze): set beta schedule values once and keep fixed.
+    beta_schedule: null
+    beta_start: null
+    beta_end: null

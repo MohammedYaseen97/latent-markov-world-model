@@ -1,0 +1,9 @@
+extends: "configs/base_model.yaml"
+
+experiment:
+  name: "baseline_grpo"
+  state_mode: "history_as_state"
+
+training:
+  # TODO: Wire to training loop defaults.
+  seed: 11

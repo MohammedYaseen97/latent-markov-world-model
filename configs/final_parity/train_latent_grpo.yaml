@@ -1,0 +1,20 @@
+extends: "configs/final_parity/base_parity.yaml"
+
+experiment:
+  arm: "latent_grpo"
+  description: "VAE latent state conditioning without intrinsic uncertainty bonus."
+
+method:
+  state_mode: "latent"
+  token_markov:
+    enabled: false
+  latent_state:
+    enabled: true
+    # TODO(parity-freeze): lock latent encoder settings from brief-aligned implementation.
+    encoder_type: "mlp"
+    latent_dim: null
+    pooling_last_n_tokens: null
+    offline_pretrain_enabled: true
+    freeze_vae_during_rl: null
+  uncertainty_bonus:
+    enabled: false

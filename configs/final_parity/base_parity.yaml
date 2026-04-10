@@ -1,0 +1,60 @@
+# Final parity base config shared across all core arms.
+# Source-of-truth reference: reports/yuan_parity_spec.md
+# Do not change per-arm unless the field is explicitly method-specific.
+
+project:
+  name: "latent-markov-world-model"
+  phase: "final_parity"
+  primary_metric: "pass@1024"
+  mandatory_metrics: ["pass@1", "pass@16", "pass@1024"]
+
+model:
+  family: "Qwen2.5-1.5B"
+  # Fallback allowed only on explicit blocker and parity-note update.
+  fallback_family: "DeepSeek-R1-Distill-1.5B"
+
+framework:
+  rl_library: "trl"
+  algorithm: "grpo"
+  # Yuan paper stack reference (informative): rLLM + VERL
+  yuan_reference_stack: "rLLM+VERL"
+
+data:
+  benchmark: "MATH-Beyond"
+  benchmark_pool_path: "data/math_beyond_ceiling_41.jsonl"
+  optional_full_pool_path: "data/math_beyond_full_181.jsonl"
+  # Keep benchmark pool and evaluation protocol identical across all 4 arms.
+  split_id: "math_beyond_ceiling_41_v1"
+
+training:
+  # Yuan-derived defaults (from appendix details)
+  learning_rate: 1.0e-6
+  kl_coef: 0.001
+  batch_size: 128
+  mini_batch_size: 128
+  group_size: 8
+
+  # Project-controlled values to be frozen before final runs.
+  # TODO(parity-freeze): set equal values for all arms.
+  max_steps: null
+  max_seq_len: null
+  grad_accum_steps: null
+  num_epochs: null
+  seed: null
+
+evaluation:
+  # Yuan reports temperature 1.0; keep parity across all arms.
+  temperature: 1.0
+  ks: [1, 16, 1024]
+  # TODO(parity-freeze): fill decode settings once and inherit for all arms.
+  top_p: null
+  max_new_tokens: null
+  num_samples_per_prompt:
+    "1": 1
+    "16": 16
+    "1024": 1024
+
+parity_controls:
+  require_shared_knobs_equal_across_arms: true
+  require_pass_at_1024_for_all_arms: true
+  require_artifact_backed_table: true

@@ -1,0 +1,42 @@
+# Reproducibility tolerance policy referenced by PROJECT_CONTRACT.md (Phase 1 gate).
+# This file defines acceptable run-to-run metric drift under same config/seed conditions.
+
+reproducibility:
+  policy_version: "v1"
+  applies_to:
+    - baseline_grpo
+    - token_markov_grpo
+    - latent_grpo
+    - latent_grpo_uncertainty
+
+  protocol:
+    # Same-seed rerun means: same code commit, same config, same data split,
+    # same hardware class, same precision mode, same decoding settings.
+    same_seed_required: true
+    same_config_required: true
+    same_split_required: true
+    same_decode_settings_required: true
+
+  # Absolute tolerance thresholds for SAME-SEED reruns.
+  # pass@1024 is the primary claim metric, so it gets the strictest threshold.
+  absolute_metric_tolerance:
+    pass@1: 0.020
+    pass@16: 0.015
+    pass@1024: 0.010
+
+  # If metrics are reported in percentage points (0-100 scale), use these.
+  # Example: 0.010 probability == 1.0 percentage point.
+  absolute_tolerance_percentage_points:
+    pass@1: 2.0
+    pass@16: 1.5
+    pass@1024: 1.0
+
+  failure_policy:
+    on_violation:
+      - "Mark run as non-reproducible."
+      - "Repeat run once to rule out transient system noise."
+      - "If still failing, block phase advancement and open reproducibility incident note in reports/repro_incidents.md."
+
+  notes:
+    - "These tolerances are for phase gating, not for confidence-interval reporting."
+    - "Cross-seed variance is evaluated separately in final analysis."
