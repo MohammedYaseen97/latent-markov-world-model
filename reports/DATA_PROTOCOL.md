@@ -44,10 +44,7 @@ Use this for sensitivity analysis, not as the main claim unless explicitly justi
 | **Yuan & Xie (2026)** — Markov states | Logic environments (e.g. Sudoku, Sokoban, Futoshiki in their paper) |
 | **Mayilvahanan et al. — MATH-Beyond** | High-school competition **math** (Hub: `brendel-group/MATH-Beyond`) |
 
-We do **not** claim “we replicate Yuan’s reported accuracies on MATH-B” unless we explicitly run their stack on MATH-B and say so.
-
-- **Yuan parity** in this repo = faithful **token-space Markov + GRPO-style** comparator and matched **shared** hyperparameters where applicable (`YUAN_PARITY_CHECKLIST.md`, `reports/yuan_parity_spec.md`).
-- **MATH-B** = **independent** benchmark for the latent-state / capability-ceiling hypothesis (`PROJECT_BRIEF.md`).
+**Yuan** ran logic puzzles; **we** evaluate on MATH-B. Their work motivates a **token-Markov comparator arm**, not a replication. Fairness across the four arms is in **`PROJECT_CONTRACT.md`**.
 
 ## How to regenerate
 

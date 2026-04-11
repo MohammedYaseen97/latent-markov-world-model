@@ -8,7 +8,7 @@ method:
   state_mode: "token_markov"
   token_markov:
     enabled: true
-    # TODO(parity-freeze): finalize architecture to match Yuan intent.
+    # TODO(config-freeze): finalize architecture (Yuan-inspired, not replication).
     predictor_type: null
     predictor_hidden_dims: null
     transition_context_window: null

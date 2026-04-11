@@ -11,7 +11,7 @@ method:
   latent_state:
     enabled: true
     encoder_type: "mlp"
-    # TODO(parity-freeze): keep same latent settings as train_latent_grpo.yaml.
+    # TODO(config-freeze): keep same latent settings as train_latent_grpo.yaml.
     latent_dim: null
     pooling_last_n_tokens: null
     offline_pretrain_enabled: true
@@ -19,7 +19,7 @@ method:
   uncertainty_bonus:
     enabled: true
     formula: "r_total = r_task + beta_t * KL(q(z|tau)||p(z))"
-    # TODO(parity-freeze): set beta schedule values once and keep fixed.
+    # TODO(config-freeze): set beta schedule values once and keep fixed.
     beta_schedule: null
     beta_start: null
     beta_end: null

@@ -10,7 +10,7 @@ method:
     enabled: false
   latent_state:
     enabled: true
-    # TODO(parity-freeze): lock latent encoder settings from brief-aligned implementation.
+    # TODO(config-freeze): lock latent encoder settings from brief-aligned implementation.
     encoder_type: "mlp"
     latent_dim: null
     pooling_last_n_tokens: null

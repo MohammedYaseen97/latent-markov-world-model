@@ -8,7 +8,9 @@ Use this section to park out-of-scope ideas without expanding current project sc
 
 ## Main results
 
-TODO: Populate after Phase 4 ablation generation.
+TODO: Populate after core table (`run_ablation_table.py`).
+
+**Claim shape (pick honestly):** latent beats **both** baselines on `pass@1024` · beats history only · ties / null — each is publishable if methods and budgets are fair (`PROJECT_CONTRACT.md`).
 
 ## Limitations
 

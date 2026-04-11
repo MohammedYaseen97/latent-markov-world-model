@@ -7,4 +7,4 @@ evaluation:
   metrics: ["pass@1", "pass@16", "pass@1024"]
   # Mandatory claim metric: pass@1024 on primary_claim_path (MATH-B-I base pool; N from manifest).
   claim_metric: "pass@1024"
-  # TODO: Finalize decode/eval settings for parity runs.
+  # TODO: Finalize decode/eval settings (match configs/final_parity/ for final runs).

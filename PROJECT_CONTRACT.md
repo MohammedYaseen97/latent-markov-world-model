@@ -1,258 +1,114 @@
-# Project Contract: Phase-Gated Implementational Deliverables (Brief-Aligned)
+# Project Contract
 
-This document is the execution contract.  
-`PROJECT_BRIEF.md` is the single source of truth for project vision and implementation intent.  
-Timeline is phase-gated, not calendar-gated: do not enter the next phase until current phase criteria pass.
-`PROJECT_SCOPE_RUBRIC_CHECKLIST.md` and `YUAN_PARITY_CHECKLIST.md` are enforcement checklists for this contract.
-
-## Document Authority Model (Single-Edit Policy)
-
-Edit exactly one owner document per change type:
-
-- Research vision, hypothesis, scientific narrative -> `PROJECT_BRIEF.md`
-- Execution phases, required implementation tasks, phase pass/fail gates -> `PROJECT_CONTRACT.md`
-- Yuan parity requirements and claim-eligibility gate -> `YUAN_PARITY_CHECKLIST.md`
-- Grading rubric and project completion checklist -> `PROJECT_SCOPE_RUBRIC_CHECKLIST.md`
-- MATH-B JSONL construction and benchmark definitions -> `reports/DATA_PROTOCOL.md`
-- Future-work / results / paper scratch placeholders -> `reports/writeup_stubs.md`
-
-Non-owner documents must reference owner documents and must not restate policy text unless required for local clarity.
-
-## Locked Scope (Non-Negotiable)
-
-- Base model family: `Qwen2.5-1.5B` track (primary) with `trl` + `GRPO`.
-- Allowed fallback (only on explicit blocker): `DeepSeek-R1-Distill-1.5B`, documented in parity and final report.
-- Primary benchmark: `MATH-Beyond` **MATH-B-I base** pool (definition and row count: `reports/DATA_PROTOCOL.md`, paths: `configs/eval_math_beyond.yaml`).
-- Mandatory experiment matrix (exactly 4 arms for core table):
-  1. `baseline_grpo` (history-as-state)
-  2. `token_markov_grpo` (Yuan-style token-space Markov state baseline)
-  3. `latent_grpo` (VAE latent state, no uncertainty bonus)
-  4. `latent_grpo_uncertainty` (VAE latent + uncertainty bonus)
-- Core claim metric: `pass@1024` (must be reported for all 4 arms).
-- Secondary metrics allowed: `pass@1`, `pass@16`, sample efficiency curves.
-- No diffusion, no persona-conditioning, no extra model families in this project phase.
+Phases, gates, and what to ship. **Vision / hypothesis / VAE design:** `PROJECT_BRIEF.md`. **How MATH-B JSONLs are built:** `reports/DATA_PROTOCOL.md`.
 
 ---
 
-## Parameter Parity Rule (Yuan-Equivalent Finals)
+## Who owns which doc
 
-Final comparison runs must use Yuan-equivalent settings wherever applicable.
-
-- For `token_markov_grpo`, use Yuan paper setup as faithfully as possible.
-- For `baseline_grpo`, keep all shared knobs identical to `token_markov_grpo`.
-- For latent methods, keep all shared training/eval knobs identical; only add latent-specific components.
-
-Required before any final run:
-
-- [x] Create `reports/yuan_parity_spec.md` listing:
-  - [x] every reproduced parameter from Yuan,
-  - [x] every parameter not specified by Yuan and chosen by us,
-  - [x] rationale for each unavoidable deviation.
-- [x] Create `configs/final_parity/` config files for all 4 arms derived from the same parity base.
-- [x] Create `configs/repro_tolerance.yaml` for reproducibility gate thresholds.
-
-No final results are valid without this parity spec.
+| Topic | File |
+|--------|------|
+| Why, narrative, stack sketch, risks | `PROJECT_BRIEF.md` |
+| Phases, repo layout, checklist, Yuan reference | this file |
+| Benchmark files, Hub pin, manifest | `reports/DATA_PROTOCOL.md` |
+| Future ideas / draft results | `reports/writeup_stubs.md` |
 
 ---
 
-## Repository Deliverables You Must Implement
+## Locked scope
 
-Required top-level paths:
+- **Model:** `Qwen2.5-1.5B` + `trl` + `GRPO`. Fallback only if blocked: `DeepSeek-R1-Distill-1.5B` (note in run log or brief appendix).
+- **Benchmark:** MATH-Beyond **MATH-B-I base** pool — definition and row count in `reports/DATA_PROTOCOL.md`, paths in `configs/eval_math_beyond.yaml` / `configs/final_parity/base_parity.yaml`.
+- **Four arms (core table):**  
+  1. `baseline_grpo` — history-as-state  
+  2. `token_markov_grpo` — Yuan-**inspired** token-space Markov comparator (not replication)  
+  3. `latent_grpo` — VAE latent, no uncertainty bonus  
+  4. `latent_grpo_uncertainty` — latent + KL bonus  
+- **Metrics:** report **`pass@1024` for all arms** (primary); also `pass@1`, `pass@16`.
+- **Out of scope for this phase:** second model family, second RL algo, diffusion/persona branches, extra benchmarks before the core table.
 
-- `configs/`
-- `data/`
-- `scripts/`
-- `src/`
-- `src/models/`
-- `src/training/`
-- `src/eval/`
-- `src/utils/`
-- `artifacts/`
-- `reports/`
-- `README.md`
+**Fair comparison:** same data, eval protocol, budgets, and shared hyperparameters across arms unless the field is explicitly method-specific (Markov module, VAE, uncertainty). Yuan’s paper motivates the token-Markov **idea**; we do **not** match their puzzle benchmark or treat their numbers as success criteria.
 
-Required config files:
+**Yuan (informative only):** KL coef ~0.001, RL LR ~1e-6, batch / mini-batch ~128, group size 8, decode temp 1.0; they use rLLM+VERL and Pass@128 on logic tasks. We use **MATH-B** and **pass@1024**. Deviations are fine; document anything large.
 
-- `configs/base_model.yaml`
-- `configs/train_baseline_grpo.yaml`
-- `configs/train_token_markov_grpo.yaml`
-- `configs/train_latent_grpo.yaml`
-- `configs/train_latent_grpo_uncertainty.yaml`
-- `configs/eval_math_beyond.yaml`
-
-Required script entrypoints:
-
-- `scripts/prepare_data.py`
-- `scripts/train_baseline.py`
-- `scripts/train_token_markov.py`
-- `scripts/train_latent.py`
-- `scripts/eval_passk.py`
-- `scripts/run_ablation_table.py`
-
-Required core modules:
-
-- `src/models/token_markov_state.py`
-- `src/models/vae_state_encoder.py`
-- `src/training/grpo_baseline.py`
-- `src/training/grpo_token_markov.py`
-- `src/training/grpo_latent.py`
-- `src/training/reward_bonus.py`
-- `src/eval/metrics.py`
-- `src/utils/logging.py`
-- `src/utils/seeding.py`
+**Frozen run configs:** `configs/final_parity/` (folder name is legacy) + `configs/repro_tolerance.yaml` for same-seed tolerance.
 
 ---
 
-## Phase 1: Baseline + Data + Evaluation Foundation
+## Checklist: trust the 4-arm result
 
-### Implementational Deliverables
+Before treating the core table as final:
 
-1. Dependency environment locked (`requirements.txt` or `pyproject.toml`).
-2. `scripts/prepare_data.py` prepares benchmark artifacts for `MATH-Beyond` per `reports/DATA_PROTOCOL.md`:
-   - `data/math_beyond_math_b_i_base.jsonl` (primary claim set, MATH-B-I base gauntlet),
-   - `data/math_beyond_hf_strict_all_models.jsonl` (secondary strict intersection),
-   - `data/math_beyond_full_181.jsonl` (full `test` split),
-   - `data/benchmark_manifest.json` (revision, counts, SHA-256).
-3. `scripts/train_baseline.py` runs end-to-end:
-   - local smoke profile (RTX 4060),
-   - full profile (A100).
-4. `scripts/eval_passk.py` supports `k in {1, 16, 1024}` and outputs all three.
-5. Baseline artifacts are written to:
-   - `artifacts/baseline_grpo/{run_id}/`
+- [x] **Data:** `DATA_PROTOCOL` + `prepare_data.py` + `benchmark_manifest.json` + config paths aligned.
+- [ ] **Token-Markov:** real predictor in GRPO, not a toy; isolated code path (`train_token_markov.py`, `token_markov_state.py`, `grpo_token_markov.py`).
+- [ ] **Fairness:** same base model, MATH-B pool, reward, train/eval budgets, max length, decode settings across arms (unless documented method-specific).
+- [ ] **Metrics:** `pass@1024` all arms; table from `run_ablation_table.py` artifacts, not hand-typed.
+- [ ] **Repro:** seeds + tolerances in `repro_tolerance.yaml`; checkpoints/logs kept.
 
-**Phase 1 — data track:** Item (2) above is **complete** (protocol, `prepare_data.py`, pins, manifest, config path alignment). Phase 1 **overall** still requires items (1), (3)–(5) and the success criteria below.
-
-### Phase 1 Success Criteria (Pass/Fail)
-
-Pass only if all are true:
-
-- Full A100 baseline run completes without training instability.
-- Eval outputs valid `pass@1`, `pass@16`, `pass@1024`.
-- Re-run at same seed is reproducible within a pre-defined tolerance recorded in `configs/repro_tolerance.yaml` (to be mirrored into `reports/yuan_parity_spec.md` in Phase 2).
-- README commands for baseline train/eval run unedited.
-
-If any fails, Phase 2 is blocked.
+**Out of scope:** replicating Yuan’s ablations, matching every Yuan hyperparameter, extra benchmarks before the matrix is done. Park ideas in `reports/writeup_stubs.md`.
 
 ---
 
-## Phase 2: Yuan-Style Token Markov Arm (Mandatory, Full Strength)
+## Phase 1: Baseline + data + eval
 
-### Implementational Deliverables
+**Deliverables:** (1) deps pinned (`requirements.txt`), (2) `prepare_data.py` outputs per `DATA_PROTOCOL`, (3) `train_baseline.py` smoke + A100, (4) `eval_passk.py` for k ∈ {1,16,1024}, (5) artifacts under `artifacts/baseline_grpo/{run_id}/`.
 
-1. `src/models/token_markov_state.py` implements token-space Markov state predictor arm aligned to Yuan method.
-2. `scripts/train_token_markov.py` trains `token_markov_grpo` end-to-end on A100.
-3. `src/training/grpo_token_markov.py` integrates state predictor into GRPO loop with full logging.
-4. Parity package completed:
-   - `reports/yuan_parity_spec.md`
-   - `configs/final_parity/train_token_markov_grpo.yaml`
-   - `configs/final_parity/train_baseline_grpo.yaml`
+*Data track (2) is done; rest of Phase 1 is not.*
 
-### Phase 2 Success Criteria (Pass/Fail)
-
-Pass only if all are true:
-
-- Token Markov arm completes full training/eval cycle.
-- Token Markov and baseline are parity-matched per parity spec.
-- `pass@1024` is produced for both baseline and token Markov arms.
-- Any deviations from Yuan are explicitly documented and justified.
-
-If any fails, Phase 3 is blocked.
+**Pass:** stable A100 baseline; valid pass@ metrics; same-seed rerun within `repro_tolerance.yaml`; README has train/eval commands.
 
 ---
 
-## Phase 3: VAE Latent Arm + Uncertainty Arm
+## Phase 2: Token-Markov arm
 
-### Implementational Deliverables
+**Deliverables:** `token_markov_state.py`, `train_token_markov.py`, `grpo_token_markov.py`, plus `configs/final_parity/train_*` for baseline + token-Markov.
 
-1. `src/models/vae_state_encoder.py` implemented per brief:
-   - trajectory hidden states input,
-   - latent outputs (`mu`, `logvar`, `z`),
-   - ELBO training objective.
-2. `src/training/grpo_latent.py` supports:
-   - `latent_grpo`,
-   - `latent_grpo_uncertainty`.
-3. `src/training/reward_bonus.py` adds intrinsic bonus:
-   - `r_total = r_task + beta_t * KL(q(z|tau) || p(z))`
-4. Final parity configs added:
-   - `configs/final_parity/train_latent_grpo.yaml`
-   - `configs/final_parity/train_latent_grpo_uncertainty.yaml`
-
-### Phase 3 Success Criteria (Pass/Fail)
-
-Pass only if all are true:
-
-- Both latent arms complete full training/eval cycles.
-- No NaN/Inf failures in latent pipeline.
-- `pass@1024` is produced for all 4 arms.
-- Shared knobs are parity-matched across all arms except method-specific components.
-
-If any fails, Phase 4 is blocked.
+**Pass:** full train+eval; shared substrate with baseline; `pass@1024` for baseline and token-Markov; implementation choices noted (no obligation to match Yuan puzzles).
 
 ---
 
-## Phase 4: Core Ablation Table + Publishable Artifacts
+## Phase 3: Latent + uncertainty
 
-### Implementational Deliverables
+**Deliverables:** `vae_state_encoder.py`, `grpo_latent.py` (both modes), `reward_bonus.py`, final parity YAMLs for both latent arms.
 
-1. `scripts/run_ablation_table.py` generates:
-   - `reports/ablation_core.csv`
-   - `reports/ablation_core.md`
-2. Core ablation table includes exactly 4 arms:
-   - baseline,
-   - token Markov (Yuan-style),
-   - latent,
-   - latent + uncertainty.
-3. Reported metrics include mandatory `pass@1024` and secondary `pass@1`, `pass@16`.
-4. Final reproducibility package:
-   - exact commands,
-   - configs,
-   - seeds,
-   - artifact paths.
-
-### Phase 4 Success Criteria (Pass/Fail)
-
-Pass only if all are true:
-
-- Ablation is generated from artifacts (not manual entry).
-- `pass@1024` comparison exists for all 4 arms.
-- `YUAN_PARITY_CHECKLIST.md` Section A is fully checked.
-- At least one outcome is established clearly:
-  - positive: latent method beats strong baselines, or
-  - negative: no gain, with rigorous diagnosis and evidence.
-
-If any fails, final delivery is blocked.
+**Pass:** both arms complete; no NaN blowups; `pass@1024` for **all four** arms; shared knobs match except method-specific parts.
 
 ---
 
-## Final Deliverables (Exactly per Brief)
+## Phase 4: Table + ship
 
-By project completion, deliver all of the following:
+**Deliverables:** `run_ablation_table.py` → `reports/ablation_core.csv` / `.md`; commands, configs, seeds, artifact paths documented.
 
-1. Public GitHub repository (clean, reproducible, documented).
-2. arXiv-style preprint (6-8 pages, citable formatting).
-3. Blog post version (shorter, visual, shareable).
-4. Core result table showing whether latent methods solve what GRPO baseline cannot, with full ablations.
-5. Bonus if time: latent space visualization with interpretable structure.
+**Pass:** table from artifacts; `pass@1024` for all four arms; checklist above complete; clear positive **or** negative outcome with evidence.
+
+**Also per brief:** public repo, short paper, blog post; bonus: latent viz.
 
 ---
 
-## Timeline Policy (Phase-Based)
+## Repository layout (must exist)
 
-- There are no fixed week deadlines in this contract.
-- Progress is governed strictly by phase gates.
-- You do not move forward until current phase criteria pass.
+**Configs:** `base_model.yaml`, `train_*_grpo.yaml` (4 arms), `eval_math_beyond.yaml`, `configs/final_parity/*`, `repro_tolerance.yaml`.
+
+**Scripts:** `prepare_data.py`, `train_baseline.py`, `train_token_markov.py`, `train_latent.py`, `eval_passk.py`, `run_ablation_table.py`.
+
+**Packages:** `src/models/{token_markov_state,vae_state_encoder}.py`, `src/training/{grpo_baseline,grpo_token_markov,grpo_latent,reward_bonus}.py`, `src/eval/metrics.py`, `src/utils/{logging,seeding}.py`.
+
+**Dirs:** `configs/`, `data/`, `scripts/`, `src/`, `artifacts/`, `reports/`.
 
 ---
 
-## Hard Scope Guardrails
+## Rubric (optional, mentor-style)
 
-Do NOT do any of the following in this phase:
+Roughly: framing (15) · baselines + token-Markov (25) · VAE correctness (20) · rigor / matched budgets (20) · honest interpretation (10) · reproducibility (10). Target ≥ 80 for “publishable shape.”
 
-- No second base model family.
-- No second RL algorithm.
-- No diffusion replacement.
-- No persona-conditioning branch.
-- No benchmark expansion before all 4-arm core results are complete.
-- No extra ablations outside the mandatory matrix until final deliverables are done.
+---
 
-If tempted to add scope, park it under **Future work** in `reports/writeup_stubs.md` and continue the current phase.
+## Scope guardrails
+
+No extra model families, algorithms, or benchmark expansion until the core four-arm table is done. Extra ideas → `reports/writeup_stubs.md` (**Future work**).
+
+---
+
+## Timeline
+
+Phase-gated only — no calendar obligation. A loose week sketch lives in `PROJECT_BRIEF.md`; **this file wins** if they disagree.

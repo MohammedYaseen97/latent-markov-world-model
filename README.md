@@ -1,7 +1,7 @@
 # Latent Markov World Model
 
-Repository scaffold for the phase-gated project defined in `PROJECT_CONTRACT.md`.
+Learned latent state vs GRPO baselines on **MATH-Beyond** (MATH-B-I pool). **Start here:** `PROJECT_BRIEF.md` (why / design) → `PROJECT_CONTRACT.md` (four arms, phases, checklist) → `reports/DATA_PROTOCOL.md` (benchmark files).
 
 ## Status
 
-Scaffolding only. Core implementations are intentionally left as TODO stubs.
+Scaffolding only; training/eval scripts are still TODO stubs.

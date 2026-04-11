@@ -5,5 +5,5 @@ experiment:
   state_mode: "token_markov"
 
 training:
-  # TODO: Fill Yuan-parity training settings.
+  # TODO: Align with configs/final_parity/base_parity.yaml + PROJECT_CONTRACT.md (Yuan = hints).
   seed: 11

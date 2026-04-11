@@ -1,8 +1,14 @@
-Here it is.
-
----
-
 # Project Brief: Latent World Models for RL Post-Training
+
+## Experiment at a glance
+
+| | |
+|---|---|
+| **Question** | Does a **learned latent state** (VAE on trajectories, optional uncertainty bonus) beat **history-as-state GRPO** and a **Yuan-style token-Markov** comparator on hard math? |
+| **Benchmark** | MATH-Beyond **MATH-B-I base** pool (pinned Hub row; see `reports/DATA_PROTOCOL.md`) |
+| **Arms** | (1) baseline GRPO (2) token-Markov GRPO (3) latent GRPO (4) latent + uncertainty |
+| **Headline metric** | `pass@1024` on all arms; also `pass@1`, `pass@16` |
+| **Gates** | Phase order and checklist → **`PROJECT_CONTRACT.md`** (authoritative) |
 
 ---
 
@@ -17,6 +23,18 @@ Recent work (Yuan et al., March 2026) confirmed this formally and showed that in
 That's still not first principles. A token-space state summarizer is constructed, not learned. It doesn't discover the structure of the solution space — it compresses language about it. And it has no uncertainty signal.
 
 **The question this project asks: what if the state was learned end-to-end from reasoning trajectories — a compressed latent belief over solution-space position, discovered from data, with uncertainty built in?**
+
+---
+
+## North star: abstract problems as mazes (keep for the postmortem)
+
+Humans rarely treat a hard problem as an unstructured string of words. We **impose structure**: intermediate states, legal moves, constraints, and a sense of **where we are** versus **where we want to be** — like **navigating a maze** whose walls are implied by the problem itself, toward an exit that satisfies the task.
+
+A useful picture for this agenda: **turn the abstract problem into an implicit “maze”** (a structured space of conceptual steps) that an agent can **navigate** toward a **correct, constraint-respecting** outcome, with **calibrated confidence** when the path is clear.
+
+**What this repo actually tests (narrow slice):** we do **not** hand-draw that maze or parse the prompt into an explicit graph. We ask whether a **learned latent** over trajectories can serve as **coordinates in that implicit space** — a Markov-friendly summary of progress — and whether **uncertainty in that latent** behaves like **“I don’t know which corridor is right yet.”** GRPO is the engine that **searches paths**; the latent is the bet on **learned navigation coordinates** instead of raw history or a fixed token-Markov summary.
+
+**When you finish:** read this section again. Ask whether the results **support, weaken, or leave open** this picture (e.g. latent geometry, uncertainty behavior, wins vs baselines on hard items) — not only whether a number went up.
 
 ---
 
@@ -68,9 +86,9 @@ Three things that make this new together:
 ## What Success Looks Like
 
 **Minimum viable result (must have):**
-- Standard GRPO baseline hits a measurable pass@k ceiling on your benchmark
-- Your latent-state model solves at least some problems the baseline cannot at equivalent compute
-- Clean ablation: history-as-state vs learned latent state, with and without uncertainty bonus
+- All four arms trained and evaluated; **`pass@1024`** reported for each (plus `pass@1` / `pass@16`)
+- Latent arm(s) beat **history baseline** and you characterize vs **token-Markov** (win, tie, or loss — honest)
+- Same benchmark and matched budgets/decoding across arms (per `PROJECT_CONTRACT.md`)
 
 **Strong result (target):**
 - Latent variance correlates meaningfully with problem difficulty — interpretability win
@@ -123,6 +141,8 @@ Three things that make this new together:
 
 ## 4-Week Execution Plan
 
+**Authoritative implementation order** is **phase-gated** in `PROJECT_CONTRACT.md` (baseline + data + eval → token-Markov → latent arms → core table). The weeks below are **pacing hints** only.
+
 **Week 1 — Baseline + VAE prototype**
 - Days 1-2: Set up training environment. Get GRPO running on Qwen2.5-1.5B with TRL. Verify training is stable.
 - Days 3-4: Establish baseline. Run standard GRPO on MATH-Beyond or logic puzzle suite. Measure pass@k ceiling. This is your ground truth.
@@ -135,7 +155,7 @@ Three things that make this new together:
 **Week 3 — Results + ablations**
 - Days 15-17: Full training run with latent state, no uncertainty bonus. Measure pass@k on benchmark. Compare to baseline.
 - Days 18-19: Add uncertainty bonus. Retrain. Measure delta.
-- Days 20-21: Ablation table: (1) GRPO baseline, (2) token-space Markov state (replicate Yuan et al. minimally), (3) VAE latent state, (4) VAE latent state + uncertainty bonus. This is your core result table.
+- Days 20-21: Ablation table: (1) GRPO baseline, (2) Yuan-style token-Markov comparator, (3) VAE latent state, (4) VAE latent state + uncertainty bonus. This is your core result table.
 
 **Week 4 — Writeup + polish**
 - Days 22-24: arXiv-style writeup. 6-8 pages. Introduction, related work, method, experiments, discussion. Don't submit yet — get it clean.
