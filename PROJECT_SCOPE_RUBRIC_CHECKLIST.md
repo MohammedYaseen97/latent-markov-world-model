@@ -7,6 +7,7 @@ Authority references:
 - Vision and scientific scope: `PROJECT_BRIEF.md`
 - Execution phases and implementation gates: `PROJECT_CONTRACT.md`
 - Yuan parity and claim eligibility: `YUAN_PARITY_CHECKLIST.md`
+- MATH-B benchmark construction: `reports/DATA_PROTOCOL.md`
 
 Do not duplicate or edit scope/policy text here; edit the owner document instead.
 
@@ -41,6 +42,8 @@ Publishable target: >= 80.
 - [x] Pre-implementation parity spec drafted (`reports/yuan_parity_spec.md`).
 - [x] Pre-implementation final parity config scaffold created (`configs/final_parity/`).
 - [x] Pre-implementation reproducibility tolerance policy created (`configs/repro_tolerance.yaml`).
+- [x] MATH-B data protocol documented (`reports/DATA_PROTOCOL.md`).
+- [x] MATH-B benchmark pipeline reproducible: `scripts/prepare_data.py`, pinned Hub revision (`configs/math_beyond_hf_revision.txt`), pinned `datasets` / `huggingface_hub` (`requirements.txt`), and committed `data/benchmark_manifest.json` (SHA-256 + `library_versions_at_build`). Config paths match the protocol (`configs/eval_math_beyond.yaml`, `configs/final_parity/base_parity.yaml`).
 - [ ] `PROJECT_CONTRACT.md` Phase 1 passed.
 - [ ] `PROJECT_CONTRACT.md` Phase 2 passed.
 - [ ] `PROJECT_CONTRACT.md` Phase 3 passed.

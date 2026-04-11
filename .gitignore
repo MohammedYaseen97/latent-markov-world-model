@@ -52,6 +52,7 @@ reports/repro_incidents.md
 data/*
 !data/.gitkeep
 !data/README.md
+!data/benchmark_manifest.json
 
 # Model checkpoints and tensorboard-like outputs
 checkpoints/

@@ -2,7 +2,9 @@
 torch
 transformers
 accelerate
-datasets
+# Pinned for byte-stable Hub downloads + Arrow/cache behavior alongside configs/math_beyond_hf_revision.txt
+datasets==4.8.4
+huggingface_hub==1.10.1
 trl
 peft
 

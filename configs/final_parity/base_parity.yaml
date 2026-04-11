@@ -21,10 +21,11 @@ framework:
 
 data:
   benchmark: "MATH-Beyond"
-  benchmark_pool_path: "data/math_beyond_ceiling_41.jsonl"
+  benchmark_pool_path: "data/math_beyond_math_b_i_base.jsonl"
+  optional_strict_pool_path: "data/math_beyond_hf_strict_all_models.jsonl"
   optional_full_pool_path: "data/math_beyond_full_181.jsonl"
-  # Keep benchmark pool and evaluation protocol identical across all 4 arms.
-  split_id: "math_beyond_ceiling_41_v1"
+  data_protocol: "reports/DATA_PROTOCOL.md"
+  split_id: "math_b_i_base_v1"
 
 training:
   # Yuan-derived defaults (from appendix details)

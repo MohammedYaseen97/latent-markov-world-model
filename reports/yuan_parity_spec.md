@@ -2,6 +2,8 @@
 
 Source paper: **Yuan & Xie (2026), "Breaking the Capability Ceiling of LLM Post-Training by Reintroducing Markov States"** ([arXiv:2603.19987](https://arxiv.org/abs/2603.19987))
 
+**Benchmark scope:** Yuan’s empirical results are on **logic puzzles** (Sudoku / Sokoban / Futoshiki), not MATH-Beyond. This repo’s **MATH-B** evaluation is a separate target (see **Relation to Yuan** in `reports/DATA_PROTOCOL.md`). Yuan parity here means matching their **method and training protocol** where applicable, not matching their Sudoku numbers on math problems.
+
 This file records:
 1) parameters and protocol details explicitly recoverable from Yuan,  
 2) project-side choices where Yuan is not directly transferable,  
@@ -66,7 +68,7 @@ These are intentionally not copied 1:1 because our benchmark claim is on `MATH-B
 
 ## 3) Our Chosen Project Values (Where Yuan Is Unspecified/Non-Transferable)
 
-- Benchmark: `MATH-Beyond` capability-ceiling set.
+- Benchmark: `MATH-Beyond` MATH-B-I base pool (`reports/DATA_PROTOCOL.md`).
 - Core claim metric: `pass@1024` (mandatory across all 4 core arms).
 - Core experiment matrix:
   - `baseline_grpo`
@@ -85,8 +87,8 @@ These configs must keep all shared knobs identical across all 4 arms.
 
 ## 4) Deviations From Yuan and Why They Are Acceptable
 
-1. **Benchmark deviation (logic puzzles -> MATH-Beyond)**
-   - Reason: project brief defines MATH-Beyond as the target capability-ceiling benchmark.
+1. **Benchmark deviation (logic puzzles -> MATH-Beyond MATH-B-I)**
+   - Reason: project brief defines this MATH-B pool as the target capability-ceiling gauntlet (`reports/DATA_PROTOCOL.md`).
    - Why acceptable: our claim is comparative within a controlled 4-arm setup under matched budgets; this is a new-domain extension, not an exact paper replication.
 
 2. **Primary metric deviation (Pass@128 -> pass@1024)**

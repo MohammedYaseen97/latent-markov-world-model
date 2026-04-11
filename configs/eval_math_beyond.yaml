@@ -1,9 +1,10 @@
 evaluation:
   benchmark: "MATH-Beyond"
-  primary_claim_set: "ceiling_41"
-  primary_claim_path: "data/math_beyond_ceiling_41.jsonl"
+  primary_claim_set: "math_b_i_base"
+  primary_claim_path: "data/math_beyond_math_b_i_base.jsonl"
+  secondary_strict_path: "data/math_beyond_hf_strict_all_models.jsonl"
   optional_full_set_path: "data/math_beyond_full_181.jsonl"
   metrics: ["pass@1", "pass@16", "pass@1024"]
-  # For this project, pass@1024 on the 41-problem ceiling set is mandatory.
+  # Mandatory claim metric: pass@1024 on primary_claim_path (MATH-B-I base pool; N from manifest).
   claim_metric: "pass@1024"
   # TODO: Finalize decode/eval settings for parity runs.

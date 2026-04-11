@@ -13,6 +13,8 @@ Edit exactly one owner document per change type:
 - Execution phases, required implementation tasks, phase pass/fail gates -> `PROJECT_CONTRACT.md`
 - Yuan parity requirements and claim-eligibility gate -> `YUAN_PARITY_CHECKLIST.md`
 - Grading rubric and project completion checklist -> `PROJECT_SCOPE_RUBRIC_CHECKLIST.md`
+- MATH-B JSONL construction and benchmark definitions -> `reports/DATA_PROTOCOL.md`
+- Future-work / results / paper scratch placeholders -> `reports/writeup_stubs.md`
 
 Non-owner documents must reference owner documents and must not restate policy text unless required for local clarity.
 
@@ -20,7 +22,7 @@ Non-owner documents must reference owner documents and must not restate policy t
 
 - Base model family: `Qwen2.5-1.5B` track (primary) with `trl` + `GRPO`.
 - Allowed fallback (only on explicit blocker): `DeepSeek-R1-Distill-1.5B`, documented in parity and final report.
-- Primary benchmark: `MATH-Beyond` capability-ceiling set.
+- Primary benchmark: `MATH-Beyond` **MATH-B-I base** pool (definition and row count: `reports/DATA_PROTOCOL.md`, paths: `configs/eval_math_beyond.yaml`).
 - Mandatory experiment matrix (exactly 4 arms for core table):
   1. `baseline_grpo` (history-as-state)
   2. `token_markov_grpo` (Yuan-style token-space Markov state baseline)
@@ -106,15 +108,19 @@ Required core modules:
 ### Implementational Deliverables
 
 1. Dependency environment locked (`requirements.txt` or `pyproject.toml`).
-2. `scripts/prepare_data.py` prepares benchmark artifacts for `MATH-Beyond`:
-   - `data/math_beyond_ceiling_41.jsonl` (primary claim set),
-   - `data/math_beyond_full_181.jsonl` (optional support set).
+2. `scripts/prepare_data.py` prepares benchmark artifacts for `MATH-Beyond` per `reports/DATA_PROTOCOL.md`:
+   - `data/math_beyond_math_b_i_base.jsonl` (primary claim set, MATH-B-I base gauntlet),
+   - `data/math_beyond_hf_strict_all_models.jsonl` (secondary strict intersection),
+   - `data/math_beyond_full_181.jsonl` (full `test` split),
+   - `data/benchmark_manifest.json` (revision, counts, SHA-256).
 3. `scripts/train_baseline.py` runs end-to-end:
    - local smoke profile (RTX 4060),
    - full profile (A100).
 4. `scripts/eval_passk.py` supports `k in {1, 16, 1024}` and outputs all three.
 5. Baseline artifacts are written to:
    - `artifacts/baseline_grpo/{run_id}/`
+
+**Phase 1 — data track:** Item (2) above is **complete** (protocol, `prepare_data.py`, pins, manifest, config path alignment). Phase 1 **overall** still requires items (1), (3)–(5) and the success criteria below.
 
 ### Phase 1 Success Criteria (Pass/Fail)
 
@@ -249,4 +255,4 @@ Do NOT do any of the following in this phase:
 - No benchmark expansion before all 4-arm core results are complete.
 - No extra ablations outside the mandatory matrix until final deliverables are done.
 
-If tempted to add scope, place it in `reports/future_work.md` and continue current phase.
+If tempted to add scope, park it under **Future work** in `reports/writeup_stubs.md` and continue the current phase.

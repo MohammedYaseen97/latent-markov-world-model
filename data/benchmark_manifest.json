@@ -1,0 +1,79 @@
+{
+  "protocol_version": "math_b_data_protocol_v1",
+  "protocol_doc": "reports/DATA_PROTOCOL.md",
+  "hf_dataset": "brendel-group/MATH-Beyond",
+  "hf_split": "test",
+  "hf_revision": "1a2a6294ff8d673aeb271ab3eff272e8d6b48c2d",
+  "hf_revision_source": "configs/math_beyond_hf_revision.txt",
+  "paper": {
+    "title": "MATH-Beyond",
+    "arxiv": "https://arxiv.org/abs/2510.11653",
+    "math_b_i_reported_n": 41,
+    "math_b_i_definition": "Section 3.2.3; intersection over Base Models at pass@1024"
+  },
+  "primary_pool": {
+    "path": "data/math_beyond_math_b_i_base.jsonl",
+    "mode": "paper_math_b_i_base",
+    "description": "MATH-B-I (paper Sec. 3.2.3 Base Models): all listed base-model pass@1024 == 0.",
+    "row_count": 40,
+    "columns_used": [
+      "qwen2.5-1.5b_pass@1024",
+      "qwen2.5-7b_pass@1024",
+      "qwen2.5-math-1.5b_pass@1024",
+      "qwen2.5-math-7b_pass@1024",
+      "qwen3-4b-base_pass@1024",
+      "qwen3_8b_base_pass@1024",
+      "r1-1.5b_pass@1024",
+      "r1-7b_pass@1024",
+      "olmo_7b_pass@1024",
+      "olmo_2_1124_7b_pass@1024",
+      "llama3.1_8b_pass@1024"
+    ]
+  },
+  "full_pool": {
+    "path": "data/math_beyond_full_181.jsonl",
+    "row_count": 181
+  },
+  "secondary_strict_pool": {
+    "path": "data/math_beyond_hf_strict_all_models.jsonl",
+    "description": "AND of all 21 *_unsolved (stricter than paper MATH-B-I).",
+    "row_count": 13
+  },
+  "hub_reference": "https://huggingface.co/datasets/brendel-group/MATH-Beyond",
+  "reproducibility": {
+    "source_index": "0-based index into HF test split at hf_revision",
+    "row_order": "Hugging Face datasets default test split order",
+    "library_versions_at_build": {
+      "datasets": "4.8.4",
+      "huggingface_hub": "1.10.1"
+    },
+    "requirements_pin_reference": "requirements.txt (datasets, huggingface_hub)"
+  },
+  "all_unsolved_columns": [
+    "deepscaler_1.5b_preview_unsolved",
+    "llama3.1_8b_unsolved",
+    "nemotron_1.5b_unsolved",
+    "nemotron_research_reasoning_qwen_1.5b_v1_unsolved",
+    "olmo_2_1124_7b_unsolved",
+    "olmo_7b_unsolved",
+    "qwen2.5-1.5b-instruct_unsolved",
+    "qwen2.5-1.5b_unsolved",
+    "qwen2.5-7b-instruct_unsolved",
+    "qwen2.5-7b_unsolved",
+    "qwen2.5-math-1.5b-instruct_unsolved",
+    "qwen2.5-math-1.5b_unsolved",
+    "qwen2.5-math-7b-instruct_unsolved",
+    "qwen2.5-math-7b_unsolved",
+    "qwen3-4b-base_unsolved",
+    "qwen3-4b_unsolved",
+    "qwen3_8b_base_unsolved",
+    "qwen3_8b_unsolved",
+    "r1-1.5b_unsolved",
+    "r1-7b_unsolved",
+    "skywork_or1_7b_unsolved"
+  ],
+  "all_pass_at_1024_columns_count": 21,
+  "sha256_math_beyond_full_181_jsonl": "75c0089c12a3657bf1ac4d1ca2fbbf4c27ac4139ce7d07f04cb32c916479f9ea",
+  "sha256_math_beyond_math_b_i_base_jsonl": "60093e6abf9d1b6a51960d78cb8ab3a7a394f4f0efffa40c5215a4cd2977dc5f",
+  "sha256_math_beyond_hf_strict_all_models_jsonl": "f182a4f8b13d0749c8e27ed1615e0398c18382ddcf56daf228491376004a98a2"
+}

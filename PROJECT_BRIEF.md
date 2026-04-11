@@ -85,7 +85,7 @@ Three things that make this new together:
 
 ## Benchmark Choice
 
-**Primary:** MATH-Beyond intersection set — 41 problems provably unsolvable by all current RLVR models at pass@1024. This is your capability ceiling test. If your model solves any of these that the baseline can't, that's a clean result.
+**Primary:** MATH-Beyond **MATH-B-I (base models)** pool from Mayilvahanan et al. — problems where every listed *base* model failed at pass@1024 on the Hub snapshot we pin (see `reports/DATA_PROTOCOL.md` and `data/benchmark_manifest.json` for the exact row count; the paper reports 41, the pinned revision currently yields 40). This is your capability-ceiling gauntlet: if your model solves any of these that the baseline cannot, that is a clean result.
 
 **Secondary (if time):** ProntoQA or a logic puzzle suite — cleaner structure, faster iteration, good for sanity checking latent geometry.
 

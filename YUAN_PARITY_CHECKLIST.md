@@ -16,7 +16,16 @@ Success standard:
 
 All items in this section must be checked before final results are accepted.
 
-Status note (current): only documentation-level parity extraction is complete; implementation and final-run checks remain pending.
+Status note (current): Yuan parity **spec and configs** are drafted; **MATH-B benchmark data substrate** is complete (see A0). Comparator implementation, training/eval parity, and final-run checks remain pending.
+
+### A0) Benchmark data substrate (complete)
+
+Reproducible MATH-Beyond pools shared by all arms; independent of RL training code readiness.
+
+- [x] `reports/DATA_PROTOCOL.md` defines primary (MATH-B-I base), secondary (strict 21-model AND), and full `test` pools; paper vs Hub row count is explicit.
+- [x] `scripts/prepare_data.py` writes JSONLs and `data/benchmark_manifest.json` (Hub revision, columns, counts, SHA-256, `library_versions_at_build`).
+- [x] Revision pin: `configs/math_beyond_hf_revision.txt` (override: `--hf-revision`, `MATH_BEYOND_HF_REVISION`). Library pins: `requirements.txt` (`datasets`, `huggingface_hub`).
+- [x] `configs/eval_math_beyond.yaml` and `configs/final_parity/base_parity.yaml` use the same pool paths as the protocol.
 
 ### A1) Comparator Definition
 
@@ -65,7 +74,7 @@ These are not required for this project and must not be added before core delive
 - [ ] Reproducing every diagnostic figure from Yuan.
 - [ ] Adding new algorithmic branches (diffusion, persona conditioning, extra RL algorithms) in this phase.
 
-If any item above is requested mid-project, record it in `reports/future_work.md` and continue core plan.
+If any item above is requested mid-project, record it under **Future work** in `reports/writeup_stubs.md` and continue the core plan.
 
 ---
 
@@ -84,7 +93,7 @@ If these are not all true, use a weaker claim phrasing in paper/blog.
 
 ## Allowed Claim Templates
 
-Use one of these templates in `reports/main_results.md` and paper draft:
+Use one of these templates in `reports/writeup_stubs.md` (**Main results** / **Paper draft**):
 
 1. **Strong claim (all gates passed)**
    - "Under Yuan-faithful token-Markov parity conditions, our latent-state method outperforms strong baselines on `pass@1024`."
