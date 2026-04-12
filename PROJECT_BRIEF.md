@@ -103,7 +103,7 @@ Three things that make this new together:
 
 ## Benchmark Choice
 
-**Primary:** MATH-Beyond **MATH-B-I (base models)** pool from Mayilvahanan et al. — problems where every listed *base* model failed at pass@1024 on the Hub snapshot we pin (see `reports/DATA_PROTOCOL.md` and `data/benchmark_manifest.json` for the exact row count; the paper reports 41, the pinned revision currently yields 40). This is your capability-ceiling gauntlet: if your model solves any of these that the baseline cannot, that is a clean result.
+**Primary:** MATH-Beyond **MATH-B-I (base models)** pool from Mayilvahanan et al. — rows where every listed **base** Hub model scored **pass@1024 = 0** on the pinned snapshot (counts: `data/benchmark_manifest.json`; see `reports/DATA_PROTOCOL.md`). That rule fixes **which problems** are in the gauntlet using a **published, reproducible** difficulty filter — it does **not** mean “frozen instruct can never solve them.” We still train **instruct** checkpoints for rollout quality; the **science** is **four-way comparison on the same fixed list** under **pass@1024** (hard at scale even when some items move). A fuller defence of “still hard / still meaningful with instruct” is in **`reports/DATA_PROTOCOL.md`** (*Is this still “hard” if we train instruct weights?*).
 
 **Secondary (if time):** ProntoQA or a logic puzzle suite — cleaner structure, faster iteration, good for sanity checking latent geometry.
 
@@ -115,7 +115,7 @@ Three things that make this new together:
 
 | Component | Choice | Reason |
 |---|---|---|
-| Base model | Qwen2.5-1.5B or DeepSeek-R1-Distill-1.5B | Well-supported, fits A100, strong reasoning baseline |
+| Policy backbone | **Instruct** weights: `Qwen/Qwen2.5-1.5B-Instruct` (primary), `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` (fallback); see `configs/base_model.yaml`. MATH-B-I **pool** uses Hub *base* columns only to pick problems — not the checkpoint you train. |
 | Training framework | TRL (simpler) or veRL (more flexible) | Start with TRL, switch if you need more control |
 | VAE | Custom PyTorch, ~200 lines | Input: trajectory hidden states. Output: latent z, mean μ, variance σ² |
 | RL algorithm | GRPO | Standard, well-understood, your existing knowledge |
@@ -127,7 +127,7 @@ Three things that make this new together:
 
 ## VAE Design (the core component)
 
-**Input:** Hidden state sequence from the base model's reasoning trajectory — not tokens, but the model's internal representations at each step. Specifically, the final layer hidden states averaged over the last N tokens at each reasoning step.
+**Input:** Hidden state sequence from the **backbone LM’s** reasoning trajectory — not tokens, but the model's internal representations at each step. Specifically, the final layer hidden states averaged over the last N tokens at each reasoning step.
 
 **Encoder:** MLP that maps trajectory hidden states → (μ, σ²) in latent space z. Start small: 2-3 layers, latent dim 64-128.
 

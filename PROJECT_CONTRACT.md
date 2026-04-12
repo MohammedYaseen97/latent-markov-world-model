@@ -17,7 +17,7 @@ Phases, gates, and what to ship. **Vision / hypothesis / VAE design:** `PROJECT_
 
 ## Locked scope
 
-- **Model:** `Qwen2.5-1.5B` + `trl` + `GRPO`. Fallback only if blocked: `DeepSeek-R1-Distill-1.5B` (note in run log or brief appendix).
+- **Model:** **`Qwen/Qwen2.5-1.5B-Instruct`** + `trl` + `GRPO` (see `configs/base_model.yaml`). Fallback only if blocked: **`deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`** (instruct-style distill — use for **all** arms if switched; note in run log). Pool membership still comes from MATH-B-I **base** Hub columns; training checkpoint choice is separate (documented in `DATA_PROTOCOL.md`).
 - **Benchmark:** MATH-Beyond **MATH-B-I base** pool — definition and row count in `reports/DATA_PROTOCOL.md`, paths in `configs/eval_math_beyond.yaml` / `configs/final_parity/base_parity.yaml`.
 - **Four arms (core table):**  
   1. `baseline_grpo` — history-as-state  
@@ -41,7 +41,7 @@ Before treating the core table as final:
 
 - [x] **Data:** `DATA_PROTOCOL` + `prepare_data.py` + `benchmark_manifest.json` + config paths aligned.
 - [ ] **Token-Markov:** real predictor in GRPO, not a toy; isolated code path (`train_token_markov.py`, `token_markov_state.py`, `grpo_token_markov.py`).
-- [ ] **Fairness:** same base model, MATH-B pool, reward, train/eval budgets, max length, decode settings across arms (unless documented method-specific).
+- [ ] **Fairness:** same pretrained checkpoint across arms (`configs/base_model.yaml`), MATH-B pool, reward, train/eval budgets, max length, decode settings (unless documented method-specific).
 - [ ] **Metrics:** `pass@1024` all arms; table from `run_ablation_table.py` artifacts, not hand-typed.
 - [ ] **Repro:** seeds + tolerances in `repro_tolerance.yaml`; checkpoints/logs kept.
 

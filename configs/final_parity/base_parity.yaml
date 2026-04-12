@@ -9,9 +9,9 @@ project:
   mandatory_metrics: ["pass@1", "pass@16", "pass@1024"]
 
 model:
-  family: "Qwen2.5-1.5B"
-  # Fallback allowed only on explicit blocker; document in comparator spec or run log.
-  fallback_family: "DeepSeek-R1-Distill-1.5B"
+  family: "Qwen2.5-1.5B-Instruct" # logical name; HF id in configs/base_model.yaml
+  # Fallback = instruct-style DeepSeek R1 distill on Qwen 1.5B; switch all arms together if used.
+  fallback_family: "DeepSeek-R1-Distill-Qwen-1.5B"
 
 framework:
   rl_library: "trl"
