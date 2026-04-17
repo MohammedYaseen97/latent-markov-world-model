@@ -1,144 +1,168 @@
-# Latent Markov World Model
+# Latent Markov World Models for RL Post-Training
 
-Research project exploring whether **learned latent state representations** can improve RL post-training for mathematical reasoning compared to standard **history-as-state GRPO** and a **token-Markov comparator**.
+**Can a learned latent state break the capability ceiling of RL post-training on hard mathematics?**
 
-The benchmark target is **MATH-Beyond**, with the primary claim metric set to **pass@1024**.
+This project trains and compares four RL post-training arms on a benchmark where standard RLVR is documented to fail — testing whether replacing token history with a learned latent representation of reasoning progress enables genuine capability expansion, not just sampling redistribution.
 
-## Why this project exists
+---
 
-Most RL post-training setups for LLM reasoning treat the full generated token history as the "state". This repository investigates a different hypothesis:
+## Motivation
 
-- Learn a compact latent state from trajectories (VAE-style encoder),
-- condition policy learning on that latent,
-- and test whether uncertainty in the latent can provide a useful exploration signal.
+Reinforcement learning post-training (GRPO, PPO, RLVR) has a structural problem. The state fed to the policy is the full concatenation of all tokens generated so far — an unbounded, redundant, non-Markovian object that gives the model no compact summary of *where it actually is* in the solution space. The consequence is well-documented: RLVR improves sampling efficiency toward paths the base model could already take, but does not expand the reasoning frontier. The capability ceiling is a direct artifact of this degenerate state representation.
 
-In short: can a learned state representation help move beyond simple trajectory reweighting and improve hard-reasoning performance?
+Yue et al. (NeurIPS 2025) proved this formally. Yuan & Xie (March 2026) confirmed it and showed that introducing explicit Markov states breaks the ceiling — using an external state predictor operating in token space.
 
-## Project goals
+Token space is still not first principles. A token-space summarizer compresses *language about* the solution space. It doesn't discover the structure of that space, and it carries no uncertainty signal.
 
-The core experiment is a four-arm ablation:
+**This project asks: what if the state was learned end-to-end from reasoning trajectories — a compressed latent belief over solution-space position, discovered from data, with epistemic uncertainty built in?**
 
-1. `baseline_grpo` - history-as-state GRPO
-2. `token_markov_grpo` - token-space Markov-style comparator
-3. `latent_grpo` - learned latent state (no uncertainty bonus)
-4. `latent_grpo_uncertainty` - latent state + uncertainty bonus
+---
 
-Primary metric: `pass@1024`  
-Secondary metrics: `pass@1`, `pass@16`
+## Core Hypothesis
 
-Scope, phase gates, and fairness constraints are defined in `PROJECT_CONTRACT.md`.
+A VAE trained on reasoning trajectories can learn a compact latent representation of where a reasoning agent currently is in the solution space. When an RL policy conditions on this latent state instead of raw token history, two things happen:
 
-## Current status (honest snapshot)
+1. **The capability ceiling breaks** — the policy operates on a proper Markov state, enabling genuine discovery rather than redistribution of existing paths.
+2. **Uncertainty drives exploration** — the variance of the VAE posterior is an epistemic signal: high variance means the model doesn't know where it is (explore); low variance means it's confident (exploit).
 
-This repository is **in active development**.
+This is a minimal learned latent world model for abstract reasoning. The "world" being modeled is not a physical environment but an *epistemic state* — where the agent is in its understanding of the problem.
 
-### Implemented
+---
 
-- Reproducible MATH-Beyond data preparation pipeline:
-  - `scripts/prepare_data.py`
-  - `data/benchmark_manifest.json`
-- YAML config inheritance utility:
-  - `src/utils/config_loader.py`
-- Deterministic seeding helper:
-  - `src/utils/seeding.py`
-- Baseline/eval script plumbing (CLI, config loading, run artifact output):
-  - `scripts/train_baseline.py`
-  - `scripts/eval_passk.py`
+## The Four Arms
 
-### Not yet implemented
+All arms share the same pretrained checkpoint, benchmark pool, reward function, and decoding budget. Only the state representation differs.
 
-- Full GRPO training loops for all arms
-- pass@k sampling + answer grading engine
-- Token-Markov and latent model/training internals
-- End-to-end ablation table generation from completed runs
+| Arm | State representation |
+|-----|---------------------|
+| `baseline_grpo` | Full token history (standard RLVR) |
+| `token_markov_grpo` | Token-space Markov state predictor (Yuan-inspired comparator) |
+| `latent_grpo` | VAE latent state — learned, no uncertainty bonus |
+| `latent_grpo_uncertainty` | VAE latent state + KL-based intrinsic exploration bonus |
 
-This transparency is intentional: the repo is structured for reproducible research execution, with core training/evaluation internals being filled in next.
+**Primary metric:** `pass@1024` (also `pass@1`, `pass@16`).
 
-## Repository structure
+---
 
-```text
-configs/     # model, training, eval, parity/fairness, reproducibility configs
-data/        # benchmark JSONL artifacts + manifest
-scripts/     # executable entry points (prepare/train/eval/ablation)
-src/         # models, training logic, eval logic, utilities
-artifacts/   # run outputs (manifests, resolved configs, checkpoints/logs)
-reports/     # protocol docs, writeup notes, generated tables
+## VAE Design
+
+**Input:** Final-layer hidden states from the backbone LM's reasoning trajectory — the model's internal representations averaged over the last N tokens at each reasoning step.
+
+**Encoder:** MLP → (μ, σ²) in latent space **z**. Architecture: 2–3 layers, latent dim 64–128.
+
+**Decoder:** MLP mapping **z** back to trajectory representation. Trained with standard ELBO: reconstruction loss + KL divergence.
+
+**Policy conditioning:** The RL policy receives **z** (sampled from the encoder posterior) concatenated with the current token embedding before the policy head.
+
+**Uncertainty bonus:** The intrinsic reward term is β_t × KL(q(**z**|τ) ∥ p(**z**)). High KL = high uncertainty = explore. β is annealed over training so exploration dominates early; exploitation dominates late.
+
+---
+
+## Benchmark
+
+**Primary pool:** MATH-Beyond MATH-B-I (base model intersection) from Mayilvahanan et al. ([arXiv:2510.11653](https://arxiv.org/abs/2510.11653)). These are problems for which *every* listed base model scored `pass@1024 = 0` on the published Hub evaluation — 11 base model columns, pinned Hub revision.
+
+This defines a hard capability-ceiling gauntlet using a published, reproducible, third-party difficulty filter. The scientific question is comparative: does the latent arm outperform the baselines on this fixed list under matched budgets?
+
+> Problems are MATH-B-I (base-model intersection on the Hub table, N from `data/benchmark_manifest.json`); training uses **Qwen2.5-1.5B-Instruct** for rollout quality. The pool membership and the training checkpoint are separate decisions — documented in `reports/DATA_PROTOCOL.md`.
+
+**Why not GSM8K or MATH?** Saturated. RLVR already works there. The capability ceiling is documented on MATH-Beyond and that's where the experiment is meaningful.
+
+**Secondary pool:** AND of all 21 `*_unsolved` Hub columns (13 rows, stricter). Used for appendix / robustness.
+
+---
+
+## Model and Training Stack
+
+| Component | Choice |
+|-----------|--------|
+| Policy backbone | `Qwen/Qwen2.5-1.5B-Instruct` (primary); `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` (fallback) |
+| RL algorithm | GRPO via TRL |
+| VAE | Custom PyTorch (~200 lines); input: trajectory hidden states |
+| Reward | Verifiable correctness vs. `ground_truth` (symbolic/numeric equivalence) |
+| Evaluation decode | Temperature 1.0; k ∈ {1, 16, 1024} |
+
+GRPO hyperparameters follow Yuan & Xie (2026) as a starting reference (LR 1e-6, KL coef 0.001, batch 128, group size 8) and are frozen identically across all four arms.
+
+---
+
+## Repository Layout
+
+```
+configs/                  YAML config tree (base_model, per-arm, eval, final_parity, repro_tolerance)
+data/                     MATH-Beyond JSONLs + benchmark_manifest.json (built by prepare_data.py)
+reports/                  DATA_PROTOCOL.md, writeup_stubs.md
+scripts/
+  prepare_data.py         Build MATH-Beyond JSONLs from HF (reproducible, SHA-256 checksummed)
+  train_baseline.py       Baseline GRPO training entrypoint
+  train_token_markov.py   Token-Markov arm entrypoint
+  train_latent.py         Latent GRPO arm entrypoint (both modes)
+  eval_passk.py           pass@k evaluation entrypoint
+  run_ablation_table.py   Aggregate artifacts → ablation table
+src/
+  models/
+    vae_state_encoder.py       VAE encoder/decoder
+    token_markov_state.py      Token-space Markov state predictor
+  training/
+    grpo_baseline.py           Baseline GRPO loop
+    grpo_token_markov.py       Token-Markov GRPO loop
+    grpo_latent.py             Latent GRPO loop (with/without uncertainty)
+    reward_bonus.py            KL intrinsic reward bonus
+  eval/
+    metrics.py                 pass@k computation
+  utils/
+    config_loader.py           YAML extends + deep merge
+    seeding.py                 Deterministic seeding (Python, NumPy, PyTorch, CUDA)
+    logging.py                 Experiment logger
+artifacts/                Per-run directories: manifests, resolved configs, checkpoints, logs
 ```
 
-## Quick start
+---
 
-### 1) Environment
+## Reproducing the Data
+
+The benchmark JSONLs in `data/` are fully reproducible from the pinned HF revision:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 2) Build benchmark artifacts
-
-```bash
 python scripts/prepare_data.py --output-dir data
 ```
 
-This writes:
+The Hub dataset revision is pinned in `configs/math_beyond_hf_revision.txt`. `data/benchmark_manifest.json` records the exact revision, row counts, column filters, and SHA-256 checksums of all three JSONL files.
 
-- `data/math_beyond_math_b_i_base.jsonl` (primary claim pool),
-- `data/math_beyond_hf_strict_all_models.jsonl` (stricter intersection pool),
-- `data/math_beyond_full_181.jsonl` (full test split),
-- `data/benchmark_manifest.json` (reproducibility metadata + hashes).
+---
 
-### 3) Smoke-run baseline script wiring
+## Connection to the Broader Vision
 
-```bash
-python scripts/train_baseline.py --profile smoke
-```
+LeWM, JEPA, and Dreamer model what the *physical world* will look like next. This project models what the agent's *understanding of a problem* looks like right now, and how it should evolve. Same philosophical DNA — predict and plan in latent space, not raw observation space — applied to a completely different domain.
 
-Today this validates config/seeding/artifact plumbing and then exits with `NotImplementedError` where the actual GRPO loop will be integrated.
+If a learned latent state over epistemic position works here, the generalization is direct:
+- Replace VAE with a diffusion model → richer, progressive denoising of belief state
+- Add identity conditioning → persona-conditioned belief initialization
+- Scale beyond RL post-training → any domain where an agent tracks its own epistemic state
 
-### 4) Smoke-run evaluation script wiring
+This project earns the right to make that larger claim.
 
-```bash
-python scripts/eval_passk.py --pool primary
-```
+---
 
-Today this validates config/pool loading and emits machine-readable output with implementation status.
+## Related Work
 
-## Reproducibility and research hygiene
+| Paper | What it does | How this differs |
+|-------|-------------|-----------------|
+| Yuan & Xie (2026) — Markov States | Introduces external token-space state predictor; breaks the capability ceiling | State here is learned via VAE, not constructed; adds uncertainty signal |
+| Yue et al. NeurIPS 2025 — Capability Ceiling | Proves RLVR doesn't expand the reasoning frontier | Empirical motivation — the problem this work solves |
+| LeWM / JEPA (LeCun, 2026) | Latent world model for physical environments from pixels | Same philosophy, different domain: epistemic space, not physical space |
+| Dreamer / DIAMOND | Diffusion/latent world models for pixel-based RL | Physical world, not abstract reasoning |
+| Coconut (Meta, 2024) | Reasoning in latent space via continuous thought tokens | Inference-time only; no learned world model; no RL |
 
-This project prioritizes reproducibility from day one:
+**Novel claim:** A VAE trained on reasoning trajectories learns a compact Markov state over solution-space position. An RL policy conditioned on this latent — with variance as an exploration bonus — breaks the capability ceiling on benchmarks where standard RLVR fails. Three things new together: (1) state is learned end-to-end, not constructed; (2) uncertainty is a first-class signal; (3) it instantiates a latent world model for abstract reasoning, a domain this has not been built for.
 
-- Pinned benchmark revision in `configs/math_beyond_hf_revision.txt`
-- Dataset manifest with row counts and SHA-256 hashes
-- Config inheritance and resolved run configs saved per run
-- Shared parity configs in `configs/final_parity/`
-- Seed policy and tolerance controls in `configs/repro_tolerance.yaml`
+---
 
-## Design docs
+## Reproducibility Contract
 
-If you want the full technical and experimental rationale:
-
-- `PROJECT_BRIEF.md` - problem framing, hypothesis, and method sketch
-- `PROJECT_CONTRACT.md` - locked scope, phase gates, and comparison rules
-- `reports/DATA_PROTOCOL.md` - benchmark definition and data provenance details
-
-## Roadmap
-
-Near-term milestones:
-
-1. Complete baseline GRPO training loop and pass@k evaluator
-2. Implement token-Markov comparator
-3. Implement latent and latent+uncertainty arms
-4. Generate the four-arm ablation table from artifacts
-5. Publish concise writeup with results and limitations
-
-## For recruiters / collaborators
-
-This repository demonstrates:
-
-- End-to-end research engineering workflow design
-- Reproducible experiment/data protocol practices
-- Clean project organization for multi-arm ML experimentation
-- Thoughtful scientific framing with explicit fairness constraints
-
-Even pre-results, the structure reflects how I build and ship ML research systems: scoped, auditable, and iteration-friendly.
+- Same pretrained checkpoint across all four arms (or documented fallback, applied uniformly)
+- Same benchmark pool, reward function, eval budget, and decode settings
+- Seeds and tolerances in `configs/repro_tolerance.yaml`
+- Final result table generated from `artifacts/` by `run_ablation_table.py` — not hand-typed
+- Full spec: `PROJECT_CONTRACT.md`
