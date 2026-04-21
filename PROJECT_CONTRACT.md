@@ -53,7 +53,7 @@ Before treating the core table as final:
 
 **Deliverables:** (1) deps pinned (`requirements.txt`), (2) `prepare_data.py` outputs per `DATA_PROTOCOL`, (3) `train_baseline.py` smoke + A100, (4) `eval_passk.py` for k ∈ {1,16,1024}, (5) artifacts under `artifacts/baseline_grpo/{run_id}/`.
 
-**Implementation status:** all five deliverables implemented and smoke-verified. Pending: A100 production run + recording pass@{1,16,1024} results.
+**Implementation status:** all five deliverables implemented and verified. Production run complete (`20260421T131720Z`, 100 steps, Qwen2.5-1.5B-Instruct). Results: `pass@1=0.012%`, `pass@16=0.19%`, `pass@1024=10.0%` — written to `artifacts/baseline_grpo/20260421T131720Z/eval_metrics.json`. **Phase 1 complete.**
 
 **Pass:** stable A100 baseline; valid pass@ metrics; same-seed rerun within `repro_tolerance.yaml`; README has train/eval commands.
 

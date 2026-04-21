@@ -76,11 +76,42 @@ def _to_sympy(s: str):
     return None
 
 
+def _sympy_equiv(pred_expr, gold_expr, timeout: float = 5.0) -> bool | None:
+    """Run simplify(pred - gold) == 0 in a thread with a hard timeout.
+
+    Returns True/False on success, None if the call times out or raises.
+    SymPy's simplify has no built-in timeout and hangs indefinitely on
+    certain model-generated expressions (e.g. deeply nested radicals).
+
+    Important: do NOT use ThreadPoolExecutor as a context manager here.
+    The context manager calls shutdown(wait=True) on exit, which blocks
+    until the worker thread terminates — re-introducing the hang we are
+    trying to prevent.  Instead we call shutdown(wait=False) explicitly
+    so we leave any stuck SymPy thread running in the background and
+    move on immediately.
+    """
+    import concurrent.futures
+
+    def _check():
+        return simplify(pred_expr - gold_expr) == 0
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(_check)
+    try:
+        result = fut.result(timeout=timeout)
+        ex.shutdown(wait=False)
+        return result
+    except (concurrent.futures.TimeoutError, Exception):
+        ex.shutdown(wait=False)
+        return None
+
+
 def answers_equivalent(pred: str, gold: str) -> bool:
     """True when pred and gold represent the same mathematical value.
 
     Checks in order:
     1. Symbolic simplification: simplify(pred - gold) == 0  (handles 1/2 == 2/4, sqrt(4) == 2, …)
+       — capped at 5 s to prevent SymPy hanging on pathological model outputs.
     2. Numeric evaluation: |N(pred) - N(gold)| < 1e-6  (catches equivalent but non-simplifiable forms)
     3. String fallback: normalised string equality.
     """
@@ -90,9 +121,11 @@ def answers_equivalent(pred: str, gold: str) -> bool:
     if pred_expr is None or gold_expr is None:
         return pred.strip().lower() == gold.strip().lower()
 
+    result = _sympy_equiv(pred_expr, gold_expr)
+    if result is True:
+        return True
+    # result is False (simplify finished, not equal) or None (timed out / error) — fall through to numeric
     try:
-        if simplify(pred_expr - gold_expr) == 0:
-            return True
         return abs(float(N(pred_expr)) - float(N(gold_expr))) < 1e-6
     except Exception:
         return str(pred_expr) == str(gold_expr)
@@ -102,17 +135,30 @@ def answers_equivalent(pred: str, gold: str) -> bool:
 # Reward function (TRL-compatible)
 # ---------------------------------------------------------------------------
 
-def math_reward(completions: list[str], answer: list[str], **kwargs) -> list[float]:
+def _completion_to_str(completion) -> str:
+    """Normalise a completion to a plain string.
+
+    Newer TRL versions pass completions as a list of chat-message dicts
+    (``[{"role": "assistant", "content": "..."}]``).  Older versions pass
+    plain strings.  This helper handles both.
+    """
+    if isinstance(completion, str):
+        return completion
+    # List[dict] – concatenate all message content in order.
+    return "".join(msg.get("content", "") for msg in completion if isinstance(msg, dict))
+
+
+def math_reward(completions, answer: list[str], **kwargs) -> list[float]:
     """Binary reward: 1.0 if the extracted final answer is mathematically equivalent to
     ``ground_truth``, 0.0 otherwise.  Same function used across all four arms (contract).
 
     Args:
-        completions: Raw model completions for a batch.
+        completions: Raw model completions for a batch (str or list[dict]).
         answer:      Corresponding ``ground_truth`` strings from the JSONL pool.
     """
     rewards = []
     for completion, ground_truth in zip(completions, answer):
-        pred = extract_answer(completion)
+        pred = extract_answer(_completion_to_str(completion))
         rewards.append(1.0 if pred is not None and answers_equivalent(pred, ground_truth) else 0.0)
     return rewards
 
@@ -126,10 +172,11 @@ def make_logged_reward(run_dir: Path):
     log_path = run_dir / "completions_hashes.jsonl"
     step: list[int] = [0]
 
-    def _reward(completions: list[str], answer: list[str], **kwargs) -> list[float]:
+    def _reward(completions, answer: list[str], **kwargs) -> list[float]:
         step[0] += 1
+        strs = [_completion_to_str(c) for c in completions]
         # Null-byte separator prevents cross-boundary collisions between completions.
-        digest = hashlib.sha256("\n\x00\n".join(completions).encode()).hexdigest()
+        digest = hashlib.sha256("\n\x00\n".join(strs).encode()).hexdigest()
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps({"step": step[0], "completions_hash": digest}) + "\n")
         return math_reward(completions, answer, **kwargs)
@@ -214,6 +261,10 @@ def train_baseline(config: dict[str, Any], run_dir: Path) -> None:
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, revision=revision, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Ensure checkpoints are saved with Qwen2TokenizerFast so vLLM can load them
+    # without hitting "Qwen2Tokenizer has no attribute all_special_tokens_extended".
+    if getattr(tokenizer, "init_kwargs", {}).get("tokenizer_class") == "Qwen2Tokenizer":
+        tokenizer.init_kwargs["tokenizer_class"] = "Qwen2TokenizerFast"
 
     raw_dataset = load_dataset(
         "json",

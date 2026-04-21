@@ -34,6 +34,10 @@
     "path": "data/math_beyond_full_181.jsonl",
     "row_count": 181
   },
+  "smoke_pool": {
+    "path": "data/math_beyond_smoke.jsonl",
+    "row_count": 4
+  },
   "secondary_strict_pool": {
     "path": "data/math_beyond_hf_strict_all_models.jsonl",
     "description": "AND of all 21 *_unsolved (stricter than paper MATH-B-I).",
@@ -75,5 +79,6 @@
   "all_pass_at_1024_columns_count": 21,
   "sha256_math_beyond_full_181_jsonl": "75c0089c12a3657bf1ac4d1ca2fbbf4c27ac4139ce7d07f04cb32c916479f9ea",
   "sha256_math_beyond_math_b_i_base_jsonl": "60093e6abf9d1b6a51960d78cb8ab3a7a394f4f0efffa40c5215a4cd2977dc5f",
+  "sha256_math_beyond_smoke_jsonl": "09b2d14463644c137748a95da242bd4378328ad56acdad7edc7deed41161d0d7",
   "sha256_math_beyond_hf_strict_all_models_jsonl": "f182a4f8b13d0749c8e27ed1615e0398c18382ddcf56daf228491376004a98a2"
 }

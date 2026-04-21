@@ -30,6 +30,8 @@ training:
   num_epochs: 1
 
   gradient_checkpointing: true  # required to fit 1.5B + QLoRA optimizer on 8 GB
+  logging_steps: 1
+  save_steps: 5
 
 evaluation:
   path: "data/math_beyond_smoke.jsonl"

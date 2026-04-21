@@ -31,8 +31,8 @@ training:
 
   gradient_checkpointing: false   # A100 80 GB, 1.5B model — not needed
   use_vllm: false
-  logging_steps: 1               # write every step to trainer_state.json for reproducibility checks
-  save_steps: 5                  # checkpoint early enough to support partial-run reproducibility checks
+  logging_steps: 5
+  save_steps: 50
 
 evaluation:
   path: "data/math_beyond_math_b_i_base.jsonl"

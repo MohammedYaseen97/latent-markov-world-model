@@ -184,22 +184,59 @@ def _estimate_pass_at_k_metrics(
     if use_vllm:
         from vllm import LLM, SamplingParams  # deferred — not required for smoke
 
+        # Fail fast with a clear message if another process is holding GPU memory.
+        # vLLM's own error ("Free memory … less than desired utilization") surfaces
+        # only after a slow EngineCore subprocess spawn; this check catches it upfront.
+        import torch
+        if torch.cuda.is_available():
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            utilization = eval_cfg.get("vllm_gpu_memory_utilization", 0.85)
+            required_bytes = total_bytes * utilization
+            if free_bytes < required_bytes:
+                free_gib = free_bytes / 2**30
+                total_gib = total_bytes / 2**30
+                required_gib = required_bytes / 2**30
+                raise RuntimeError(
+                    f"Not enough free GPU memory to start vLLM "
+                    f"({free_gib:.1f} GiB free / {total_gib:.1f} GiB total, "
+                    f"need {required_gib:.1f} GiB for gpu_memory_utilization={utilization}). "
+                    f"Kill any orphaned GPU processes (check: nvidia-smi) and retry."
+                )
+
         llm = LLM(
             model=checkpoint,
             dtype="bfloat16",
             gpu_memory_utilization=eval_cfg.get("vllm_gpu_memory_utilization", 0.85),
         )
-        sampling_params = SamplingParams(
-            n=n_samples,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_new_tokens,
+        # Generate in chunks rather than a single llm.generate(n=1024) call.
+        # With max_tokens=1024 the EngineCore must detokenize ~40k sequences
+        # (~20M tokens) before it can return anything, which stalls for 20+ min.
+        # Smaller chunks keep each round-trip fast.
+        chunk_size: int = int(eval_cfg.get("vllm_chunk_size", 64))
+        n_chunks = -(-n_samples // chunk_size)  # ceil division
+        accumulated: list[list[str]] = [[] for _ in range(len(prompts))]
+
+        print(
+            f"Generating {n_samples} completions × {len(problems)} problems via vLLM "
+            f"(chunks of {chunk_size}) …",
+            file=sys.stderr,
         )
-        print(f"Generating {n_samples} completions × {len(problems)} problems via vLLM …",
-              file=sys.stderr)
-        outputs = llm.generate(prompts, sampling_params)
-        for output, problem in zip(outputs, problems):
-            completions = [o.text for o in output.outputs]
+        remaining = n_samples
+        for chunk_idx in range(1, n_chunks + 1):
+            this_n = min(chunk_size, remaining)
+            chunk_params = SamplingParams(
+                n=this_n,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_new_tokens,
+            )
+            print(f"  chunk {chunk_idx}/{n_chunks} (n={this_n}) …", file=sys.stderr)
+            chunk_outputs = llm.generate(prompts, chunk_params)
+            for i, out in enumerate(chunk_outputs):
+                accumulated[i].extend(o.text for o in out.outputs)
+            remaining -= this_n
+
+        for completions, problem in zip(accumulated, problems):
             per_problem.append((len(completions), _grade(completions, problem["ground_truth"])))
 
     else:
