@@ -1,0 +1,20 @@
+# Smoke eval config — verifies the eval pipeline runs end-to-end on the RTX 4060 8 GB.
+# Uses the 4-problem smoke pool and tiny k values; results are not meaningful.
+#
+# Usage:
+#   python scripts/eval_passk.py \
+#       --eval-config configs/eval_math_beyond_smoke.yaml \
+#       --pool-path data/math_beyond_smoke.jsonl
+
+evaluation:
+  benchmark: "MATH-Beyond"
+  primary_claim_path: "data/math_beyond_smoke.jsonl"
+  metrics: ["pass@1", "pass@2"]
+  claim_metric: "pass@1"
+
+  temperature: 1.0
+  top_p: 1.0
+  max_new_tokens: 64    # short completions — enough to confirm the loop runs
+
+  use_vllm: false
+  gen_batch_size: 2     # 2 completions per generate() call; fits on 8 GB with 1.5B model

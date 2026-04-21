@@ -43,7 +43,7 @@ Before treating the core table as final:
 - [ ] **Token-Markov:** real predictor in GRPO, not a toy; isolated code path (`train_token_markov.py`, `token_markov_state.py`, `grpo_token_markov.py`).
 - [ ] **Fairness:** same pretrained checkpoint across arms (`configs/base_model.yaml`), MATH-B pool, reward, train/eval budgets, max length, decode settings (unless documented method-specific).
 - [ ] **Metrics:** `pass@1024` all arms; table from `run_ablation_table.py` artifacts, not hand-typed.
-- [ ] **Repro:** seeds + tolerances in `repro_tolerance.yaml`; checkpoints/logs kept.
+- [x] **Repro:** seeds + tolerances in `repro_tolerance.yaml`; seeding stack verified bit-for-bit on smoke (entropy + completion hashes identical across runs); `check_reproducibility.py` in place; checkpoints/log infrastructure confirmed.
 
 **Out of scope:** replicating Yuan’s ablations, matching every Yuan hyperparameter, extra benchmarks before the matrix is done. Park ideas in `reports/writeup_stubs.md`.
 
@@ -53,7 +53,7 @@ Before treating the core table as final:
 
 **Deliverables:** (1) deps pinned (`requirements.txt`), (2) `prepare_data.py` outputs per `DATA_PROTOCOL`, (3) `train_baseline.py` smoke + A100, (4) `eval_passk.py` for k ∈ {1,16,1024}, (5) artifacts under `artifacts/baseline_grpo/{run_id}/`.
 
-*Data track (2) is done; rest of Phase 1 is not.*
+**Implementation status:** all five deliverables implemented and smoke-verified. Pending: A100 production run + recording pass@{1,16,1024} results.
 
 **Pass:** stable A100 baseline; valid pass@ metrics; same-seed rerun within `repro_tolerance.yaml`; README has train/eval commands.
 

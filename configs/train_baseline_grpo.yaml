@@ -3,7 +3,36 @@ extends: "configs/base_model.yaml"
 experiment:
   name: "baseline_grpo"
   state_mode: "history_as_state"
+  profile: "full"
 
 training:
-  # TODO: Wire to training loop defaults.
   seed: 11
+
+  # Learning rate: Yuan appendix reference (1e-6); same across all arms per contract.
+  learning_rate: 1.0e-6
+
+  # Generation group: 8 completions per prompt per step.
+  # TRL constraint: batch_size % num_generations == 0, so batch_size must be a multiple of 8.
+  num_generations: 8
+  batch_size: 8             # per_device_train_batch_size; 1 unique prompt per generation pass
+  grad_accum_steps: 4       # effective prompt batch = 4 per weight update
+
+  # Completion budget: 1024 tokens gives enough room for chain-of-thought + \boxed{answer}.
+  max_completion_length: 1024
+
+  # Decode settings: same across all arms for fair comparison.
+  temperature: 1.0          # Yuan reference; consistent with base_parity.yaml
+  top_p: 1.0
+
+  # Training duration: 10 epochs over 40-problem pool = ~50 weight updates.
+  # Increase if reward signal hasn't converged by the end.
+  num_epochs: 10
+  max_steps: null           # null = use num_epochs
+
+  gradient_checkpointing: false   # A100 80 GB, 1.5B model — not needed
+  use_vllm: false
+  logging_steps: 1               # write every step to trainer_state.json for reproducibility checks
+  save_steps: 5                  # checkpoint early enough to support partial-run reproducibility checks
+
+evaluation:
+  path: "data/math_beyond_math_b_i_base.jsonl"

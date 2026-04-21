@@ -28,20 +28,22 @@ data:
   split_id: "math_b_i_base_v1"
 
 training:
-  # Yuan-derived defaults (from appendix details)
-  learning_rate: 1.0e-6
-  kl_coef: 0.001
-  batch_size: 128
-  mini_batch_size: 128
-  group_size: 8
-
-  # Project-controlled values to freeze before final runs (same across arms).
-  # TODO(config-freeze): set equal values for all arms.
-  max_steps: null
-  max_seq_len: null
-  grad_accum_steps: null
-  num_epochs: null
-  seed: null
+  # Locked values — identical across all four arms (PROJECT_CONTRACT.md fairness criteria).
+  # Yuan's appendix reference values are noted in comments where they differ from ours.
+  seed: 11
+  learning_rate: 1.0e-6        # Yuan: 1e-6 ✓
+  num_generations: 8           # Yuan: group_size 8 ✓ (TRL parameter name)
+  batch_size: 8                # per_device_train_batch_size; must be a multiple of num_generations
+                               # (Yuan used batch_size 128 on a different stack — we use 8 on single GPU)
+  grad_accum_steps: 4          # effective prompts per weight update = 4
+  max_completion_length: 1024  # tokens; enough for chain-of-thought + \boxed{answer}
+  temperature: 1.0             # Yuan: 1.0 ✓
+  top_p: 1.0
+  num_epochs: 10               # 10 passes over 40-problem pool ≈ 50 weight updates
+  max_steps: null              # null = governed by num_epochs
+  gradient_checkpointing: false
+  use_vllm: false
+  # kl_coef: 0.001             # Yuan reference — TRL GRPO uses clipped objective, no KL term
 
 evaluation:
   # Yuan reports 1.0; keep identical across all arms for fair comparison.

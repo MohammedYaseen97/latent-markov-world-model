@@ -195,6 +195,7 @@ def main() -> None:
     full_path = out_dir / "math_beyond_full_181.jsonl"
     primary_path = out_dir / "math_beyond_math_b_i_base.jsonl"
     strict_path = out_dir / "math_beyond_hf_strict_all_models.jsonl"
+    smoke_path = out_dir / "math_beyond_smoke.jsonl"
     manifest_path = out_dir / "benchmark_manifest.json"
 
     all_records = [row_to_record(i, ds[i]) for i in range(len(ds))]
@@ -220,6 +221,9 @@ def main() -> None:
 
     primary_records = [row_to_record(i, ds[i]) for i in primary_indices]
     write_jsonl(primary_path, primary_records)
+
+    # Smoke pool: first 4 rows of the primary pool — deterministic, no extra filtering.
+    write_jsonl(smoke_path, primary_records[:4])
 
     strict_indices: list[int] | None = None
     if not args.no_secondary_strict:
@@ -261,6 +265,7 @@ def main() -> None:
             "columns_used": primary_columns,
         },
         "full_pool": {"path": rel(full_path), "row_count": len(ds)},
+        "smoke_pool": {"path": rel(smoke_path), "row_count": min(4, len(primary_records))},
         "secondary_strict_pool": None,
         "hub_reference": "https://huggingface.co/datasets/brendel-group/MATH-Beyond",
         "reproducibility": {
@@ -284,6 +289,8 @@ def main() -> None:
         manifest["sha256_math_beyond_full_181_jsonl"] = sha256_file(full_path)
     if primary_path.is_file():
         manifest["sha256_math_beyond_math_b_i_base_jsonl"] = sha256_file(primary_path)
+    if smoke_path.is_file():
+        manifest["sha256_math_beyond_smoke_jsonl"] = sha256_file(smoke_path)
     if strict_indices is not None and strict_path.is_file():
         manifest["sha256_math_beyond_hf_strict_all_models_jsonl"] = sha256_file(strict_path)
 
@@ -292,6 +299,7 @@ def main() -> None:
 
     print(f"Wrote {len(ds)} rows -> {full_path}", file=sys.stderr)
     print(f"Wrote {len(primary_records)} rows -> {primary_path}  ({args.primary_mode})", file=sys.stderr)
+    print(f"Wrote {min(4, len(primary_records))} rows -> {smoke_path}  (smoke subset)", file=sys.stderr)
     if strict_indices is not None:
         print(f"Wrote {len(strict_indices)} rows -> {strict_path}", file=sys.stderr)
     print(f"Wrote {manifest_path}", file=sys.stderr)

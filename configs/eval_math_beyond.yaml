@@ -2,9 +2,23 @@ evaluation:
   benchmark: "MATH-Beyond"
   primary_claim_set: "math_b_i_base"
   primary_claim_path: "data/math_beyond_math_b_i_base.jsonl"
+  smoke_pool_path: "data/math_beyond_smoke.jsonl"
   secondary_strict_path: "data/math_beyond_hf_strict_all_models.jsonl"
   optional_full_set_path: "data/math_beyond_full_181.jsonl"
   metrics: ["pass@1", "pass@16", "pass@1024"]
   # Mandatory claim metric: pass@1024 on primary_claim_path (MATH-B-I base pool; N from manifest).
   claim_metric: "pass@1024"
-  # TODO: Finalize decode/eval settings (match configs/final_parity/ for final runs).
+
+  # Decode settings — must match across all arms for fair comparison (same as training).
+  temperature: 1.0
+  top_p: 1.0
+  max_new_tokens: 1024
+
+  # vLLM for production: generates all problems × n_samples in one batched call.
+  # Orders of magnitude faster than HF generate for pass@1024 (40k completions).
+  use_vllm: true
+  vllm_gpu_memory_utilization: 0.85
+
+  # HF generate fallback (used when use_vllm: false).
+  # Increase gen_batch_size for faster throughput; decrease if OOM.
+  gen_batch_size: 64

@@ -1,0 +1,35 @@
+# Smoke profile — local RTX 4060 8 GB pipeline verification only.
+# Goal: confirm the full loop (load → dataset → GRPOTrainer → reward → checkpoint) runs without error.
+# Not a training run: 64-token completions and 4 steps produce no meaningful reward signal.
+#
+# Usage:
+#   python scripts/train_baseline.py \
+#       --config configs/train_baseline_grpo_smoke.yaml
+
+extends: "configs/train_baseline_grpo.yaml"
+
+experiment:
+  profile: "smoke"
+
+training:
+  seed: 11
+
+  # batch_size must be a multiple of num_generations (TRL constraint).
+  num_generations: 2
+  batch_size: 2
+  grad_accum_steps: 1
+
+  # Very short completions — enough to confirm generation runs, not to produce \boxed{} answers.
+  max_completion_length: 64
+
+  # Decode settings: same as production for consistency.
+  temperature: 1.0
+  top_p: 1.0
+
+  max_steps: 4
+  num_epochs: 1
+
+  gradient_checkpointing: true  # required to fit 1.5B + QLoRA optimizer on 8 GB
+
+evaluation:
+  path: "data/math_beyond_smoke.jsonl"

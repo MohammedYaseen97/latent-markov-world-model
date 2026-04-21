@@ -8,6 +8,9 @@ primary:
   huggingface_repo_id: "Qwen/Qwen2.5-1.5B-Instruct"
   tokenizer_repo_id: "Qwen/Qwen2.5-1.5B-Instruct"
   dtype: "bfloat16"
+  # Pinned commit — ensures identical weights across all runs regardless of Hub updates.
+  # Refresh with: python -c "from huggingface_hub import model_info; print(model_info('Qwen/Qwen2.5-1.5B-Instruct').sha)"
+  revision: "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
 
 # Same convention: instruct-style distill so behavior matches primary track (chat, follows prompts).
 fallback:

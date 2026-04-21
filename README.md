@@ -159,6 +159,45 @@ This project earns the right to make that larger claim.
 
 ---
 
+## Running the Experiments
+
+**Install dependencies (exact versions pinned):**
+```bash
+pip install -r requirements.txt
+```
+
+**Smoke test (RTX 4060 8 GB — pipeline verification only):**
+```bash
+# Training
+python scripts/train_baseline.py --config configs/train_baseline_grpo_smoke.yaml
+
+# Eval
+python scripts/eval_passk.py \
+    --eval-config configs/eval_math_beyond_smoke.yaml \
+    --pool-path data/math_beyond_smoke.jsonl \
+    --arm-name baseline_grpo_smoke
+
+# Reproducibility check (run twice, compare)
+python scripts/check_reproducibility.py \
+    artifacts/baseline_grpo/<run_1>/checkpoint-4/trainer_state.json \
+    artifacts/baseline_grpo/<run_2>/checkpoint-4/trainer_state.json
+```
+
+**Production (A100 80 GB):**
+```bash
+# Training
+python scripts/train_baseline.py --config configs/train_baseline_grpo.yaml
+
+# Eval (uses vLLM for fast pass@1024 — 40 k completions)
+python scripts/eval_passk.py \
+    --eval-config configs/eval_math_beyond.yaml \
+    --checkpoint artifacts/baseline_grpo/<run_id>/checkpoint-<N> \
+    --arm-name baseline_grpo \
+    --output artifacts/baseline_grpo/<run_id>/eval_metrics.json
+```
+
+---
+
 ## Reproducibility Contract
 
 - Same pretrained checkpoint across all four arms (or documented fallback, applied uniformly)
