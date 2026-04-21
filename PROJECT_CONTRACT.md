@@ -49,7 +49,7 @@ Before treating the core table as final:
 
 ---
 
-## Phase 1: Baseline + data + eval
+## Phase 1 ✅ — Baseline + data + eval
 
 **Deliverables:** (1) deps pinned (`requirements.txt`), (2) `prepare_data.py` outputs per `DATA_PROTOCOL`, (3) `train_baseline.py` smoke + A100, (4) `eval_passk.py` for k ∈ {1,16,1024}, (5) artifacts under `artifacts/baseline_grpo/{run_id}/`.
 
@@ -59,7 +59,7 @@ Before treating the core table as final:
 
 ---
 
-## Phase 2: Token-Markov arm
+## Phase 2 🔲 — Token-Markov arm
 
 **Deliverables:** `token_markov_state.py`, `train_token_markov.py`, `grpo_token_markov.py`, plus `configs/final_parity/train_*` for baseline + token-Markov.
 
@@ -67,7 +67,7 @@ Before treating the core table as final:
 
 ---
 
-## Phase 3: Latent + uncertainty
+## Phase 3 🔲 — Latent + uncertainty
 
 **Deliverables:** `vae_state_encoder.py`, `grpo_latent.py` (both modes), `reward_bonus.py`, final parity YAMLs for both latent arms.
 
@@ -75,7 +75,7 @@ Before treating the core table as final:
 
 ---
 
-## Phase 4: Table + ship
+## Phase 4 🔲 — Table + ship
 
 **Deliverables:** `run_ablation_table.py` → `reports/ablation_core.csv` / `.md`; commands, configs, seeds, artifact paths documented.
 
