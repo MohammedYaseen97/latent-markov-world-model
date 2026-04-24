@@ -30,3 +30,24 @@ TODO: Document methodological and empirical limitations.
 ## Paper draft
 
 TODO: Write arXiv-style manuscript draft (6–8 pages equivalent).
+
+### Framing constraint (do not lose this)
+
+**The load-bearing frame is the MDP reformulation, not the VAE architecture.** Every section leads with: "We replace history-as-state with a compact learned Markov state." The VAE is mentioned as the implementation. This distinction determines the abstract, the intro hook, and the contribution bullets.
+
+The abstract shape (from PROJECT_BRIEF.md): current RL post-training fails because token history is not a valid MDP state → we replace it with a learned latent Markov state → this breaks the capability ceiling where standard RLVR fails.
+
+### Related work — Reasoning Palette (must handle explicitly)
+
+Reasoning Palette (VAE latent modulating reasoning strategy via token prefix) is the closest adjacent paper. Differentiator that must appear clearly in related work:
+
+- **Theirs:** VAE sampled *once per problem* as a strategy prefix before generation begins. Static per problem.
+- **Ours:** `z_h` evolves *step-wise during the rollout* as a Markov state. Dynamic through reasoning.
+- Different MDP formulation, not just a different architecture. They never question the history-as-state MDP. We do.
+
+### Markov diagnostic results (TODO after Phase 3)
+
+Must include empirical evidence that `z_h` satisfies the Markov property:
+- Latent transition loss: `z_h + a_h → z_{h+1}` without history
+- Last-state-only ablation: policy on `z_h` only vs full history access
+- Latent variance analysis: does `σ_h²` correlate with problem difficulty / solution uncertainty?

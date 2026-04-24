@@ -1,9 +1,41 @@
-extends: "configs/base_model.yaml"
+# Token-Markov arm — Delethink-style RL-learned textual carryover.
+# Inherits all shared training knobs from train_baseline_grpo.yaml.
+# Only method-specific fields are set here.
+#
+# Paper: "The Markovian Thinker: Architecture-Agnostic Linear Scaling of Reasoning"
+#        (Aghajohari et al., ICLR 2026) — https://github.com/McGill-NLP/the-markovian-thinker
+#
+# Mechanism (Algorithm 1 from paper):
+#   Chunk 1:  x1 = query;         y1 ~ π(x1; C)    [up to C new tokens]
+#             q  = q ⊕ y1[0:100]  [append first 100 "planning" tokens to query permanently]
+#   Chunk l≥2: xl = q ⊕ y_{l-1}[-m:]               [original query + last m tokens of prev chunk]
+#              yl ~ π(xl; C-m)                       [up to C-m new tokens]
+#   Stop when [EOS] is produced or iteration_cap is reached.
+#
+# Budget design (must equal baseline's 1024 total new tokens for fair comparison):
+#   C = 512, m = C/2 = 256 (paper's fixed ratio), iteration_cap = 3
+#   Total new tokens: C + (C-m) * (I-1) = 512 + 256*2 = 1024 ✓
+
+extends: "configs/train_baseline_grpo.yaml"
 
 experiment:
   name: "token_markov_grpo"
   state_mode: "token_markov"
 
 training:
-  # TODO: Align with configs/final_parity/base_parity.yaml + PROJECT_CONTRACT.md (Yuan = hints).
   seed: 11
+
+token_markov:
+  chunk_boundary: "fixed_tokens"   # Delethink generates exactly up to C tokens per chunk (or stops at [EOS])
+  chunk_size_tokens: 512           # C — per-chunk generation cap (new tokens); m = C/2 = 256
+  max_carryover_tokens: 256        # m = C/2 (paper's fixed formula). The last m tokens of chunk l
+                                   # become the Markov state for chunk l+1. STRICTLY BOUNDED —
+                                   # any larger and carryover approaches full history.
+  planning_prefix_tokens: 100      # First 100 tokens of chunk 1 are appended to query permanently
+                                   # (paper's "planning tokens" — captures problem setup / approach).
+  iteration_cap: 3                 # Max chunks per rollout. With C=512, m=256: 512+256+256=1024 total ✓
+  carryover_format: "freeform"     # Raw last-m tokens of previous chunk — NO hand-engineered structure.
+                                   # The model learns what state to write via RL reward signal.
+  context_reset: true              # Old chunk tokens are DELETED. Next chunk context = query + carryover.
+                                   # Requires overriding TRL's GRPOTrainer generation loop — the standard
+                                   # loop assumes one continuous sequence per rollout.

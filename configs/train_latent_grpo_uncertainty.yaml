@@ -1,9 +1,29 @@
-extends: "configs/base_model.yaml"
+# Latent + uncertainty arm — VAE latent Markov state + KL variance exploration bonus.
+# Inherits all shared training knobs from train_baseline_grpo.yaml.
+# Only method-specific fields are set here.
+
+extends: "configs/train_baseline_grpo.yaml"
 
 experiment:
   name: "latent_grpo_uncertainty"
-  state_mode: "latent"
+  state_mode: "latent_uncertainty"
+
+training:
+  seed: 11
+
+vae:
+  # TODO(phase3): Fill these before implementation — should match train_latent_grpo.yaml exactly.
+  latent_dim: null
+  encoder_layers: null
+  decoder_layers: null
+  input: "hidden_states"
+  conditioning: "concat"
 
 uncertainty_bonus:
   enabled: true
-  # TODO: Set final beta schedule.
+  # TODO(phase3): Set beta schedule before implementation.
+  # β × KL(q(z|trajectory) || p(z)) added as intrinsic reward term.
+  # Anneal β so exploration dominates early, exploitation dominates later.
+  beta_start: null          # Initial β (high — prioritise exploration)
+  beta_end: null            # Final β (low — prioritise exploitation)
+  beta_schedule: null       # Options: "linear" | "cosine" | "step"

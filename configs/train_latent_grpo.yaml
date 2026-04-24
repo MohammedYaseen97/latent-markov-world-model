@@ -1,9 +1,20 @@
-extends: "configs/base_model.yaml"
+# Latent arm — VAE latent Markov state, no uncertainty bonus.
+# Inherits all shared training knobs from train_baseline_grpo.yaml.
+# Only method-specific fields are set here.
+
+extends: "configs/train_baseline_grpo.yaml"
 
 experiment:
   name: "latent_grpo"
   state_mode: "latent"
 
 training:
-  # TODO: Fill latent-arm settings.
   seed: 11
+
+vae:
+  # TODO(phase3): Fill these before implementation.
+  latent_dim: null          # Start small: 64-128 per PROJECT_BRIEF.md
+  encoder_layers: null      # MLP depth: 2-3 layers
+  decoder_layers: null      # MLP depth: 2-3 layers
+  input: "hidden_states"    # Final-layer hidden states averaged over last N tokens per reasoning step
+  conditioning: "concat"    # z concatenated with token embedding before policy head
