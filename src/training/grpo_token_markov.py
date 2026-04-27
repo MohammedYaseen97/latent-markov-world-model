@@ -28,9 +28,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import math
+
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
+from tqdm import tqdm
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
@@ -224,6 +227,173 @@ def generate_delethink_trace(
 
 
 # ---------------------------------------------------------------------------
+# Batched generation (production path)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _chunk_log_probs_batched(
+    model: AutoModelForCausalLM,
+    input_ids_batch: torch.Tensor,
+    responses: list[torch.Tensor],
+    prompt_len: int,
+) -> list[torch.Tensor]:
+    """Per-token log probs for a batch of (prompt, response) pairs in one forward pass.
+
+    All rows in input_ids_batch share the same prompt_len; responses are right-padded
+    with zeros and masked. With causal attention + masking, each row is processed
+    independently — results are numerically identical to G sequential _chunk_log_probs
+    calls.
+
+    Args:
+        input_ids_batch: (G, prompt_len) prompt tokens, same for all rows in chunk 1,
+                         per-trace in chunks 2+.
+        responses:       G tensors of (possibly different) response lengths.
+        prompt_len:      number of prompt tokens per row.
+    Returns:
+        List of G 1-D tensors matching each response length.
+    """
+    G = len(responses)
+    device = input_ids_batch.device
+    max_resp_len = max(r.shape[0] for r in responses)
+    total_len = prompt_len + max_resp_len
+
+    full_ids = torch.zeros(G, total_len, dtype=torch.long, device=device)
+    attn_mask = torch.zeros(G, total_len, dtype=torch.long, device=device)
+
+    full_ids[:, :prompt_len] = input_ids_batch
+    attn_mask[:, :prompt_len] = 1
+    for g, resp in enumerate(responses):
+        resp_len = resp.shape[0]
+        full_ids[g, prompt_len : prompt_len + resp_len] = resp
+        attn_mask[g, prompt_len : prompt_len + resp_len] = 1
+
+    logits = model(full_ids, attention_mask=attn_mask).logits  # (G, total_len, vocab)
+
+    results: list[torch.Tensor] = []
+    for g, resp in enumerate(responses):
+        resp_len = resp.shape[0]
+        resp_logits = logits[g, prompt_len - 1 : prompt_len + resp_len - 1]
+        log_probs = F.log_softmax(resp_logits, dim=-1)
+        results.append(log_probs[torch.arange(resp_len, device=device), resp])
+    return results
+
+
+@torch.no_grad()
+def generate_delethink_traces_batch(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    query_ids: list[int],
+    cfg: dict[str, Any],
+    G: int,
+    temperature: float,
+    top_p: float,
+) -> list[Trace]:
+    """Generate G independent Delethink traces in parallel.
+
+    Functionally identical to calling generate_delethink_trace G times, but uses
+    batched model.generate calls (one per chunk) instead of G sequential calls.
+
+    Chunk 1: all G traces share the same prompt → single model.generate(batch=G).
+    Chunks 2+: each active trace has a unique prompt of the same length
+               (query + P planning tokens + m carryover tokens) → torch.stack, no
+               padding required. Traces that ended early (EOS in a previous chunk)
+               are silently dropped from the active set.
+
+    Old log probs are computed via one batched forward pass per chunk (replacing G
+    sequential _chunk_log_probs calls).
+
+    Args:
+        G: number of independent traces to generate (num_generations).
+    Returns:
+        List of G Trace objects in the same order as the G generation slots.
+    """
+    C = cfg["chunk_size_tokens"]
+    m = cfg["max_carryover_tokens"]
+    I = cfg["iteration_cap"]
+    P = cfg["planning_prefix_tokens"]
+    eos = tokenizer.eos_token_id
+    device = next(model.parameters()).device
+
+    query_t = torch.tensor(query_ids, device=device, dtype=torch.long)
+
+    traces = [Trace() for _ in range(G)]
+    active = list(range(G))          # indices of still-generating traces
+    query_t_g = [query_t.clone() for _ in range(G)]   # per-trace persistent query
+    next_prompt_g: dict[int, torch.Tensor] = {}        # per-trace prompt for next chunk
+
+    for chunk_idx in range(I):
+        if not active:
+            break
+
+        n_active = len(active)
+        max_new = C if chunk_idx == 0 else (C - m)
+
+        # Build prompt batch — chunk 1 is identical for all; chunks 2+ differ per trace.
+        if chunk_idx == 0:
+            prompt_len = query_t.shape[0]
+            input_batch = query_t.unsqueeze(0).expand(n_active, -1).contiguous()
+        else:
+            # All active prompts have the same length: len(query_ids) + P + m.
+            prompts = [next_prompt_g[g] for g in active]
+            prompt_len = prompts[0].shape[0]
+            input_batch = torch.stack(prompts)
+
+        # One model.generate call for all active traces.
+        attn_mask = torch.ones_like(input_batch)
+        out = model.generate(
+            input_batch,
+            attention_mask=attn_mask,
+            max_new_tokens=max_new,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=eos,
+            eos_token_id=eos,
+        )
+
+        # Extract per-trace responses; trim to first EOS inclusive.
+        # (pad_token_id == eos_token_id, so trailing pads appear as EOS.)
+        responses: list[torch.Tensor] = []
+        for j in range(n_active):
+            resp = out[j, prompt_len:]
+            eos_positions = (resp == eos).nonzero(as_tuple=False)
+            if len(eos_positions) > 0:
+                resp = resp[: eos_positions[0].item() + 1]
+            responses.append(resp)
+
+        # One batched forward pass for all old_log_probs (replaces n_active separate passes).
+        old_lps = _chunk_log_probs_batched(model, input_batch, responses, prompt_len)
+
+        # Record chunks and advance active set.
+        still_active: list[int] = []
+        for j, g in enumerate(active):
+            resp = responses[j]
+            if resp.shape[0] == 0:
+                continue  # empty response — drop trace
+
+            traces[g].chunks.append(Chunk(
+                input_ids=input_batch[j].clone(),
+                response_ids=resp.clone(),
+                old_log_probs=old_lps[j],
+            ))
+
+            # Fold first P tokens of chunk-1 response into the persistent query.
+            if chunk_idx == 0:
+                query_t_g[g] = torch.cat([query_t_g[g], resp[:P]])
+
+            if resp[-1].item() == eos:
+                continue  # natural EOS — trace complete
+
+            # Build next prompt: persistent query + Markov carryover.
+            next_prompt_g[g] = torch.cat([query_t_g[g], resp[-m:]])
+            still_active.append(g)
+
+        active = still_active
+
+    return traces
+
+
+# ---------------------------------------------------------------------------
 # Reward and advantages
 # ---------------------------------------------------------------------------
 
@@ -393,6 +563,20 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
     revision = primary.get("revision")
     dtype = getattr(torch, primary["dtype"])
 
+    # Load dataset BEFORE initialising CUDA / loading model weights.
+    # datasets' .map() spawns worker processes; forking after CUDA is initialised
+    # causes the workers to inherit a broken CUDA context and hang indefinitely.
+    # num_proc=1 is a belt-and-suspenders guard that forces single-process execution
+    # so the fork never happens even if this ordering is accidentally swapped later.
+    raw_dataset = load_dataset(
+        "json", data_files=config["evaluation"]["path"], split="train"
+    )
+    dataset = raw_dataset.map(
+        map_keys,
+        remove_columns=[c for c in raw_dataset.column_names if c not in ("prompt", "answer")],
+        num_proc=1,
+    )
+    logger.info("dataset ready: %d rows  |  loading model %s ...", len(dataset), model_id)
     # Smoke: 4-bit QLoRA to fit on 8 GB RTX 4060 — pipeline verification only.
     # Full: native bfloat16 on A100 80 GB.
     if is_smoke:
@@ -440,13 +624,7 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
     if getattr(tokenizer, "init_kwargs", {}).get("tokenizer_class") == "Qwen2Tokenizer":
         tokenizer.init_kwargs["tokenizer_class"] = "Qwen2TokenizerFast"
 
-    raw_dataset = load_dataset(
-        "json", data_files=config["evaluation"]["path"], split="train"
-    )
-    dataset = raw_dataset.map(
-        map_keys,
-        remove_columns=[c for c in raw_dataset.column_names if c != "prompt"],
-    )
+    logger.info("model and tokenizer ready")
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=training["learning_rate"]
@@ -468,7 +646,23 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
     (run_dir / "resolved_config.json").write_text(json.dumps(config, indent=2))
 
     problems = list(dataset)
+
+    # Precompute tokenised prompts once — reused across all epochs.
+    for problem in problems:
+        prompt_text = tokenizer.apply_chat_template(
+            problem["prompt"], tokenize=False, add_generation_prompt=True
+        )
+        problem["query_ids"] = tokenizer(prompt_text, return_tensors="pt").input_ids[0].tolist()
+
+    steps_per_epoch = math.ceil(len(problems) / batch_sz)
+    total_steps = min(num_epochs * steps_per_epoch, max_steps)
+    logger.info(
+        "starting training — %d problems  %d epochs  %d steps  batch=%d  G=%d",
+        len(problems), num_epochs, total_steps, batch_sz, G,
+    )
+
     global_step = 0
+    step_bar = tqdm(total=total_steps, desc="training", unit="step", dynamic_ncols=True)
 
     for epoch in range(num_epochs):
         for batch_start in range(0, len(problems), batch_sz):
@@ -477,94 +671,93 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
 
             batch = problems[batch_start : batch_start + batch_sz]
             optimizer.zero_grad()
-            accum_loss = None  # None until at least one trace has a real gradient
-            last_traces = []   # for logging
+            accum_loss = None
+            last_traces = []
 
-            for accum_idx, problem in enumerate(batch):
-                answer = problem["answer"]
-                prompt_text = tokenizer.apply_chat_template(
-                    problem["prompt"], tokenize=False, add_generation_prompt=True
-                )
-                query_ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0].tolist()
-
-                # --- Generate G traces (no gradient) ---
+            # Rollout phase — one transient bar across all traces in this step.
+            rollout_total = len(batch) * G
+            with tqdm(
+                total=rollout_total,
+                desc="  rollout",
+                unit="trace",
+                leave=False,
+                dynamic_ncols=True,
+            ) as rollout_bar:
                 model.eval()
-                traces: list[Trace] = []
-                for _ in range(G):
-                    t = generate_delethink_trace(
-                        model, tokenizer, query_ids, tm_cfg, temperature, top_p
+                for problem in batch:
+                    answer = problem["answer"]
+                    traces = generate_delethink_traces_batch(
+                        model, tokenizer, problem["query_ids"], tm_cfg, G, temperature, top_p
                     )
-                    t.answer = answer
-                    traces.append(t)
+                    for t in traces:
+                        t.answer = answer
+                    rollout_bar.update(G)
+                    last_traces = traces
+
+                    # --- Score traces ---
+                    rewards = []
+                    completions_for_log = []
+                    for t in traces:
+                        if t.chunks:
+                            all_resp_ids = torch.cat([c.response_ids for c in t.chunks])
+                            full_text = tokenizer.decode(all_resp_ids, skip_special_tokens=True)
+                        else:
+                            full_text = ""
+                        completions_for_log.append(full_text)
+                        pred = extract_answer(full_text)
+                        r = 1.0 if (pred is not None and answers_equivalent(pred, answer)) else 0.0
+                        t.reward = r
+                        rewards.append(r)
+
+                    logged_reward(completions_for_log, [answer] * G)
+
+                    # --- Compute advantages ---
+                    advantages = compute_grpo_advantages(rewards)
+
+                    # --- Compute loss over all traces with non-zero advantage ---
+                    batch_loss = None
+                    for trace, adv in zip(traces, advantages):
+                        if not trace.chunks or adv == 0.0:
+                            continue
+                        loss = compute_trace_loss(
+                            model, ref_model, trace, adv,
+                            clip_eps=0.2,
+                            kl_coef=0.001,
+                        )
+                        if loss is None:
+                            continue
+                        batch_loss = loss if batch_loss is None else batch_loss + loss
+
+                    if batch_loss is not None:
+                        scaled = batch_loss / (G * grad_accum)
+                        accum_loss = scaled if accum_loss is None else accum_loss + scaled
                 model.train()
-                last_traces = traces
 
-                # --- Score traces ---
-                rewards = []
-                completions_for_log = []
-                for t in traces:
-                    if t.chunks:
-                        all_resp_ids = torch.cat([c.response_ids for c in t.chunks])
-                        full_text = tokenizer.decode(all_resp_ids, skip_special_tokens=True)
-                    else:
-                        full_text = ""
-                    completions_for_log.append(full_text)
-                    pred = extract_answer(full_text)
-                    r = 1.0 if (pred is not None and answers_equivalent(pred, answer)) else 0.0
-                    t.reward = r
-                    rewards.append(r)
-
-                logged_reward(completions_for_log, [answer] * G)
-
-                # --- Compute advantages ---
-                advantages = compute_grpo_advantages(rewards)
-
-                # --- Compute loss over all traces with non-zero advantage ---
-                batch_loss = None
-                for trace, adv in zip(traces, advantages):
-                    if not trace.chunks or adv == 0.0:
-                        continue
-                    loss = compute_trace_loss(
-                        model, ref_model, trace, adv,
-                        clip_eps=0.2,
-                        kl_coef=0.001,
-                    )
-                    if loss is None:
-                        continue
-                    batch_loss = loss if batch_loss is None else batch_loss + loss
-
-                if batch_loss is not None:
-                    # Normalise by group size and accumulation steps.
-                    scaled = batch_loss / (G * grad_accum)
-                    accum_loss = scaled if accum_loss is None else accum_loss + scaled
-
-            # Only step if at least one trace in this batch had a non-zero advantage.
+            # Backward + optimizer step.
             if accum_loss is not None and accum_loss.requires_grad:
                 accum_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
             global_step += 1
-
-            if global_step % logging_steps == 0:
-                mean_reward = (
-                    sum(t.reward for t in last_traces) / len(last_traces)
-                    if last_traces else 0.0
-                )
-                loss_val = accum_loss.item() if accum_loss is not None else 0.0
-                logger.info(
-                    "step=%d  loss=%.4f  mean_reward=%.3f",
-                    global_step, loss_val, mean_reward,
-                )
+            mean_reward = (
+                sum(t.reward for t in last_traces) / len(last_traces)
+                if last_traces else 0.0
+            )
+            loss_val = accum_loss.item() if accum_loss is not None else 0.0
+            step_bar.set_postfix(loss=f"{loss_val:.4f}", reward=f"{mean_reward:.3f}", epoch=epoch)
+            step_bar.update(1)
 
             if global_step % save_steps == 0:
                 ckpt_dir = run_dir / f"checkpoint-{global_step}"
                 model.save_pretrained(ckpt_dir)
                 tokenizer.save_pretrained(ckpt_dir)
-                logger.info("Saved checkpoint to %s", ckpt_dir)
+                tqdm.write(f"  checkpoint saved → {ckpt_dir}")
+
+    step_bar.close()
 
     # Final checkpoint.
     final_dir = run_dir / f"checkpoint-{global_step}"
     model.save_pretrained(final_dir)
     tokenizer.save_pretrained(final_dir)
-    logger.info("Training complete. Final checkpoint: %s", final_dir)
+    tqdm.write(f"training complete — final checkpoint: {final_dir}")
