@@ -714,6 +714,10 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
                     # --- Compute advantages ---
                     advantages = compute_grpo_advantages(rewards)
 
+                    # Switch to train mode for loss computation so dropout (if any)
+                    # is active during the policy gradient forward pass.
+                    model.train()
+
                     # --- Compute loss over all traces with non-zero advantage ---
                     batch_loss = None
                     for trace, adv in zip(traces, advantages):
@@ -731,7 +735,7 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
                     if batch_loss is not None:
                         scaled = batch_loss / (G * grad_accum)
                         accum_loss = scaled if accum_loss is None else accum_loss + scaled
-                model.train()
+                    model.eval()  # back to eval for next problem's generation
 
             # Backward + optimizer step.
             if accum_loss is not None and accum_loss.requires_grad:
