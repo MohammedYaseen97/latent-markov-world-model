@@ -1,0 +1,35 @@
+# Smoke profile for 2-chunk ablation — local RTX 4060 8 GB pipeline verification.
+# Goal: confirm the 2-chunk Delethink loop runs without error (not meaningful training).
+#
+# Chunk sizes scaled proportionally to the production config (768→96, 512→64):
+#   Budget: C + (C-m)*(I-1) = 96 + (96-64)*1 = 96 + 32 = 128 total tokens (smoke).
+#
+# Usage:
+#   python scripts/train_token_markov.py \
+#       --config configs/train_token_markov_grpo_2chunk_smoke.yaml
+
+extends: "configs/train_token_markov_grpo_2chunk.yaml"
+
+experiment:
+  profile: "smoke"
+
+training:
+  num_generations: 2        # G=2 traces per problem — minimum to compute advantages
+  batch_size: 2
+  grad_accum_steps: 1
+  temperature: 1.0
+  top_p: 1.0
+  max_steps: 4
+  num_epochs: 1
+  gradient_checkpointing: true
+  logging_steps: 1
+  save_steps: 5
+
+token_markov:
+  chunk_size_tokens: 96          # C (smoke) — 768/8
+  max_carryover_tokens: 64       # m (smoke) — 512/8
+  planning_prefix_tokens: 20     # first 20 tokens as planning prefix (smoke)
+  iteration_cap: 2               # 2 chunks: 96 + 32 = 128 total tokens (smoke)
+
+evaluation:
+  path: "data/math_beyond_smoke.jsonl"

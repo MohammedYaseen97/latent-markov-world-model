@@ -36,7 +36,7 @@ All arms share the same pretrained checkpoint, benchmark pool, reward function, 
 | Arm | State representation |
 |-----|---------------------|
 | `baseline_grpo` | Full token history (standard RLVR) |
-| `token_markov_grpo` | Token-space Markov state predictor (Yuan-inspired comparator) |
+| `token_markov_grpo` | Delethink-style RL-learned textual carryover — chunked generation with context reset (Markovian Thinker, ICLR 2026) |
 | `latent_grpo` | VAE latent state — learned, no uncertainty bonus |
 | `latent_grpo_uncertainty` | VAE latent state + KL-based intrinsic exploration bonus |
 
@@ -194,6 +194,46 @@ python scripts/eval_passk.py \
     --checkpoint artifacts/baseline_grpo/<run_id>/checkpoint-<N> \
     --arm-name baseline_grpo \
     --output artifacts/baseline_grpo/<run_id>/eval_metrics.json
+```
+
+**Token-Markov arm — smoke (RTX 4060 8 GB):**
+```bash
+# 3-chunk (default, m=256)
+python scripts/train_token_markov.py \
+    --config configs/train_token_markov_grpo_smoke.yaml
+
+# 2-chunk ablation (m=512, same 1024-token budget)
+python scripts/train_token_markov.py \
+    --config configs/train_token_markov_grpo_2chunk_smoke.yaml
+```
+
+**Token-Markov arm — production (A100 80 GB):**
+```bash
+# Training — 3-chunk
+python scripts/train_token_markov.py \
+    --config configs/train_token_markov_grpo.yaml
+
+# Training — 2-chunk ablation
+python scripts/train_token_markov.py \
+    --config configs/train_token_markov_grpo_2chunk.yaml
+
+# Eval — full pass@1024 (sequential HF generate, ~3× baseline wall-clock; plan accordingly)
+python scripts/eval_passk.py \
+    --generation-mode token_markov \
+    --train-config configs/train_token_markov_grpo.yaml \
+    --eval-config configs/eval_math_beyond.yaml \
+    --checkpoint artifacts/token_markov_grpo/<run_id>/checkpoint-<N> \
+    --arm-name token_markov_3chunk \
+    --output artifacts/token_markov_grpo/<run_id>/eval_metrics.json
+
+# Eval — 2-chunk ablation
+python scripts/eval_passk.py \
+    --generation-mode token_markov \
+    --train-config configs/train_token_markov_grpo_2chunk.yaml \
+    --eval-config configs/eval_math_beyond.yaml \
+    --checkpoint artifacts/token_markov_grpo_2chunk/<run_id>/checkpoint-<N> \
+    --arm-name token_markov_2chunk \
+    --output artifacts/token_markov_grpo_2chunk/<run_id>/eval_metrics.json
 ```
 
 ---

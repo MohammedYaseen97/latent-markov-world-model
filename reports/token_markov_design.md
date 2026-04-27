@@ -179,29 +179,92 @@ in the paper).
 
 ---
 
-## What the Model Learns
+## What the Model Learns (and what it doesn't need to learn)
 
-The reward signal propagates back through all chunks. If a trace gets the right
-answer, every token in chunks 1, 2, and 3 gets upweighted. The model gradually
-learns that the last 256 tokens of each chunk (what becomes the carryover) should
-contain whatever information is needed to continue reasoning in the next chunk.
+**The Markov property is structural, not learned.** The context reset happens
+regardless of what the model writes. From the first rollout, the model is already
+operating as a Markovian thinker — it cannot attend to tokens outside the
+carryover window even if it tries. This is the core contribution of this arm:
+enforcing the Markov property by construction and measuring whether that alone
+helps on hard math.
 
-Nobody tells the model what to write in the carryover. There is no structured
-format, no prompt engineering. The Markov state representation emerges from the
-reward signal alone. That's the "RL-learned" part.
+**What RL does** is progressively improve the *quality* of the carryover as a
+sufficient statistic. If a trace reaches the correct answer, every token in all
+three chunks gets upweighted — including the tokens that ended up in the carryover
+window. Over training, the model learns to write more useful state into that window.
+There is no structured format, no prompt engineering for this — but the learning
+happens on top of an already-Markovian inference regime, not as the mechanism that
+creates it.
+
+**Important caveat for our setting.** The Delethink paper demonstrated this on
+R1-Distill-Qwen-1.5B, which already exhibits natural Markovian reasoning behaviour
+zero-shot (last-m tokens of its output happen to contain useful state summaries
+because of R1-style CoT pretraining). We use Qwen2.5-1.5B-Instruct, which has no
+such prior. Our m=256 window in the default 3-chunk config is also 8-16× smaller
+than the paper's 2K-4K, which limits carryover richness.
+
+To address the window concern without breaking the 1024-token budget or requiring
+a code change, we run a **2-chunk ablation** (`train_token_markov_grpo_2chunk.yaml`)
+with I=2, C=768, m=512:
+```
+budget: 768 + (768-512)*1 = 768 + 256 = 1024 tokens  ✓  (identical to baseline)
+carryover: 512 tokens (2× the 3-chunk variant)
+```
+This doubles the carryover window within the same budget. The result directly
+answers the small-window concern: if 2-chunk beats 3-chunk, larger carryover
+matters; if they're similar, the 256-token window is sufficient.
+
+Two honest outcomes for the token-Markov arm overall:
+
+- Beats baseline → enforced Markov structure helps even on a non-reasoning-model
+  base with a small carryover window.
+- ≈ or underperforms baseline → motivates the latent arm: structured token carryover
+  is not sufficient; a learned continuous compression (VAE) is needed.
+
+Either result is informative. This arm is a controlled test of what structural
+Markov enforcement contributes — not a validation of Delethink's claim on our dataset.
 
 ---
 
-## Key Parameters (our config)
+## Key Parameters
 
-| Parameter | Value | Source |
-|-----------|-------|--------|
-| C (chunk size) | 512 tokens | Scaled from paper's 4K to fit 1024-token total budget |
-| m (carryover) | 256 tokens | Paper's fixed ratio: m = C/2 |
+### Default: 3-chunk config (`train_token_markov_grpo.yaml`)
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| C (chunk size) | 512 tokens | Budget: 512 + 256 + 256 = 1024 ✓ |
+| m (carryover) | 256 tokens | Paper's ratio m = C/2 |
 | planning_prefix | 100 tokens | Paper's Algorithm 1 exactly |
-| iteration_cap (I) | 3 chunks | Budget: 512 + 256 + 256 = 1024 = baseline ✓ |
+| iteration_cap (I) | 3 chunks | 2 context resets per rollout |
 | carryover_format | freeform | Raw last-m tokens, no structure |
-| context_reset | true | Old tokens deleted — enforces Markov property structurally |
+| context_reset | true | Old tokens deleted each chunk boundary |
+
+### Ablation: 2-chunk config (`train_token_markov_grpo_2chunk.yaml`)
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| C (chunk size) | 768 tokens | Budget: 768 + 256 = 1024 ✓ |
+| m (carryover) | 512 tokens | **2× the default** — addresses small-window concern |
+| planning_prefix | 100 tokens | Same as default |
+| iteration_cap (I) | 2 chunks | 1 context reset per rollout |
+| carryover_format | freeform | Inherited from default |
+| context_reset | true | Inherited from default |
+
+**Ablation question answered:** does doubling the carryover window (256→512 tokens)
+improve `pass@1024`, given the same total token budget?
+
+### Budget derivation formula (both configs)
+
+```
+Total new tokens = C + (C - m) * (I - 1)
+
+3-chunk:  512 + (512-256)*2 = 512 + 512   = 1024  ✓
+2-chunk:  768 + (768-512)*1 = 768 + 256   = 1024  ✓
+baseline: (single sequence, 1024 tokens)           1024  ✓
+```
+
+m is derived from the budget formula — it was never an independent choice.
+The only free parameter is I (number of chunks).
 
 ---
 
@@ -235,3 +298,29 @@ The mismatch is in two places:
    we need loss over all chunks jointly, normalized by total trace length.
 
 These are not trivial to patch. Options to consider next.
+
+---
+
+## Base Model Choice (why we do NOT switch to DeepSeek R1-Distill)
+
+The Delethink paper used R1-Distill-Qwen-1.5B, which already behaves Markovian
+zero-shot. One might ask: should we switch to R1-Distill to match their setting?
+
+**No.** For two reasons:
+
+1. **Fairness across all four arms.** The contract requires the same base model
+   across all arms. Switching to R1-Distill for only the token-Markov arm confounds
+   the comparison — you'd be measuring base model effect, not Markov structure effect.
+   Switching for all arms would require re-running the baseline and is out of scope.
+
+2. **Using a non-R1 model is the harder, more informative test.** R1-Distill
+   already internalises chain-of-thought summarisation, so it has a natural affinity
+   for Delethink's carryover mechanism. Using Qwen2.5-1.5B-Instruct removes that
+   confound. If the token-Markov arm shows benefit here, the result is stronger
+   (Markov structure helps even without a reasoning-model prior). If it doesn't,
+   the result is informative about prerequisites (you need a reasoning-model base
+   or the latent VAE approach to generalise).
+
+   Testing on the "harder" model is the right scientific choice — it avoids
+   inflating the token-Markov arm's result through base model affinity and gives
+   a cleaner signal about what structural Markov enforcement actually contributes.

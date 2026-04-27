@@ -1,19 +1,23 @@
+# Final-parity config for the token-Markov arm (Delethink-style RL-learned textual carryover).
+# Extends the shared locked base; only Delethink-specific fields are set here.
+#
+# Implementation: Markovian Thinker (Aghajohari et al., ICLR 2026).
+# Design rationale + parameter derivations: reports/token_markov_design.md
+# Training loop: src/training/grpo_token_markov.py (custom loop, bypasses TRL GRPOTrainer)
+#
+# Budget: C + (C-m)*(I-1) = 512 + 256*2 = 1024 tokens = baseline max_completion_length ✓
+
 extends: "configs/final_parity/base_parity.yaml"
 
 experiment:
   arm: "token_markov_grpo"
-  description: "Yuan-style token-space Markov state arm."
+  description: "Delethink-style RL-learned textual carryover (Markovian Thinker, ICLR 2026)."
 
-method:
-  state_mode: "token_markov"
-  token_markov:
-    enabled: true
-    # TODO(config-freeze): finalize architecture (Yuan-inspired, not replication).
-    predictor_type: null
-    predictor_hidden_dims: null
-    transition_context_window: null
-    predictor_checkpoint: null
-  latent_state:
-    enabled: false
-  uncertainty_bonus:
-    enabled: false
+token_markov:
+  chunk_boundary: "fixed_tokens"
+  chunk_size_tokens: 512        # C — chunk 1 generates up to 512 new tokens
+  max_carryover_tokens: 256     # m = C/2 — last 256 tokens of each chunk become next chunk's context
+  planning_prefix_tokens: 100   # first 100 tokens of chunk 1 permanently appended to query
+  iteration_cap: 3              # 3 chunks: 512 + 256 + 256 = 1024 total ✓
+  carryover_format: "freeform"  # raw last-m tokens, no structure
+  context_reset: true           # old chunk tokens deleted at each boundary

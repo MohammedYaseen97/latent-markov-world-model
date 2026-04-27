@@ -6,6 +6,21 @@ Short placeholders for later phases. Keeps the repo to one scratch surface inste
 
 Use this section to park out-of-scope ideas without expanding current project scope.
 
+### Batched Delethink trace generation for production pass@1024 ✅ Implemented
+
+`eval_passk.py --generation-mode token_markov` supports both vLLM (production)
+and HF sequential (smoke/fallback) backends.
+
+**vLLM multi-round path (use_vllm: true in eval config):**
+- Round 1: identical to baseline — all problems × n_samples via vLLM, chunk_size
+  completions at a time (same chunked loop as baseline, max_tokens=C).
+- Rounds 2+: 40k unique prompts (query + carryover_i per trace), batched in
+  chunks of chunk_size with n=1 each, max_tokens=C-m (shorter per round).
+- Wall-clock: round 1 ≈ baseline (~30 min); rounds 2+ are fast (fewer tokens,
+  n=1). Total ≈ baseline ± 25%. Full pass@1024 at ~30-45 min on A100.
+
+**HF sequential fallback (use_vllm: false):** correct but slow; smoke use only.
+
 ## Main results
 
 TODO: Populate after core table (`run_ablation_table.py`). Partial results below as arms complete.
@@ -17,7 +32,8 @@ TODO: Populate after core table (`run_ablation_table.py`). Partial results below
 | arm | pass@1 | pass@16 | pass@1024 | run |
 |-----|--------|---------|-----------|-----|
 | `baseline_grpo` | 0.012% | 0.19% | **10.0%** | `20260421T131720Z` / `checkpoint-100` |
-| `token_markov_grpo` | — | — | — | pending |
+| `token_markov_grpo` (3-chunk, m=256) | — | — | — | pending |
+| `token_markov_grpo` (2-chunk, m=512) | — | — | — | pending (ablation) |
 | `latent_grpo` | — | — | — | pending |
 | `latent_grpo_uncertainty` | — | — | — | pending |
 

@@ -1,0 +1,46 @@
+# Smoke profile — local RTX 4060 8 GB pipeline verification only.
+# Goal: confirm the full Delethink loop (load → chunked generation → reward →
+#        loss → checkpoint) runs without error on a small machine.
+# Not a training run: tiny chunk sizes and 4 steps produce no meaningful signal.
+#
+# Usage:
+#   python scripts/train_token_markov.py \
+#       --config configs/train_token_markov_grpo_smoke.yaml
+#   # or equivalently:
+#   python scripts/train_token_markov.py \
+#       --config configs/train_token_markov_grpo.yaml --smoke
+
+extends: "configs/train_token_markov_grpo.yaml"
+
+experiment:
+  profile: "smoke"
+
+training:
+  num_generations: 2        # G=2 traces per problem — minimum to compute advantages
+  batch_size: 2             # 2 problems per step
+  grad_accum_steps: 1
+
+  # Decode settings: same as production.
+  temperature: 1.0
+  top_p: 1.0
+
+  max_steps: 4
+  num_epochs: 1
+
+  gradient_checkpointing: true   # required to fit 1.5B + QLoRA on 8 GB
+  logging_steps: 1
+  save_steps: 5
+
+token_markov:
+  # Scale chunk sizes down to fit within 8 GB and run quickly.
+  # Budget: C + (I-1)*(C-m) = 64 + 1*(64-32) = 96 total tokens — enough to
+  # verify the chunked loop and context reset, not enough for real reasoning.
+  chunk_size_tokens: 64          # C (smoke)
+  max_carryover_tokens: 32       # m = C/2 (smoke)
+  planning_prefix_tokens: 20     # first 20 tokens as planning prefix (smoke)
+  iteration_cap: 2               # 2 chunks: 64 + 32 = 96 total tokens (smoke)
+  # All other token_markov fields (chunk_boundary, carryover_format,
+  # context_reset) inherit from train_token_markov_grpo.yaml.
+
+evaluation:
+  path: "data/math_beyond_smoke.jsonl"

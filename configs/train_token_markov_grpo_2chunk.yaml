@@ -1,0 +1,31 @@
+# Token-Markov arm — 2-chunk ablation variant.
+# Purpose: test whether a LARGER carryover window (m=512) beats the default 3-chunk
+# variant (m=256) at the SAME total token budget.
+#
+# Budget derivation (must equal baseline's 1024 total new tokens):
+#   formula:  C + (C-m) * (I-1) = budget
+#   I=2, C=768, m=512:  768 + (768-512)*1 = 768 + 256 = 1024  ✓
+#
+# vs. default 3-chunk:  C=512, m=256, I=3:  512 + 256*2 = 1024  ✓
+#
+# Key difference: carryover window doubles from 256 → 512 tokens.
+# The model retains the entire second half of chunk 1 instead of the last quarter.
+# Context resets are fewer (1 vs 2), and each chunk is larger.
+#
+# No code changes needed — same formula, same training loop, just different knobs.
+
+extends: "configs/train_token_markov_grpo.yaml"
+
+experiment:
+  name: "token_markov_grpo_2chunk"
+  state_mode: "token_markov"
+
+token_markov:
+  chunk_size_tokens: 768        # C — chunk 1 generates up to 768 new tokens
+  max_carryover_tokens: 512     # m = 512 (paper formula: last m tokens of chunk 1
+                                # become the Markov state for chunk 2). Doubles
+                                # the carryover vs. 3-chunk variant (256 → 512).
+  planning_prefix_tokens: 100   # First 100 tokens of chunk 1 appended to query
+                                # permanently — same ratio as 3-chunk variant.
+  iteration_cap: 2              # 2 chunks: 768 + 256 = 1024 total ✓
+  # carryover_format, context_reset, chunk_boundary all inherit from parent.

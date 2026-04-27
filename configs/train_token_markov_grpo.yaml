@@ -22,9 +22,6 @@ experiment:
   name: "token_markov_grpo"
   state_mode: "token_markov"
 
-training:
-  seed: 11
-
 token_markov:
   chunk_boundary: "fixed_tokens"   # Delethink generates exactly up to C tokens per chunk (or stops at [EOS])
   chunk_size_tokens: 512           # C — per-chunk generation cap (new tokens); m = C/2 = 256
@@ -37,5 +34,5 @@ token_markov:
   carryover_format: "freeform"     # Raw last-m tokens of previous chunk — NO hand-engineered structure.
                                    # The model learns what state to write via RL reward signal.
   context_reset: true              # Old chunk tokens are DELETED. Next chunk context = query + carryover.
-                                   # Requires overriding TRL's GRPOTrainer generation loop — the standard
-                                   # loop assumes one continuous sequence per rollout.
+                                   # Implemented via custom training loop in grpo_token_markov.py —
+                                   # NOT TRL's GRPOTrainer (which assumes one continuous sequence per rollout).
