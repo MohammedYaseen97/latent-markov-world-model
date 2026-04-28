@@ -161,12 +161,16 @@ def _unbiased_pass_at_k(n: int, c: int, k: int) -> float:
     return 1.0 - comb(n - c, k) / comb(n, k)
 
 
-def _build_prompts(problems: list[dict[str, Any]], tokenizer: Any) -> list[str]:
+def _build_prompts(
+    problems: list[dict[str, Any]],
+    tokenizer: Any,
+    system_prompt: str = SYSTEM_PROMPT,
+) -> list[str]:
     """Format all problems into chat-template strings ready for generation."""
     prompts = []
     for problem in problems:
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": problem["prompt"]},
         ]
         prompts.append(tokenizer.apply_chat_template(
@@ -362,11 +366,14 @@ def _estimate_pass_at_k_metrics_token_markov(
     I = int(tm_cfg["iteration_cap"])
     P = int(tm_cfg["planning_prefix_tokens"])
 
+    from src.training.grpo_token_markov import make_tm_system_prompt
+    tm_system_prompt = make_tm_system_prompt(m)
+
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base_prompts = _build_prompts(problems, tokenizer)
+    base_prompts = _build_prompts(problems, tokenizer, system_prompt=tm_system_prompt)
 
     if use_vllm:
         from vllm import LLM, SamplingParams
@@ -488,7 +495,7 @@ def _estimate_pass_at_k_metrics_token_markov(
         per_problem = []
         for problem in tqdm(problems, desc="Evaluating (token-Markov HF)", unit="problem"):
             messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": tm_system_prompt},
                 {"role": "user", "content": problem["prompt"]},
             ]
             prompt_text = tokenizer.apply_chat_template(

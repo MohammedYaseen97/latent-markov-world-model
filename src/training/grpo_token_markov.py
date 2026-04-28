@@ -38,15 +38,61 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from src.training.grpo_baseline import (
-    SYSTEM_PROMPT,
+    SYSTEM_PROMPT,  # noqa: F401 — re-exported for eval_passk.py import
     answers_equivalent,
     extract_answer,
     make_logged_reward,
-    map_keys,
+    map_keys,       # noqa: F401 — kept for any external callers
     math_reward,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Token-Markov system prompt
+# ---------------------------------------------------------------------------
+
+def make_tm_system_prompt(m: int) -> str:
+    """Return the system prompt for the token-Markov arm, parameterised by m.
+
+    Tells the model two things the baseline prompt does not:
+      1. It reasons in stages — only its last m tokens carry forward.
+      2. It should structure those tokens as a useful state summary so the
+         next stage can continue without the earlier context.
+
+    This applies equally to chunk 1 (build a good initial state) and chunks
+    2+ (continue reasoning, then encode state again for the next stage).
+    Using the same prompt across all chunks is correct: the carryover text
+    already visible in chunks 2+ shows the model what "previous state" looks
+    like; the system prompt tells it to keep doing the same at the end.
+    """
+    return (
+        "Please reason step by step. "
+        f"You reason in stages: only your last {m} tokens of each stage carry "
+        "forward as context — nothing else is retained. "
+        "Always end each stage by clearly summarising: "
+        "(1) what you have established so far, "
+        "(2) your current approach, and "
+        "(3) your immediate next step. "
+        "This summary is the only thing the next stage will see. "
+        "Put your final answer inside \\boxed{answer}."
+    )
+
+
+def tm_map_keys(m: int):
+    """Return a map_keys function that uses the token-Markov system prompt."""
+    system_prompt = make_tm_system_prompt(m)
+
+    def _map(ex):
+        return {
+            "prompt": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": ex["prompt"]},
+            ],
+            "answer": ex["ground_truth"],
+        }
+    return _map
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +618,7 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
         "json", data_files=config["evaluation"]["path"], split="train"
     )
     dataset = raw_dataset.map(
-        map_keys,
+        tm_map_keys(tm_cfg["max_carryover_tokens"]),
         remove_columns=[c for c in raw_dataset.column_names if c not in ("prompt", "answer")],
         num_proc=1,
     )
