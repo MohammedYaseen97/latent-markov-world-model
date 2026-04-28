@@ -18,6 +18,10 @@ evaluation:
   # Orders of magnitude faster than HF generate for pass@1024 (40k completions).
   use_vllm: true
   vllm_gpu_memory_utilization: 0.85
+  # token-Markov rounds 2+ have longer prompts (base + planning + carryover ≈ 550 tokens)
+  # combined with max_new_tokens=256 per sequence. chunk_size=64 exhausts the KV cache
+  # mid-batch and deadlocks the vLLM scheduler. 32 keeps peak KV usage well within 80 GB.
+  vllm_chunk_size: 32
 
   # HF generate fallback (used when use_vllm: false).
   # Increase gen_batch_size for faster throughput; decrease if OOM.
