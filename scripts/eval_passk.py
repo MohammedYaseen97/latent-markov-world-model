@@ -633,7 +633,7 @@ def main() -> None:
         if args.train_config is None:
             raise ValueError(
                 "--train-config is required for --generation-mode token_markov. "
-                "Pass e.g. configs/train_token_markov_grpo.yaml (or the 2-chunk variant)."
+                "Pass e.g. configs/train_token_markov_grpo.yaml."
             )
         train_cfg = load_yaml_with_extends(args.train_config.resolve(), root=REPO_ROOT)
         metrics = _estimate_pass_at_k_metrics_token_markov(

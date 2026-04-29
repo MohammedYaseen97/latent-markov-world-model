@@ -198,26 +198,17 @@ python scripts/eval_passk.py \
 
 **Token-Markov arm — smoke (RTX 4060 8 GB):**
 ```bash
-# 3-chunk (default, m=256)
 python scripts/train_token_markov.py \
     --config configs/train_token_markov_grpo_smoke.yaml
-
-# 2-chunk ablation (m=512, same 1024-token budget)
-python scripts/train_token_markov.py \
-    --config configs/train_token_markov_grpo_2chunk_smoke.yaml
 ```
 
 **Token-Markov arm — production (A100 80 GB):**
 ```bash
-# Training — 3-chunk
+# Training
 python scripts/train_token_markov.py \
     --config configs/train_token_markov_grpo.yaml
 
-# Training — 2-chunk ablation
-python scripts/train_token_markov.py \
-    --config configs/train_token_markov_grpo_2chunk.yaml
-
-# Eval — full pass@1024 (sequential HF generate, ~3× baseline wall-clock; plan accordingly)
+# Eval — full pass@1024 (~30-45 min on A100 via vLLM multi-round)
 python scripts/eval_passk.py \
     --generation-mode token_markov \
     --train-config configs/train_token_markov_grpo.yaml \
@@ -225,15 +216,6 @@ python scripts/eval_passk.py \
     --checkpoint artifacts/token_markov_grpo/<run_id>/checkpoint-<N> \
     --arm-name token_markov_3chunk \
     --output artifacts/token_markov_grpo/<run_id>/eval_metrics.json
-
-# Eval — 2-chunk ablation
-python scripts/eval_passk.py \
-    --generation-mode token_markov \
-    --train-config configs/train_token_markov_grpo_2chunk.yaml \
-    --eval-config configs/eval_math_beyond.yaml \
-    --checkpoint artifacts/token_markov_grpo_2chunk/<run_id>/checkpoint-<N> \
-    --arm-name token_markov_2chunk \
-    --output artifacts/token_markov_grpo_2chunk/<run_id>/eval_metrics.json
 ```
 
 ---

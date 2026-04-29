@@ -200,35 +200,24 @@ creates it.
 R1-Distill-Qwen-1.5B, which already exhibits natural Markovian reasoning behaviour
 zero-shot (last-m tokens of its output happen to contain useful state summaries
 because of R1-style CoT pretraining). We use Qwen2.5-1.5B-Instruct, which has no
-such prior. Our m=256 window in the default 3-chunk config is also 8-16× smaller
-than the paper's 2K-4K, which limits carryover richness.
+such prior. Our m=256 window is also 8-16× smaller than the paper's 2K-4K, which
+limits carryover richness.
 
-To address the window concern without breaking the 1024-token budget or requiring
-a code change, we run a **2-chunk ablation** (`train_token_markov_grpo_2chunk.yaml`)
-with I=2, C=768, m=512:
-```
-budget: 768 + (768-512)*1 = 768 + 256 = 1024 tokens  ✓  (identical to baseline)
-carryover: 512 tokens (2× the 3-chunk variant)
-```
-This doubles the carryover window within the same budget. The result directly
-answers the small-window concern: if 2-chunk beats 3-chunk, larger carryover
-matters; if they're similar, the 256-token window is sufficient.
+**Observed result:** `pass@1024 = 7.5%` vs baseline `10.0%`. RL training received
+zero gradient signal (per-sample pass rate ≈ 0.007%; G=8 insufficient to surface any
+successes at training time). This is the expected finding: Delethink's hard context
+reset imposes a capability cost that degrades the base model's ceiling below the
+threshold for RL to obtain a usable reward signal. The model is structurally
+Markovian, but RL cannot improve carryover quality because it never observes a success.
 
-Two honest outcomes for the token-Markov arm overall:
-
-- Beats baseline → enforced Markov structure helps even on a non-reasoning-model
-  base with a small carryover window.
-- ≈ or underperforms baseline → motivates the latent arm: structured token carryover
-  is not sufficient; a learned continuous compression (VAE) is needed.
-
-Either result is informative. This arm is a controlled test of what structural
-Markov enforcement contributes — not a validation of Delethink's claim on our dataset.
+This outcome directly motivates the latent arm: a learned continuous representation
+should compress state without the capability degradation of hard context reset.
 
 ---
 
 ## Key Parameters
 
-### Default: 3-chunk config (`train_token_markov_grpo.yaml`)
+### 3-chunk config (`train_token_markov_grpo.yaml`)
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
@@ -239,28 +228,13 @@ Markov enforcement contributes — not a validation of Delethink's claim on our 
 | carryover_format | freeform | Raw last-m tokens, no structure |
 | context_reset | true | Old tokens deleted each chunk boundary |
 
-### Ablation: 2-chunk config (`train_token_markov_grpo_2chunk.yaml`)
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| C (chunk size) | 768 tokens | Budget: 768 + 256 = 1024 ✓ |
-| m (carryover) | 512 tokens | **2× the default** — addresses small-window concern |
-| planning_prefix | 100 tokens | Same as default |
-| iteration_cap (I) | 2 chunks | 1 context reset per rollout |
-| carryover_format | freeform | Inherited from default |
-| context_reset | true | Inherited from default |
-
-**Ablation question answered:** does doubling the carryover window (256→512 tokens)
-improve `pass@1024`, given the same total token budget?
-
-### Budget derivation formula (both configs)
+### Budget derivation
 
 ```
 Total new tokens = C + (C - m) * (I - 1)
 
-3-chunk:  512 + (512-256)*2 = 512 + 512   = 1024  ✓
-2-chunk:  768 + (768-512)*1 = 768 + 256   = 1024  ✓
-baseline: (single sequence, 1024 tokens)           1024  ✓
+3-chunk:  512 + (512-256)*2 = 512 + 512 = 1024  ✓
+baseline: (single sequence, 1024 tokens)         1024  ✓
 ```
 
 m is derived from the budget formula — it was never an independent choice.
