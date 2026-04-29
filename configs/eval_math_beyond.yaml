@@ -18,6 +18,11 @@ evaluation:
   # Orders of magnitude faster than HF generate for pass@1024 (40k completions).
   use_vllm: true
   vllm_gpu_memory_utilization: 0.85
+  # Fixed seed for vLLM's internal RNG — makes eval deterministic given the same
+  # checkpoint, config, and vllm_chunk_size. Without this, every run draws different
+  # token sequences (non-deterministic batching) even with identical settings.
+  # All four arms must use the same seed for a fair same-seed rerun comparison.
+  vllm_seed: 42
 
   # Cap vLLM's KV-cache block allocation. Without this, vLLM allocates for
   # max_position_embeddings=32768 (Qwen2.5 default), burning ~60 GB of GPU KV

@@ -222,6 +222,7 @@ def _make_vllm(checkpoint: str, eval_cfg: dict[str, Any]) -> "LLM":  # type: ign
         model=checkpoint,
         dtype="bfloat16",
         gpu_memory_utilization=utilization,
+        seed=int(eval_cfg.get("vllm_seed", 42)),
     )
     max_model_len = eval_cfg.get("vllm_max_model_len", None)
     if max_model_len is not None:
