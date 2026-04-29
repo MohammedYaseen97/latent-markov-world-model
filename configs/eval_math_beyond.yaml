@@ -18,10 +18,30 @@ evaluation:
   # Orders of magnitude faster than HF generate for pass@1024 (40k completions).
   use_vllm: true
   vllm_gpu_memory_utilization: 0.85
+
+  # Cap vLLM's KV-cache block allocation. Without this, vLLM allocates for
+  # max_position_embeddings=32768 (Qwen2.5 default), burning ~60 GB of GPU KV
+  # cache for sequences that never exceed ~1300 tokens in practice.
+  # Baseline max seq: prompt (~300 tok) + max_new_tokens (1024) ≈ 1324 tokens.
+  # Token-Markov max seq: prompt + P + m + (C-m) ≈ 912 tokens.
+  # 2048 is safe for both arms with comfortable headroom.
+  vllm_max_model_len: 2048
+
   # token-Markov rounds 2+ have longer prompts (base + planning + carryover ≈ 550 tokens)
   # combined with max_new_tokens=256 per sequence. chunk_size=64 exhausts the KV cache
   # mid-batch and deadlocks the vLLM scheduler. 32 keeps peak KV usage well within 80 GB.
   vllm_chunk_size: 32
+
+  # Token-Markov vLLM path: number of problems processed together per iteration.
+  # The root cause of "Killed" (Linux OOM) is that the old code held ALL rounds
+  # of text for ALL 40 × 1024 samples in RAM simultaneously (modified_queries +
+  # flat_prompts + chunk_texts + flat_outputs ≈ 400–600 MB of Python strings,
+  # on top of vLLM's own process footprint). Processing in groups bounds peak
+  # string RAM to group_sz × n_samples × I × ~4 KB ≈ 4 × 1024 × 3 × 4KB ≈ 50 MB.
+  # Throughput impact: negligible — total vLLM work is identical, just split across
+  # more llm.generate() calls each with a proportionally smaller batch.
+  # Increase for better vLLM batch utilisation if you have headroom (e.g. 8 or 10).
+  tm_vllm_problem_group_size: 4
 
   # HF generate fallback (used when use_vllm: false).
   # Increase gen_batch_size for faster throughput; decrease if OOM.

@@ -180,11 +180,54 @@ def _build_prompts(
 
 
 def _grade(completions: list[str], ground_truth: str) -> int:
-    return sum(
-        1 for comp in completions
-        if (pred := extract_answer(comp)) is not None
-        and answers_equivalent(pred, ground_truth)
+    count = 0
+    for comp in completions:
+        pred = extract_answer(comp)
+        if pred is None:
+            continue
+        try:
+            if answers_equivalent(pred, ground_truth):
+                count += 1
+        except Exception:
+            pass
+    return count
+
+
+def _make_vllm(checkpoint: str, eval_cfg: dict[str, Any]) -> "LLM":  # type: ignore[name-defined]
+    """Construct a vLLM LLM instance with a pre-flight GPU memory check.
+
+    Raises RuntimeError with a clear message if the GPU doesn't have enough
+    free memory to satisfy gpu_memory_utilization before the slow EngineCore
+    subprocess spawn. Accepts an optional vllm_max_model_len to cap KV-cache
+    block allocation (important: without this vLLM pre-allocates for the
+    model's full max_position_embeddings, which is 32 768 for Qwen2.5 and
+    wastes gigabytes of RAM for sequences that are never that long).
+    """
+    from vllm import LLM
+
+    utilization = eval_cfg.get("vllm_gpu_memory_utilization", 0.85)
+    if torch.cuda.is_available():
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        required_bytes = total_bytes * utilization
+        if free_bytes < required_bytes:
+            raise RuntimeError(
+                f"Not enough free GPU memory to start vLLM "
+                f"({free_bytes / 2**30:.1f} GiB free / {total_bytes / 2**30:.1f} GiB total, "
+                f"need {required_bytes / 2**30:.1f} GiB for "
+                f"gpu_memory_utilization={utilization}). "
+                f"Kill any orphaned GPU processes (nvidia-smi) and retry."
+            )
+
+    kwargs: dict[str, Any] = dict(
+        model=checkpoint,
+        dtype="bfloat16",
+        gpu_memory_utilization=utilization,
     )
+    max_model_len = eval_cfg.get("vllm_max_model_len", None)
+    if max_model_len is not None:
+        kwargs["max_model_len"] = int(max_model_len)
+
+    return LLM(**kwargs)
 
 
 def _estimate_pass_at_k_metrics(
@@ -218,32 +261,10 @@ def _estimate_pass_at_k_metrics(
     per_problem: list[tuple[int, int]] = []  # (n_sampled, n_correct) per problem
 
     if use_vllm:
-        from vllm import LLM, SamplingParams  # deferred — not required for smoke
+        from vllm import SamplingParams  # deferred — not required for smoke
 
-        # Fail fast with a clear message if another process is holding GPU memory.
-        # vLLM's own error ("Free memory … less than desired utilization") surfaces
-        # only after a slow EngineCore subprocess spawn; this check catches it upfront.
-        import torch
-        if torch.cuda.is_available():
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
-            utilization = eval_cfg.get("vllm_gpu_memory_utilization", 0.85)
-            required_bytes = total_bytes * utilization
-            if free_bytes < required_bytes:
-                free_gib = free_bytes / 2**30
-                total_gib = total_bytes / 2**30
-                required_gib = required_bytes / 2**30
-                raise RuntimeError(
-                    f"Not enough free GPU memory to start vLLM "
-                    f"({free_gib:.1f} GiB free / {total_gib:.1f} GiB total, "
-                    f"need {required_gib:.1f} GiB for gpu_memory_utilization={utilization}). "
-                    f"Kill any orphaned GPU processes (check: nvidia-smi) and retry."
-                )
+        llm = _make_vllm(checkpoint, eval_cfg)
 
-        llm = LLM(
-            model=checkpoint,
-            dtype="bfloat16",
-            gpu_memory_utilization=eval_cfg.get("vllm_gpu_memory_utilization", 0.85),
-        )
         # Generate in chunks rather than a single llm.generate(n=1024) call.
         # With max_tokens=1024 the EngineCore must detokenize ~40k sequences
         # (~20M tokens) before it can return anything, which stalls for 20+ min.
@@ -335,20 +356,30 @@ def _estimate_pass_at_k_metrics_token_markov(
     Two backends, selected by eval_cfg["use_vllm"]:
 
     vLLM (production, use_vllm=true):
-      Multi-round batched generation — same continuous-batching throughput as
-      the baseline vLLM path.
+      Problems are processed in groups of ``tm_vllm_problem_group_size`` (default 4).
+      Processing one group at a time keeps peak system RAM bounded to roughly:
+          group_sz × n_samples × I × ~4 KB ≈ 50–100 MB of Python string data
+      regardless of total problem count. Without grouping, all I rounds of text
+      for all 40 × 1024 samples live in RAM simultaneously, which triggers the
+      Linux OOM killer on machines with limited system RAM.
 
-      Round 1  — identical to baseline: all problems × n_samples via vLLM,
-                 chunk_size completions at a time (max_tokens=C).
-      Round 2+ — 40k unique prompts (query + carryover_i) in chunks of
-                 chunk_size, n=1 each (max_tokens=C-m, much shorter).
-
-      Wall-clock: round 1 ≈ baseline time (~30 min); rounds 2+ are short
-      because max_tokens is 2-4× smaller and n=1. Total ≈ baseline ± 25%.
+      Per group:
+        Round 1  — same prompt for all n_samples of each problem in the group →
+                   batched with SamplingParams(n=chunk_size). Exactly like the
+                   baseline path but limited to the current group.
+        Planning — first P tokens of each chunk-1 output folded into the query
+                   permanently (same as training). Computed once per group.
+        Rounds 2+ — only unfinished traces (EOS not yet hit) need new chunks.
+                    Their unique prompts are flattened and batched in chunk_size.
+        Grading  — after all rounds, grade problem-by-problem and free strings
+                   before moving to the next group.
 
     HF generate (smoke / no-vLLM fallback):
-      Sequential, one trace at a time. Correct but slow; use for smoke only.
+      Sequential, one trace at a time (already memory-efficient).
     """
+    import gc
+    import math
+
     n_samples = max(ks)
     temperature = eval_cfg.get("temperature", 1.0)
     top_p = eval_cfg.get("top_p", 1.0)
@@ -374,115 +405,168 @@ def _estimate_pass_at_k_metrics_token_markov(
         tokenizer.pad_token = tokenizer.eos_token
 
     base_prompts = _build_prompts(problems, tokenizer, system_prompt=tm_system_prompt)
+    n_problems = len(problems)
+    per_problem: list[tuple[int, int]] = []
 
     if use_vllm:
-        from vllm import LLM, SamplingParams
+        from vllm import SamplingParams
 
-        if torch.cuda.is_available():
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
-            utilization = eval_cfg.get("vllm_gpu_memory_utilization", 0.85)
-            required_bytes = total_bytes * utilization
-            if free_bytes < required_bytes:
-                free_gib = free_bytes / 2**30
-                total_gib = total_bytes / 2**30
-                required_gib = required_bytes / 2**30
-                raise RuntimeError(
-                    f"Not enough free GPU memory to start vLLM "
-                    f"({free_gib:.1f} GiB free / {total_gib:.1f} GiB total, "
-                    f"need {required_gib:.1f} GiB). Kill orphaned GPU processes and retry."
-                )
+        llm = _make_vllm(checkpoint, eval_cfg)
+        chunk_size: int = int(eval_cfg.get("vllm_chunk_size", 32))
 
-        llm = LLM(
-            model=checkpoint,
-            dtype="bfloat16",
-            gpu_memory_utilization=eval_cfg.get("vllm_gpu_memory_utilization", 0.85),
-        )
-        chunk_size: int = int(eval_cfg.get("vllm_chunk_size", 64))
-        n_problems = len(problems)
+        # Number of problems to process together. Larger = better vLLM batch
+        # utilisation; smaller = lower peak RAM. Default 4 keeps peak string
+        # data below ~100 MB while still presenting a reasonable batch to vLLM.
+        group_sz: int = int(eval_cfg.get("tm_vllm_problem_group_size", 4))
+        n_r1_iters = math.ceil(n_samples / chunk_size)
+        n_groups = math.ceil(n_problems / group_sz)
 
-        # chunk_texts[prob_idx][samp_idx] = list of per-chunk text strings
-        chunk_texts: list[list[list[str]]] = [
-            [[] for _ in range(n_samples)] for _ in range(n_problems)
-        ]
+        for g_idx, g_start in enumerate(range(0, n_problems, group_sz)):
+            g_end = min(g_start + group_sz, n_problems)
+            g_probs = problems[g_start:g_end]
+            g_prompts = base_prompts[g_start:g_end]
+            G = len(g_probs)
 
-        # ── Round 1: identical to baseline vLLM path ─────────────────────────
-        # Same prompt for all n_samples traces of each problem → use n=this_n.
-        # Accumulate into a flat list per problem, then assign to chunk_texts.
-        print(
-            f"[token-Markov eval] Round 1/{I}: {n_samples} completions × "
-            f"{n_problems} problems (max_tokens={C}) …",
-            file=sys.stderr,
-        )
-        accumulated_r1: list[list[str]] = [[] for _ in range(n_problems)]
-        remaining = n_samples
-        n_chunks_r1 = -(-n_samples // chunk_size)
-        for chunk_idx in range(1, n_chunks_r1 + 1):
-            this_n = min(chunk_size, remaining)
-            params = SamplingParams(n=this_n, temperature=temperature, top_p=top_p, max_tokens=C)
-            print(f"  chunk {chunk_idx}/{n_chunks_r1} (n={this_n}) …", file=sys.stderr)
-            outputs = llm.generate(base_prompts, params)
-            for prob_idx, out in enumerate(outputs):
-                accumulated_r1[prob_idx].extend(o.text for o in out.outputs)
-            remaining -= this_n
+            # chunk_texts[li][s] grows from [] to [c1_text, c2_text, …] over rounds.
+            chunk_texts: list[list[list[str]]] = [
+                [[] for _ in range(n_samples)] for _ in range(G)
+            ]
+            # finished[li][s] = True once EOS is seen; such samples skip further rounds.
+            finished: list[list[bool]] = [[False] * n_samples for _ in range(G)]
 
-        # Assign chunk-1 texts into chunk_texts[prob][samp][chunk=0].
-        for prob_idx in range(n_problems):
-            for samp_idx, text in enumerate(accumulated_r1[prob_idx]):
-                chunk_texts[prob_idx][samp_idx].append(text)
-
-        # ── Compute modified queries (base prompt + planning prefix) ──────────
-        # planning prefix = first P tokens of chunk-1 output, appended permanently.
-        modified_queries: list[list[str]] = []
-        for prob_idx in range(n_problems):
-            queries: list[str] = []
-            for samp_idx in range(n_samples):
-                c1_text = chunk_texts[prob_idx][samp_idx][0]
-                ids = tokenizer.encode(c1_text, add_special_tokens=False)
-                planning_text = tokenizer.decode(ids[:P], skip_special_tokens=True)
-                queries.append(base_prompts[prob_idx] + planning_text)
-            modified_queries.append(queries)
-
-        # ── Rounds 2 .. I ─────────────────────────────────────────────────────
-        # Each trace has a unique prompt = modified_query + carryover from prev chunk.
-        # Flatten all (prob, samp) pairs into one list, batch with chunk_size, n=1.
-        for round_idx in range(1, I):
-            max_new = C - m
-            flat_prompts: list[str] = []
-            for prob_idx in range(n_problems):
-                for samp_idx in range(n_samples):
-                    prev_text = chunk_texts[prob_idx][samp_idx][-1]
-                    ids = tokenizer.encode(prev_text, add_special_tokens=False)
-                    carryover = tokenizer.decode(ids[-m:], skip_special_tokens=True)
-                    flat_prompts.append(modified_queries[prob_idx][samp_idx] + carryover)
-
+            # ── Round 1 ──────────────────────────────────────────────────────
             print(
-                f"[token-Markov eval] Round {round_idx + 1}/{I}: "
-                f"{len(flat_prompts)} unique prompts (max_tokens={max_new}) …",
+                f"\n[TM eval] group {g_idx + 1}/{n_groups} — round 1/{I}: "
+                f"{n_samples} × {G} problems (max_tokens={C}) …",
                 file=sys.stderr,
             )
-            flat_outputs: list[str] = [""] * len(flat_prompts)
-            params = SamplingParams(n=1, temperature=temperature, top_p=top_p, max_tokens=max_new)
-            for start in range(0, len(flat_prompts), chunk_size):
-                batch = flat_prompts[start : start + chunk_size]
-                outs = llm.generate(batch, params)
-                for j, out in enumerate(outs):
-                    flat_outputs[start + j] = out.outputs[0].text
+            # Temporary per-problem accumulators — freed immediately after use.
+            r1_acc: list[list[str]] = [[] for _ in range(G)]
+            r1_fin: list[list[bool]] = [[] for _ in range(G)]
+            remaining = n_samples
+            for iter_i in range(n_r1_iters):
+                this_n = min(chunk_size, remaining)
+                outputs = llm.generate(
+                    g_prompts,
+                    SamplingParams(n=this_n, temperature=temperature, top_p=top_p, max_tokens=C),
+                )
+                for li, out in enumerate(outputs):
+                    for o in out.outputs:
+                        r1_acc[li].append(o.text)
+                        r1_fin[li].append(o.finish_reason == "stop")
+                remaining -= this_n
+                print(f"  r1 iter {iter_i + 1}/{n_r1_iters}", file=sys.stderr, end="\r")
 
-            for prob_idx in range(n_problems):
-                for samp_idx in range(n_samples):
-                    idx = prob_idx * n_samples + samp_idx
-                    chunk_texts[prob_idx][samp_idx].append(flat_outputs[idx])
+            for li in range(G):
+                for s in range(n_samples):
+                    chunk_texts[li][s].append(r1_acc[li][s])
+                    finished[li][s] = r1_fin[li][s]
+            del r1_acc, r1_fin
+            gc.collect()
 
-        # ── Grade ─────────────────────────────────────────────────────────────
-        per_problem: list[tuple[int, int]] = []
-        for prob_idx, problem in enumerate(problems):
-            completions = [
-                "".join(chunk_texts[prob_idx][samp_idx]) for samp_idx in range(n_samples)
-            ]
-            per_problem.append((len(completions), _grade(completions, problem["ground_truth"])))
+            # ── Planning prefix (compute once from chunk-1, reuse for all rounds) ──
+            # g_mq[li][s] = base_prompt[li] + first-P-tokens of chunk-1 output for sample s.
+            g_mq: list[list[str]] = []
+            for li in range(G):
+                mqs: list[str] = []
+                for s in range(n_samples):
+                    ids = tokenizer.encode(chunk_texts[li][s][0], add_special_tokens=False)
+                    planning_text = tokenizer.decode(ids[:P], skip_special_tokens=True)
+                    mqs.append(g_prompts[li] + planning_text)
+                g_mq.append(mqs)
+
+            # ── Rounds 2 .. I ────────────────────────────────────────────────
+            for round_idx in range(1, I):
+                max_new = C - m
+
+                # Only generate for samples whose traces are still live (no EOS yet).
+                active: list[tuple[int, int]] = [
+                    (li, s)
+                    for li in range(G)
+                    for s in range(n_samples)
+                    if not finished[li][s]
+                ]
+
+                print(
+                    f"\n[TM eval] group {g_idx + 1}/{n_groups} — round {round_idx + 1}/{I}: "
+                    f"{len(active)} active traces (max_tokens={max_new}) …",
+                    file=sys.stderr,
+                )
+
+                if active:
+                    # Build flat prompt list: modified_query + last-m-token carryover.
+                    flat_prompts: list[str] = []
+                    for li, s in active:
+                        prev_ids = tokenizer.encode(
+                            chunk_texts[li][s][-1], add_special_tokens=False
+                        )
+                        carryover = tokenizer.decode(prev_ids[-m:], skip_special_tokens=True)
+                        flat_prompts.append(g_mq[li][s] + carryover)
+
+                    flat_texts: list[str] = [""] * len(flat_prompts)
+                    flat_fin: list[bool] = [False] * len(flat_prompts)
+                    params = SamplingParams(
+                        n=1, temperature=temperature, top_p=top_p, max_tokens=max_new
+                    )
+                    n_batches = math.ceil(len(flat_prompts) / chunk_size)
+                    for b_idx, start in enumerate(range(0, len(flat_prompts), chunk_size)):
+                        outs = llm.generate(flat_prompts[start : start + chunk_size], params)
+                        for j, out in enumerate(outs):
+                            flat_texts[start + j] = out.outputs[0].text
+                            flat_fin[start + j] = out.outputs[0].finish_reason == "stop"
+                        print(
+                            f"  r{round_idx + 1} batch {b_idx + 1}/{n_batches}",
+                            file=sys.stderr,
+                            end="\r",
+                        )
+
+                    del flat_prompts
+                    gc.collect()
+
+                    for fi, (li, s) in enumerate(active):
+                        chunk_texts[li][s].append(flat_texts[fi])
+                        finished[li][s] = flat_fin[fi]
+
+                    del flat_texts, flat_fin
+                    gc.collect()
+
+                # Samples that were already finished get an empty placeholder so
+                # every chunk_texts[li][s] list has length == round_idx + 1.
+                for li in range(G):
+                    for s in range(n_samples):
+                        if len(chunk_texts[li][s]) <= round_idx:
+                            chunk_texts[li][s].append("")
+
+            # ── Grade this group (problem-by-problem to minimise peak RAM) ───
+            print(
+                f"\n[TM eval] group {g_idx + 1}/{n_groups} — grading "
+                f"{G * n_samples} completions (SymPy) …",
+                file=sys.stderr,
+            )
+            for li, problem in enumerate(g_probs):
+                n_correct = 0
+                for s in range(n_samples):
+                    full_text = "".join(chunk_texts[li][s])
+                    pred = extract_answer(full_text)
+                    if pred is not None:
+                        try:
+                            if answers_equivalent(pred, problem["ground_truth"]):
+                                n_correct += 1
+                        except Exception:
+                            pass
+                per_problem.append((n_samples, n_correct))
+                print(
+                    f"  problem {g_start + li + 1}/{n_problems}: "
+                    f"{n_correct}/{n_samples} correct",
+                    file=sys.stderr,
+                )
+
+            del chunk_texts, g_mq, finished
+            gc.collect()
 
     else:
         # ── HF sequential fallback (smoke / no-vLLM) ─────────────────────────
+        # One trace at a time — already bounded RAM, no grouping needed.
         from src.training.grpo_token_markov import generate_delethink_trace
 
         model = AutoModelForCausalLM.from_pretrained(
@@ -492,7 +576,6 @@ def _estimate_pass_at_k_metrics_token_markov(
         )
         model.eval()
 
-        per_problem = []
         for problem in tqdm(problems, desc="Evaluating (token-Markov HF)", unit="problem"):
             messages = [
                 {"role": "system", "content": tm_system_prompt},

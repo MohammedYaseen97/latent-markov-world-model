@@ -128,7 +128,13 @@ def answers_equivalent(pred: str, gold: str) -> bool:
     try:
         return abs(float(N(pred_expr)) - float(N(gold_expr))) < 1e-6
     except Exception:
+        pass
+    # str() calls SymPy's printer (sort_key → as_ordered_factors) which can recurse
+    # arbitrarily deep on pathological model outputs — guard with its own try/except.
+    try:
         return str(pred_expr) == str(gold_expr)
+    except Exception:
+        return pred.strip().lower() == gold.strip().lower()
 
 
 # ---------------------------------------------------------------------------
