@@ -24,15 +24,20 @@ training:
   temperature: 1.0          # Yuan reference; consistent with base_parity.yaml
   top_p: 1.0
 
-  # Training duration: 10 epochs over 40-problem pool = ~50 weight updates.
-  # Increase if reward signal hasn't converged by the end.
-  num_epochs: 10
-  max_steps: null           # null = use num_epochs
+  # Training duration: 200 steps for all arms.
+  # Token-Markov's custom loop gives ceil(40/8) × 40 epochs = 200 steps exactly.
+  # Baseline TRL is capped at 200 via max_steps (without it TRL may count differently).
+  # 200 steps is the minimum defensible budget for GRPO on a sparse-reward benchmark:
+  # with P(pass@1) ≈ 10%, roughly half of steps carry zero gradient — 200 steps gives
+  # ~100 effective gradient updates. All future latent-Markov arms inherit this via
+  # the config extends chain, so the budget is fair across all four arms.
+  num_epochs: 40
+  max_steps: 200
 
   gradient_checkpointing: false   # A100 80 GB, 1.5B model — not needed
   use_vllm: false
-  logging_steps: 5
-  save_steps: 50
+  logging_steps: 10
+  save_steps: 200
 
 evaluation:
   path: "data/math_beyond_math_b_i_base.jsonl"

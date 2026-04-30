@@ -13,8 +13,7 @@ from datasets import load_dataset
 from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
 
-from sympy import N, simplify, sympify
-from sympy.parsing.latex import parse_latex
+from math_verify import parse as mv_parse, verify as mv_verify
 
 
 # ---------------------------------------------------------------------------
@@ -57,82 +56,17 @@ def extract_answer(text: str) -> str | None:
 # Symbolic equivalence
 # ---------------------------------------------------------------------------
 
-def _to_sympy(s: str):
-    """Parse a string to a sympy expression. Returns None on any failure.
-
-    Routing: strings containing a backslash are LaTeX — try parse_latex first,
-    then sympify.  Plain expressions (numbers, '2*sqrt(2)', etc.) use sympify
-    first; parse_latex misparses them by treating letters as variables.
-    """
-    s = s.strip()
-    parsers = (parse_latex, sympify) if "\\" in s else (sympify, parse_latex)
-    for parser in parsers:
-        try:
-            result = parser(s)
-            if result is not None:
-                return result
-        except Exception:
-            continue
-    return None
-
-
-def _sympy_equiv(pred_expr, gold_expr, timeout: float = 5.0) -> bool | None:
-    """Run simplify(pred - gold) == 0 in a thread with a hard timeout.
-
-    Returns True/False on success, None if the call times out or raises.
-    SymPy's simplify has no built-in timeout and hangs indefinitely on
-    certain model-generated expressions (e.g. deeply nested radicals).
-
-    Important: do NOT use ThreadPoolExecutor as a context manager here.
-    The context manager calls shutdown(wait=True) on exit, which blocks
-    until the worker thread terminates — re-introducing the hang we are
-    trying to prevent.  Instead we call shutdown(wait=False) explicitly
-    so we leave any stuck SymPy thread running in the background and
-    move on immediately.
-    """
-    import concurrent.futures
-
-    def _check():
-        return simplify(pred_expr - gold_expr) == 0
-
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    fut = ex.submit(_check)
-    try:
-        result = fut.result(timeout=timeout)
-        ex.shutdown(wait=False)
-        return result
-    except (concurrent.futures.TimeoutError, Exception):
-        ex.shutdown(wait=False)
-        return None
-
-
 def answers_equivalent(pred: str, gold: str) -> bool:
     """True when pred and gold represent the same mathematical value.
 
-    Checks in order:
-    1. Symbolic simplification: simplify(pred - gold) == 0  (handles 1/2 == 2/4, sqrt(4) == 2, …)
-       — capped at 5 s to prevent SymPy hanging on pathological model outputs.
-    2. Numeric evaluation: |N(pred) - N(gold)| < 1e-6  (catches equivalent but non-simplifiable forms)
-    3. String fallback: normalised string equality.
+    Uses math-verify (HuggingFace), built specifically for LLM math evaluation.
+    Handles LaTeX, fractions, radicals, symbolic and numeric equivalence.
+    math-verify's own signal.alarm() timeout prevents hangs on pathological
+    inputs — it must run on the main thread (signal.alarm requires it).
+    Falls back to normalised string equality on any failure.
     """
-    pred_expr = _to_sympy(pred)
-    gold_expr = _to_sympy(gold)
-
-    if pred_expr is None or gold_expr is None:
-        return pred.strip().lower() == gold.strip().lower()
-
-    result = _sympy_equiv(pred_expr, gold_expr)
-    if result is True:
-        return True
-    # result is False (simplify finished, not equal) or None (timed out / error) — fall through to numeric
     try:
-        return abs(float(N(pred_expr)) - float(N(gold_expr))) < 1e-6
-    except Exception:
-        pass
-    # str() calls SymPy's printer (sort_key → as_ordered_factors) which can recurse
-    # arbitrarily deep on pathological model outputs — guard with its own try/except.
-    try:
-        return str(pred_expr) == str(gold_expr)
+        return bool(mv_verify(mv_parse(pred), mv_parse(gold)))
     except Exception:
         return pred.strip().lower() == gold.strip().lower()
 

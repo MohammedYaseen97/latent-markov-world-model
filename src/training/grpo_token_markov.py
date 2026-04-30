@@ -708,7 +708,24 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
     )
 
     global_step = 0
+    log_history: list[dict] = []
+    pending_log: dict = {}          # accumulates metrics within a logging window
+    num_tokens_seen = 0
     step_bar = tqdm(total=total_steps, desc="training", unit="step", dynamic_ncols=True)
+
+    def _write_trainer_state(directory: Path) -> None:
+        state = {
+            "best_global_step": None,
+            "best_metric": None,
+            "epoch": global_step / steps_per_epoch,
+            "global_step": global_step,
+            "log_history": log_history,
+            "logging_steps": logging_steps,
+            "max_steps": total_steps,
+            "num_input_tokens_seen": num_tokens_seen,
+            "train_batch_size": batch_sz,
+        }
+        (directory / "trainer_state.json").write_text(json.dumps(state, indent=2))
 
     for epoch in range(num_epochs):
         for batch_start in range(0, len(problems), batch_sz):
@@ -718,7 +735,8 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
             batch = problems[batch_start : batch_start + batch_sz]
             optimizer.zero_grad()
             accum_loss = None
-            last_traces = []
+            step_rewards: list[float] = []      # all rewards across all problems in step
+            step_tokens = 0
 
             # Rollout phase — one transient bar across all traces in this step.
             rollout_total = len(batch) * G
@@ -738,7 +756,6 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
                     for t in traces:
                         t.answer = answer
                     rollout_bar.update(G)
-                    last_traces = traces
 
                     # --- Score traces ---
                     rewards = []
@@ -747,6 +764,7 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
                         if t.chunks:
                             all_resp_ids = torch.cat([c.response_ids for c in t.chunks])
                             full_text = tokenizer.decode(all_resp_ids, skip_special_tokens=True)
+                            step_tokens += sum(c.response_ids.numel() for c in t.chunks)
                         else:
                             full_text = ""
                         completions_for_log.append(full_text)
@@ -754,6 +772,7 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
                         r = 1.0 if (pred is not None and answers_equivalent(pred, answer)) else 0.0
                         t.reward = r
                         rewards.append(r)
+                    step_rewards.extend(rewards)
 
                     logged_reward(completions_for_log, [answer] * G)
 
@@ -784,17 +803,44 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
                     model.eval()  # back to eval for next problem's generation
 
             # Backward + optimizer step.
+            grad_norm = 0.0
             if accum_loss is not None and accum_loss.requires_grad:
                 accum_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
                 optimizer.step()
 
             global_step += 1
-            mean_reward = (
-                sum(t.reward for t in last_traces) / len(last_traces)
-                if last_traces else 0.0
-            )
+            num_tokens_seen += step_tokens
+
+            mean_reward = sum(step_rewards) / len(step_rewards) if step_rewards else 0.0
+            reward_std = float(torch.tensor(step_rewards).std().item()) if step_rewards else 0.0
             loss_val = accum_loss.item() if accum_loss is not None else 0.0
+            frac_zero_std = 1.0 if reward_std == 0.0 else 0.0
+
+            # Accumulate into pending log window.
+            for key, val in [
+                ("reward", mean_reward), ("reward_std", reward_std),
+                ("grad_norm", grad_norm), ("loss", loss_val),
+                ("frac_reward_zero_std", frac_zero_std),
+            ]:
+                pending_log[key] = pending_log.get(key, 0.0) + val
+
+            if global_step % logging_steps == 0:
+                n = logging_steps
+                entry = {
+                    "step": global_step,
+                    "epoch": round(global_step / steps_per_epoch, 1),
+                    "loss": pending_log.get("loss", 0.0) / n,
+                    "reward": pending_log.get("reward", 0.0) / n,
+                    "reward_std": pending_log.get("reward_std", 0.0) / n,
+                    "grad_norm": pending_log.get("grad_norm", 0.0) / n,
+                    "frac_reward_zero_std": pending_log.get("frac_reward_zero_std", 0.0) / n,
+                    "learning_rate": training["learning_rate"],
+                    "num_tokens": num_tokens_seen,
+                }
+                log_history.append(entry)
+                pending_log = {}
+
             step_bar.set_postfix(loss=f"{loss_val:.4f}", reward=f"{mean_reward:.3f}", epoch=epoch)
             step_bar.update(1)
 
@@ -802,6 +848,7 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
                 ckpt_dir = run_dir / f"checkpoint-{global_step}"
                 model.save_pretrained(ckpt_dir)
                 tokenizer.save_pretrained(ckpt_dir)
+                _write_trainer_state(ckpt_dir)
                 tqdm.write(f"  checkpoint saved → {ckpt_dir}")
 
     step_bar.close()
@@ -810,4 +857,5 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
     final_dir = run_dir / f"checkpoint-{global_step}"
     model.save_pretrained(final_dir)
     tokenizer.save_pretrained(final_dir)
+    _write_trainer_state(final_dir)
     tqdm.write(f"training complete — final checkpoint: {final_dir}")

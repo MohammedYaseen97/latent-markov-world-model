@@ -33,8 +33,8 @@ TODO: Populate after core table (`run_ablation_table.py`). Partial results below
 |-----|--------|---------|-----------|-----|
 | `baseline_pretrained` (instruct, no GRPO) | — | — | — | pending — run: `eval_passk.py` (no `--checkpoint`) |
 | `token_markov_pretrained` (instruct, no GRPO, Delethink regime) | — | — | — | pending — run: `eval_passk.py --generation-mode token_markov` (no `--checkpoint`) |
-| `baseline_grpo` | 0.012% | 0.19% | **10.0%** | `20260421T131720Z` / `checkpoint-100` |
-| `token_markov_grpo` (3-chunk, m=256) | 0.007% | 0.12% | **7.5%** | `20260428T004551Z` / `checkpoint-50` |
+| `baseline_grpo` | — | — | — | pending re-run at 200 steps |
+| `token_markov_grpo` (3-chunk, m=256) | — | — | — | pending re-run at 200 steps |
 | `latent_grpo` | — | — | — | pending |
 | `latent_grpo_uncertainty` | — | — | — | pending |
 
@@ -60,26 +60,24 @@ a solvable problem produces at least one correct trace is:
 P(≥1 correct | G=8) = 1 - (1 - 1/1024)^8 ≈ 8/1024 ≈ 0.78%
 ```
 
-Over the full training run, each of the 3 solvable problems is encountered approximately
-`50 steps × 4 problems/step × (3/40)` = **15 times** (on expectation). Expected total
+Over the full training run (200 steps), each of the 3 solvable problems is encountered approximately
+`200 steps × 5 problems/step × (3/40)` = **75 times** (on expectation). Expected total
 positive rewards across the entire training run:
 
 ```
-15 encounters × 0.78% success rate per encounter ≈ 0.12 expected rewards
+75 encounters × 0.78% success rate per encounter ≈ 0.59 expected rewards
 ```
 
-Statistically zero. The training observation of zero positive rewards is not a
-malfunction — it is the mathematically expected outcome given the reward density and group
-size. Running for more steps would not help: the expected rewards scale linearly, and even
-doubling to 100 steps yields ~0.24 expected rewards. RL requires consistent positive
-reward within a group to compute a non-degenerate advantage; at this reward density,
-G=8 is structurally insufficient.
+Statistically zero even at the expanded 200-step budget. The training observation of zero
+positive rewards is not a malfunction — it is the mathematically expected outcome given the
+reward density and group size. RL requires consistent positive reward within a group to
+compute a non-degenerate advantage; at this reward density, G=8 is structurally
+insufficient regardless of training duration. (Note: 200 steps was chosen as the shared
+budget for all four arms on fairness grounds — see PROJECT_CONTRACT.md. Even at this
+budget the token-Markov arm is not expected to receive a usable signal, which is precisely
+the empirical motivation for the latent arm.)
 
-**Caveat on the head-to-head comparison:** the baseline was successfully RL-trained for
-100 steps (10.0% pass@1024), while the token-Markov arm received effectively zero
-gradient updates (7.5%, essentially the base model under Delethink constraints). The
-10.0% vs 7.5% gap therefore conflates two effects: (1) the capability cost of the
-Delethink context-reset constraint, and (2) the benefit of 100 steps of GRPO training.
+**Caveat on the head-to-head comparison:** the baseline was RL-trained for 200 steps, while the token-Markov arm received effectively zero gradient updates (essentially the base model under Delethink constraints). Any gap between the two therefore conflates two effects: (1) the capability cost of the Delethink context-reset constraint, and (2) the benefit of 200 steps of GRPO training.
 The honest framing is not "token-Markov underperforms the trained baseline" but rather
 "Delethink's structural Markov enforcement imposes a capability cost that prevents RL
 from obtaining any training signal at G=8." These are the same finding stated at

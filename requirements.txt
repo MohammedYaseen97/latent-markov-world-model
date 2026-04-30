@@ -12,8 +12,11 @@ vllm==0.11.0           # fast inference for pass@1024 eval
 datasets==4.8.4
 huggingface_hub==1.10.1
 
-# sympy.parsing.latex requires antlr4 4.11.x specifically
-antlr4-python3-runtime==4.11.1
+# math-verify is the standard LLM math evaluation library (HuggingFace, used in
+# Open LLM Leaderboard). It handles LaTeX parsing, symbolic and numeric
+# equivalence, and is battle-tested on arbitrary model outputs.
+# sympy is a transitive dependency of math-verify; listed explicitly for clarity.
+math-verify
 sympy
 
 # Numerics and data handling

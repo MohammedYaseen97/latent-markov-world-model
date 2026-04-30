@@ -29,6 +29,8 @@ Phases, gates, and what to ship. **Vision / hypothesis / VAE design:** `PROJECT_
 
 **Fair comparison:** same data, eval protocol, budgets, and shared hyperparameters across arms unless the field is explicitly method-specific (Markov module, VAE, uncertainty). Yuan’s paper motivates the token-Markov **idea**; we do **not** match their puzzle benchmark or treat their numbers as success criteria.
 
+**Training budget — 200 steps (all four arms):** GRPO on MATH-Beyond is a sparse-reward problem. With P(pass@1) ≈ 10% for the base model and G=8 completions per problem, P(≥1 correct in a group) ≈ 57% per problem. With 40 training problems and batch_size=8, each step sees ~5 problems — roughly half the steps in a short run carry near-zero gradient. At 50–100 steps the expected number of reward-bearing encounters is too small to move the policy reliably. At 200 steps (token-Markov: 5 steps/epoch × 40 epochs = 200 naturally; TRL arms: max_steps=200) the expected reward-bearing encounters reach ~570 — enough for a meaningful gradient signal while keeping per-problem repetition at 40× where stochastic sampling (temperature=1.0) still ensures diversity across encounters. Going beyond 200 risks overfitting on 40 problems without a commensurate gain in signal density. The budget is enforced identically for all arms via the extends config chain (train_baseline_grpo.yaml → train_token_markov_grpo.yaml → future latent configs).
+
 **Yuan (informative only):** KL coef ~0.001, RL LR ~1e-6, batch / mini-batch ~128, group size 8, decode temp 1.0; they use rLLM+VERL and Pass@128 on logic tasks. We use **MATH-B** and **pass@1024**. Deviations are fine; document anything large.
 
 **Frozen run configs:** `configs/final_parity/` (folder name is legacy) + `configs/repro_tolerance.yaml` for same-seed tolerance.
@@ -54,7 +56,7 @@ Before treating the core table as final:
 
 **Deliverables:** (1) deps pinned (`requirements.txt`), (2) `prepare_data.py` outputs per `DATA_PROTOCOL`, (3) `train_baseline.py` smoke + A100, (4) `eval_passk.py` for k ∈ {1,16,1024}, (5) artifacts under `artifacts/baseline_grpo/{run_id}/`.
 
-**Implementation status:** all five deliverables implemented and verified. Production run complete (`20260421T131720Z`, 100 steps, Qwen2.5-1.5B-Instruct). Results: `pass@1=0.012%`, `pass@16=0.19%`, `pass@1024=10.0%` — written to `artifacts/baseline_grpo/20260421T131720Z/eval_metrics.json`. **Phase 1 complete.**
+**Implementation status:** all five deliverables implemented and verified. Re-running at 200 steps (budget decision — see Fair Comparison note above). Previous 50-step run retired.
 
 **Pass:** stable A100 baseline; valid pass@ metrics; same-seed rerun within `repro_tolerance.yaml`; README has train/eval commands.
 
@@ -74,11 +76,9 @@ Before treating the core table as final:
 
 **Framing note:** this arm tests "does a textual learned Markov state beat history-as-state on hard math?" It does **not** test Yuan's architecture specifically. In the paper: *"We implement the token-space Markov arm using Delethink's RL-learned textual carryover, which extends Yuan et al.'s Markovian state compression to open-ended reasoning where symbolic states are undefined."*
 
-**Deliverables:** `token_markov_state.py`, `train_token_markov.py`, `grpo_token_markov.py`, `configs/train_token_markov_grpo.yaml`, `configs/final_parity/train_token_markov_grpo.yaml`. Eval artifact: `artifacts/token_markov_grpo/20260428T004551Z/checkpoint-50`.
+**Deliverables:** `token_markov_state.py`, `train_token_markov.py`, `grpo_token_markov.py`, `configs/train_token_markov_grpo.yaml`. Re-running at 200 steps (budget decision — see Fair Comparison note above). Previous 50-step run retired.
 
-**Result:** `pass@1024=7.5%` vs baseline `10.0%`. RL training received zero gradient signal due to reward sparsity (per-sample pass rate ≈ 0.01%; G=8 insufficient to surface any successes at training time). The 7.5% reflects the base model operating under Delethink constraints — structurally Markovian from step 0, but RL could not further improve carryover quality. This is a finding: hard token-space Markov enforcement degrades the capability ceiling enough to starve RL of reward, motivating the latent arm.
-
-**Phase 2 complete.**
+**Phase 2 implementation complete; re-running training for fair 200-step comparison.**
 
 ---
 

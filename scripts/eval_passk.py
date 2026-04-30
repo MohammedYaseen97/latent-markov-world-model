@@ -541,7 +541,7 @@ def _estimate_pass_at_k_metrics_token_markov(
             # ── Grade this group (problem-by-problem to minimise peak RAM) ───
             print(
                 f"\n[TM eval] group {g_idx + 1}/{n_groups} — grading "
-                f"{G * n_samples} completions (SymPy) …",
+                f"{G * n_samples} completions (math-verify) …",
                 file=sys.stderr,
             )
             for li, problem in enumerate(g_probs):
