@@ -203,15 +203,24 @@ because of R1-style CoT pretraining). We use Qwen2.5-1.5B-Instruct, which has no
 such prior. Our m=256 window is also 8-16× smaller than the paper's 2K-4K, which
 limits carryover richness.
 
-**Observed result:** `pass@1024 = 7.5%` vs baseline `10.0%`. RL training received
-zero gradient signal (per-sample pass rate ≈ 0.007%; G=8 insufficient to surface any
-successes at training time). This is the expected finding: Delethink's hard context
-reset imposes a capability cost that degrades the base model's ceiling below the
-threshold for RL to obtain a usable reward signal. The model is structurally
-Markovian, but RL cannot improve carryover quality because it never observes a success.
+**Observed result (final, 200-step run):**
+
+- `token_markov_pretrained` (no GRPO): `pass@1024 = 12.5%` — equal to `baseline_pretrained`
+  (12.5%). Delethink's context reset + carryover does **not** hurt the model at inference
+  time. Capability is fully preserved under the Markovian constraint before training.
+- `token_markov_grpo` checkpoint-200: `pass@1024 ≈ 12.5%`. SHA256 of checkpoint-200
+  equals SHA256 of pretrained weights — **zero weight updates** across all 200 steps.
+  Baseline improved to 15.0% over the same 200 steps.
+
+**Why zero gradient:** GRPO loss = `ppo_term + kl_coef × kl_term`. Per-sample success
+under Delethink is ≈ 0.015% → `P(≥1 correct | G=8) ≈ 0.12%` → ≈ 0.15 expected reward
+events over the entire run. Zero reward → zero advantage → `ppo_term = 0`. Since the
+policy never moves from the reference, `kl_term = curr_lp − ref_lp = 0` too — a stable
+fixed point. Full arithmetic in `reports/writeup_stubs.md`.
 
 This outcome directly motivates the latent arm: a learned continuous representation
-should compress state without the capability degradation of hard context reset.
+must (1) preserve base capability (already satisfied here) and (2) maintain enough
+reward density for RL to function — the part token-space enforcement cannot deliver.
 
 ---
 
