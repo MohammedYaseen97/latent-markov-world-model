@@ -147,22 +147,19 @@ PHASE 0 — VAE Pretraining (NOT counted in the 200-step RL budget)
   Backbone: FROZEN throughout Phase 0
   Trains: encoder, decoder, transition model, outcome_head
 
-  Data: MATH-Beyond complement — 141 problems that are NOT in the
-        hard 40-problem eval pool (181 full pool − 40 hard = 141)
-        These are problems where at least one base model solved them
-        at pass@1024 → they're "easier" by a published, reproducible rule.
-        Already in the repo: data/math_beyond_full_181.jsonl
+  Data: Easier pretraining pool (TBD — see calibration step)
+        Must satisfy: pass@8 ≥ 20% with pretrained instruct model.
+        Calibration result on MATH-B complement (141 problems) = 0% → rejected.
+        Current candidate: hendrycks/competition_math Level 1–3.
 
-  Why this data:
-  - Same benchmark family → same domain, same format, same hidden state
-    distribution as the target environment
+  Why a separate pool:
   - Not in the eval pool → no contamination
-  - Easier → Qwen2.5-1.5B-Instruct actually succeeds on some (~10-30%)
+  - Easier → instruct model succeeds on some problems
     → rollouts have both correct AND incorrect trajectories → rich labels
-  - Already downloaded → zero extra effort
+  - Same reasoning domain → hidden states have correct distributional character
 
   Generation + hidden state extraction (one-time, no grad, BEFORE VAE training):
-    Step 1: run frozen backbone on 141 problems × G=8 rollouts
+    Step 1: run frozen backbone on Phase 0 pool × G=8 rollouts
     Step 2: in a separate forward pass, extract and SAVE final-layer hidden
             states for each chunk as static arrays (numpy / .pt files on disk)
     Step 3: grade all rollouts → save (correct/incorrect) label per trajectory
@@ -195,8 +192,8 @@ PHASE 0 — VAE Pretraining (NOT counted in the 200-step RL budget)
 
   Why L_outcome is not redundant with L_RL:
     They operate in different phases, on different components:
-    - L_outcome fires DENSELY during Phase 0 on 141 easier problems
-      where correct trajectories actually exist (10-30% success rate)
+    - L_outcome fires DENSELY during Phase 0 on the easier pretraining pool
+      where correct trajectories actually exist (≥20% success rate required)
     - L_RL fires SPARSELY during Phase 1 on 40 hard problems (0.02%)
     - Backbone is frozen in Phase 0 → L_outcome ONLY updates the encoder
     - L_RL primarily updates the backbone/policy
@@ -204,8 +201,7 @@ PHASE 0 — VAE Pretraining (NOT counted in the 200-step RL budget)
       info without L_outcome — it would just compress surface statistics
 
   Budget: not counted in the 200-step RL budget. Specify K steps in config.
-          (default candidate: 2–3 epochs over the 141 problems with G=8
-           = 141 × 3 = ~423 generation passes, VAE trains on all of them)
+          (default candidate: 2–3 epochs over the Phase 0 pool with G=8)
 
   Cost: cheap — no backbone backward pass. Only the small VAE modules.
 
@@ -320,7 +316,7 @@ Rejected alternatives:
 
 ### Q3: When does the VAE get trained?
 
-**Decision: VAE pretraining phase (Phase 0) on the 141-problem MATH-B complement,
+**Decision: VAE pretraining phase (Phase 0) on an easier pretraining pool (TBD),
 then joint RL training (Phase 1) on the hard 40.**
 
 NOT joint training from step 0. That was the original plan but it was revised after
@@ -427,7 +423,7 @@ These are NOT blocking. They go in configs, not in the design doc.
 
 | Item | Default candidate | Why not blocked |
 |------|-------------------|-----------------|
-| Phase 0 training budget K | 2-3 epochs over 141 problems | Empirical — check loss curves |
+| Phase 0 training budget K | 2-3 epochs over Phase 0 pool | Empirical — check loss curves |
 | G for Phase 0 rollouts | 8 (same as RL, cheaper since backbone frozen) | Config knob |
 | Loss weights in Phase 0 | λ_ELBO=1.0, λ_trans=1.0, λ_outcome=1.0 | Document as hyperparameters |
 | VAE LR vs backbone LR (Phase 1) | Same LR (1e-6), monitor | Can separate if needed |
@@ -444,7 +440,7 @@ These are NOT blocking. They go in configs, not in the design doc.
 | Chunk 1 input | No z prefix (no prior state) |
 | Chunks 2-3 input | z_{h-1} prefix + system prompt + problem |
 | VAE training structure | Phase 0 (pretraining, frozen backbone) → Phase 1 (joint RL) |
-| Phase 0 data | MATH-B complement: 141 problems (181 full − 40 hard) |
+| Phase 0 data | Easier pretraining pool TBD (candidate: MATH Level 1–3) |
 | Phase 0 losses | L_ELBO + L_transition + L_outcome |
 | L_outcome attachment | z_final (last chunk's latent) only |
 | L_outcome fate | Discarded before Phase 1 begins |

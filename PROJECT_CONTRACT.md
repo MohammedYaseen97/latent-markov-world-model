@@ -93,7 +93,7 @@ Before treating the core table as final:
 **Design doc:** `reports/latent_markov_design.md` (authoritative). Implementation steps and ordering in that doc's "Implementation Deliverables" table.
 
 **Deliverables — `latent_grpo` arm:**
-- [x] `data/math_beyond_complement_141.jsonl` — 141-problem Phase 0 pretraining pool (full-181 minus hard-40); `prepare_data.py` updated
+- [x] Phase 0 pretraining dataset: `data/math_easy_pool.jsonl` — 2974 problems (974 L1, 1000 L2, 1000 L3) from `EleutherAI/hendrycks_math`; calibration confirmed pass@8 = 83%, per-sample 40% (`results/calib_easy_pool.json`)
 - [ ] `scripts/generate_phase0_rollouts.py` — frozen backbone rollout generation + hidden state extraction, saves `(repr_1, repr_2, repr_3, reward)` per trajectory
 - [ ] `src/models/vae_state_encoder.py` — `VAEStateEncoder` (encoder, decoder, transition) + `OutcomeHead` (Phase 0 only)
 - [ ] `src/training/grpo_latent.py` — `pretrain_vae()` (Phase 0) + `train_latent()` (Phase 1)
@@ -105,7 +105,7 @@ Before treating the core table as final:
 
 **Pass criteria — `latent_grpo` arm:**
 - [ ] Smoke test completes end-to-end in < 10 min on 4060 (Phase 0 + Phase 1, no NaN blowups)
-- [ ] **NFR6 gate:** t-SNE of z_final shows visible separation between correct and incorrect trajectories on the 141-problem pool — must pass before A100 Phase 1 run
+- [ ] **NFR6 gate:** t-SNE of z_final shows visible separation between correct and incorrect trajectories on the Phase 0 pool — must pass before A100 Phase 1 run
 - [ ] Phase 1 training log shows L_transition non-zero from step 0; L_RL non-zero within first 30 steps (gradient flow canaries per NFR4)
 - [ ] `pass@1024` evaluated for `latent_grpo`; result logged in `reports/writeup_stubs.md`
 - [ ] No NaN blowups under zero-reward stretches (R6.5)

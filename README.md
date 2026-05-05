@@ -70,8 +70,6 @@ This defines a hard capability-ceiling gauntlet using a published, reproducible,
 
 **Secondary pool:** AND of all 21 `*_unsolved` Hub columns (13 rows, stricter). Used for appendix / robustness.
 
-**Phase 0 pretraining pool:** Complement of the hard-40 within the full 181-row split (141 rows). Problems where at least one base model has `pass@1024 > 0` — the easier stratum used to pretrain the VAE before RL training. Training only, not evaluated. See `reports/DATA_PROTOCOL.md`.
-
 ---
 
 ## Model and Training Stack

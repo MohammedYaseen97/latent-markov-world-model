@@ -189,25 +189,26 @@ before RL begins. Phase 0 is VAE pretraining.
 
 **Backbone: FROZEN throughout Phase 0.**
 
-**Data: MATH-Beyond complement — 141 problems.**
+**Data: Easier pretraining pool (TBD — see calibration step).**
 
-The MATH-B-I eval pool is 40 problems from a full MATH-Beyond dataset of 181 problems.
-The complement (181 − 40 = 141 problems) contains problems where at least one base model
-achieved nonzero `pass@1024` — the "easier" stratum by the benchmark's own published
-filter. This data is already in the repo (`data/math_beyond_full_181.jsonl`; the 40-problem
-hard pool is excluded at prep time).
+The pool must satisfy: the pretrained instruct model solves ≥20% of problems at pass@8, so
+`L_outcome` receives a mix of correct and incorrect trajectory labels. Calibration
+(`scripts/calibrate_pool.py --pool-path <candidate>`) must confirm this before
+any Phase 0 compute is spent.
 
-Why this data:
-- Same benchmark family → same domain, same format, same hidden state distribution
+Candidate: `hendrycks/competition_math` Level 1–3 (standard MATH competition problems at
+lower difficulty). These provide the same mathematical domain and hidden-state distribution
+expected during Phase 1 RL, without contaminating the hard MATH-Beyond eval pool.
+
+Why a separate pool at all:
 - Not in the eval pool → no contamination of the RL target environment
-- Easier → the pretrained model succeeds on some (~10–30% per sample) → rollouts
-  contain both correct and incorrect trajectories → rich labels for L_outcome
-- Already downloaded, no extra infrastructure
+- Easier → rollouts contain both correct and incorrect trajectories → rich labels for L_outcome
+- Same reasoning domain → hidden states have the right distributional character for the encoder
 
 **Generation (one-time, before training loop, no grad):**
 
 ```
-1. Run frozen backbone on 141 problems × G=8 rollouts (no_grad)
+1. Run frozen backbone on Phase 0 pool × G=8 rollouts (no_grad)
 2. For each rollout, extract final-layer hidden states per chunk, mean-pool
    → save (repr_1, repr_2, repr_3, reward_label) per trajectory to disk
 3. Backbone is NOT in the VAE training computational graph
@@ -245,8 +246,8 @@ Default weights: λ_elbo = 1.0, λ_trans = 1.0, λ_out = 1.0. Specified in confi
 L_outcome and L_RL both connect `z_h` to outcome quality, but they operate in
 different phases, on different problem sets, under different reward density conditions:
 
-- L_outcome fires on every trajectory during Phase 0 on 141 easier problems where
-  the model actually succeeds sometimes. On easier problems with ~20% per-sample
+- L_outcome fires on every trajectory during Phase 0 on the easier pretraining pool
+  where the model actually succeeds sometimes. On easier problems with ~20%+ per-sample
   success and G=8 rollouts, most batches contain both positive and negative examples.
   Gradient flows from L_outcome through the encoder to shape what information survives
   the 1536→64 bottleneck.
@@ -270,7 +271,7 @@ loss), so quality-relevant structure in z_3 propagates structurally backward to 
 and z_1 via consistency constraints.
 
 **Phase 0 budget:** Specified in config (`vae_pretrain_steps` or epochs).
-Default candidate: 2–3 epochs over the 141-problem pool with G=8 precomputed
+Default candidate: 2–3 epochs over the Phase 0 pool with G=8 precomputed
 rollouts. Cost is negligible — no backbone backward pass.
 
 **Gate:** NFR6 applies after Phase 0. Run the encoder on the saved rollouts, produce
@@ -398,7 +399,7 @@ correlation with difficulty), and the NFR6 t-SNE gate.
 | Decoder architecture | MLP 64→512→1536 | training only |
 | Transition architecture | MLP 1600→512→64 | input = concat(z_h, repr_h) |
 | Outcome head | MLP 64→64→1 + sigmoid | Phase 0 only, discarded after |
-| Phase 0 data | 141-problem MATH-B complement | 181 full − 40 hard |
+| Phase 0 data | Easier pretraining pool (TBD) | Must achieve pass@8 ≥ 20% with instruct model |
 | Phase 0 backbone | frozen (static hidden states saved to disk) | |
 | Phase 1 λ_t | 1.0 → 0.1 linear over steps 0-100, held at 0.1 | |
 | Phase 0 loss weights | λ_elbo=1.0, λ_trans=1.0, λ_out=1.0 | config knobs |
@@ -434,7 +435,7 @@ Ordered by dependency. Each step is a gate for the next.
 
 | # | Deliverable | File | Gate |
 |---|-------------|------|------|
-| 1 | Phase 0 dataset: generate 141-problem complement JSONL from full-181 pool | `scripts/prepare_data.py` | Data must exist before Phase 0 generation |
+| 1 | Phase 0 dataset: build easier pretraining pool (e.g. MATH Level 1–3); run calibration (`scripts/calibrate_pool.py`) to confirm pass@8 ≥ 20% | `scripts/prepare_easy_pool.py` | Pool must pass calibration before Phase 0 generation; if pass@8 < 5% try easier difficulty slice |
 | 2 | `VAEStateEncoder` — encoder, decoder, transition model | `src/models/vae_state_encoder.py` | Core module; all training depends on it |
 | 3 | `OutcomeHead` — 2-layer MLP on z_final, used in Phase 0 only | `src/models/vae_state_encoder.py` | Phase 0 training |
 | 4 | Hidden state extraction + Phase 0 rollout generation script | `scripts/generate_phase0_rollouts.py` | Must produce `repr_h` + label files before Phase 0 training |
