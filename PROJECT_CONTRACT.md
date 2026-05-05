@@ -88,17 +88,43 @@ Before treating the core table as final:
 
 ---
 
-## Phase 3 🔲 — Latent + uncertainty
+## Phase 3 🔲 — Latent Markov arm (`latent_grpo`)
 
-**Deliverables:** `vae_state_encoder.py`, `grpo_latent.py` (both modes), `reward_bonus.py`, final parity YAMLs for both latent arms.
+**Design doc:** `reports/latent_markov_design.md` (authoritative). Implementation steps and ordering in that doc's "Implementation Deliverables" table.
 
-**Pass:** both arms complete; no NaN blowups; `pass@1024` for **all four** arms; shared knobs match except method-specific parts.
+**Deliverables — `latent_grpo` arm:**
+- [x] `data/math_beyond_complement_141.jsonl` — 141-problem Phase 0 pretraining pool (full-181 minus hard-40); `prepare_data.py` updated
+- [ ] `scripts/generate_phase0_rollouts.py` — frozen backbone rollout generation + hidden state extraction, saves `(repr_1, repr_2, repr_3, reward)` per trajectory
+- [ ] `src/models/vae_state_encoder.py` — `VAEStateEncoder` (encoder, decoder, transition) + `OutcomeHead` (Phase 0 only)
+- [ ] `src/training/grpo_latent.py` — `pretrain_vae()` (Phase 0) + `train_latent()` (Phase 1)
+- [ ] `configs/train_latent_grpo_smoke.yaml` — smoke config (2 steps, 4 problems, QLoRA, 4060)
+- [ ] `configs/train_latent_grpo.yaml` — full Phase 1 config (200 steps, A100, extends baseline)
+- [ ] `scripts/check_latent_structure.py` — t-SNE/UMAP of z_final (NFR6 gate)
+- [ ] Latent generation mode in `scripts/eval_passk.py`
+- [ ] Phase 1 eval artifacts under `artifacts/latent_grpo/{run_id}/`
 
-**Additional pass criterion — Markov diagnostic (required):** empirical evidence that `z_h` satisfies the Markov property. Without this, the claim that the VAE learns a Markov state is an assertion, not a result. Minimum bar:
-- **Transition sufficiency:** `z_h` + `a_h` predicts `z_{h+1}` without history access (latent transition loss).
-- **Policy sufficiency:** policy conditioned only on `z_h` performs comparably to one with full history access (last-state-only ablation, mirroring Yuan et al. Table 4).
+**Pass criteria — `latent_grpo` arm:**
+- [ ] Smoke test completes end-to-end in < 10 min on 4060 (Phase 0 + Phase 1, no NaN blowups)
+- [ ] **NFR6 gate:** t-SNE of z_final shows visible separation between correct and incorrect trajectories on the 141-problem pool — must pass before A100 Phase 1 run
+- [ ] Phase 1 training log shows L_transition non-zero from step 0; L_RL non-zero within first 30 steps (gradient flow canaries per NFR4)
+- [ ] `pass@1024` evaluated for `latent_grpo`; result logged in `reports/writeup_stubs.md`
+- [ ] No NaN blowups under zero-reward stretches (R6.5)
+- [ ] Shared hyperparameters (G=8, lr=1e-6, 200 steps, same backbone) match all other arms
 
-Latent variance as exploration signal (`σ_h²`) also requires its own validation: does it correlate with problem difficulty or solution uncertainty, or is it just reconstruction noise?
+**Additional pass criterion — Markov diagnostic (required for paper):** empirical evidence that `z_h` satisfies the Markov property. Without this, the claim is an assertion, not a result:
+- **E1 — Transition sufficiency:** held-out transition loss (z_h + a_h → z_{h+1} without history)
+- **E2 — Policy sufficiency:** last-state-only ablation (policy on z_h vs full history)
+- **E3 — Uncertainty calibration:** σ_h² correlation with problem difficulty / outcome
+
+## Phase 3b 🔲 — Uncertainty arm (`latent_grpo_uncertainty`)
+
+**Status:** design not yet started. Begins after `latent_grpo` arm is complete and results are logged.
+
+**Design doc:** to be written. Context preserved in `reports/SCRATCH_latent_design_rough.md` (Uncertainty Arm section).
+
+**Deliverables:** `src/training/reward_bonus.py` — `compute_uncertainty_bonus()`; `configs/train_latent_grpo_uncertainty.yaml`; `train_latent_with_uncertainty()` in `grpo_latent.py`; eval artifacts.
+
+**Pass:** same criteria as `latent_grpo` arm + uncertainty bonus active (β_t schedule documented); E3 diagnostic completed (σ_h² validated as exploration signal, not noise).
 
 ---
 

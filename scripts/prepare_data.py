@@ -11,6 +11,14 @@ Authoritative documentation for claims about these files: ``reports/DATA_PROTOCO
 (``configs/math_beyond_hf_revision.txt``) this filter yields **40** rows — documented in
 ``data/benchmark_manifest.json``.
 
+**Phase 0 VAE pretraining pool (always written)**
+
+``data/math_beyond_complement_141.jsonl`` — complement of the MATH-B-I hard-40 within the full
+181-row test split (181 - 40 = **141** rows at the pinned revision). Problems where at least one
+base model achieved ``pass@1024 > 0`` — the easier stratum used to pretrain the VAE before RL
+training on the hard pool. Always computed relative to the MATH-B-I base definition regardless
+of ``--primary-mode``. See ``reports/latent_markov_design.md`` (Phase 0).
+
 **Secondary pool (always written)**
 
 ``data/math_beyond_hf_strict_all_models.jsonl`` — **stricter** subset: logical AND of all **21**
@@ -194,6 +202,7 @@ def main() -> None:
 
     full_path = out_dir / "math_beyond_full_181.jsonl"
     primary_path = out_dir / "math_beyond_math_b_i_base.jsonl"
+    complement_path = out_dir / "math_beyond_complement_141.jsonl"
     strict_path = out_dir / "math_beyond_hf_strict_all_models.jsonl"
     smoke_path = out_dir / "math_beyond_smoke.jsonl"
     manifest_path = out_dir / "benchmark_manifest.json"
@@ -224,6 +233,18 @@ def main() -> None:
 
     # Smoke pool: first 4 rows of the primary pool — deterministic, no extra filtering.
     write_jsonl(smoke_path, primary_records[:4])
+
+    # Phase 0 VAE pretraining pool: complement of the MATH-B-I hard-40 in the full 181.
+    # Always relative to the paper's MATH-B-I base definition, not --primary-mode, because
+    # the Phase 0 pool is defined as "not the RL evaluation target" — which is always the
+    # hard 40, regardless of what primary_mode the caller chose.
+    math_b_i_indices_set = (
+        set(primary_indices)
+        if args.primary_mode == "paper_math_b_i_base"
+        else set(filter_indices_math_b_i_base(ds))
+    )
+    complement_indices = [i for i in range(len(ds)) if i not in math_b_i_indices_set]
+    write_jsonl(complement_path, [row_to_record(i, ds[i]) for i in complement_indices])
 
     strict_indices: list[int] | None = None
     if not args.no_secondary_strict:
@@ -264,6 +285,16 @@ def main() -> None:
             "row_count": len(primary_indices),
             "columns_used": primary_columns,
         },
+        "phase0_pretrain_pool": {
+            "path": rel(complement_path),
+            "description": (
+                "Phase 0 VAE pretraining pool: full-181 minus MATH-B-I hard-40. "
+                "Problems where at least one base model has pass@1024 > 0. "
+                "See reports/latent_markov_design.md."
+            ),
+            "row_count": len(complement_indices),
+            "complement_of": "primary_pool (MATH-B-I base)",
+        },
         "full_pool": {"path": rel(full_path), "row_count": len(ds)},
         "smoke_pool": {"path": rel(smoke_path), "row_count": min(4, len(primary_records))},
         "secondary_strict_pool": None,
@@ -289,6 +320,8 @@ def main() -> None:
         manifest["sha256_math_beyond_full_181_jsonl"] = sha256_file(full_path)
     if primary_path.is_file():
         manifest["sha256_math_beyond_math_b_i_base_jsonl"] = sha256_file(primary_path)
+    if complement_path.is_file():
+        manifest["sha256_math_beyond_complement_141_jsonl"] = sha256_file(complement_path)
     if smoke_path.is_file():
         manifest["sha256_math_beyond_smoke_jsonl"] = sha256_file(smoke_path)
     if strict_indices is not None and strict_path.is_file():
@@ -299,6 +332,7 @@ def main() -> None:
 
     print(f"Wrote {len(ds)} rows -> {full_path}", file=sys.stderr)
     print(f"Wrote {len(primary_records)} rows -> {primary_path}  ({args.primary_mode})", file=sys.stderr)
+    print(f"Wrote {len(complement_indices)} rows -> {complement_path}  (phase0 pretrain complement)", file=sys.stderr)
     print(f"Wrote {min(4, len(primary_records))} rows -> {smoke_path}  (smoke subset)", file=sys.stderr)
     if strict_indices is not None:
         print(f"Wrote {len(strict_indices)} rows -> {strict_path}", file=sys.stderr)

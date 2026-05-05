@@ -50,6 +50,33 @@ In writeups, one honest sentence is enough, e.g.: *Problems are MATH-B-I (base-m
 
 Use this for sensitivity analysis, not as the main claim unless explicitly justified.
 
+## Phase 0 VAE pretraining pool
+
+**File:** `data/math_beyond_complement_141.jsonl`
+
+**Definition:** Complement of the MATH-B-I hard-40 within the full 181-row test split. All rows
+in `data/math_beyond_full_181.jsonl` whose `source_index` is NOT in the MATH-B-I base intersection.
+At the pinned revision this yields **141** rows.
+
+These are problems where at least one of the 11 listed base models achieved `pass@1024 > 0` —
+the "easier stratum" of MATH-Beyond by the benchmark's own published difficulty filter.
+
+**Purpose:** VAE pretraining (Phase 0) for the `latent_grpo` and `latent_grpo_uncertainty` arms.
+The VAE is pretrained on rollouts from this pool — backbone frozen — before joint RL training
+begins on the hard 40-problem target pool. The pretraining uses the Qwen2.5-1.5B-Instruct
+pretrained model (no GRPO), which achieves non-trivial per-sample success on easier problems,
+providing both correct and incorrect labeled trajectories for supervised VAE training.
+See `reports/latent_markov_design.md` (Phase 0) for full design rationale.
+
+**NOT an evaluation dataset.** This pool is used for Phase 0 pretraining only. All evaluation
+and RL training is on `data/math_beyond_math_b_i_base.jsonl` (the hard 40). The complement pool
+is excluded from all arm comparisons in the core results table.
+
+**Reproducibility:** same HF revision pin as all other files (`configs/math_beyond_hf_revision.txt`).
+SHA-256 recorded in `data/benchmark_manifest.json` under `sha256_math_beyond_complement_141_jsonl`.
+The complement is computed by `scripts/prepare_data.py` always relative to the MATH-B-I base
+definition, regardless of `--primary-mode`.
+
 ## Full pool
 
 **File:** `data/math_beyond_full_181.jsonl` — entire `test` split of `brendel-group/MATH-Beyond` at the pinned revision (181 rows).
