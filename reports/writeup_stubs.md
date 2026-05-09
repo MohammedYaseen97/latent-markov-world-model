@@ -180,6 +180,6 @@ Reasoning Palette (VAE latent modulating reasoning strategy via token prefix) is
 ### Markov diagnostic results (TODO after Phase 3)
 
 Must include empirical evidence that `z_h` satisfies the Markov property:
-- Latent transition loss: `z_h + a_h → z_{h+1}` without history
+- Latent transition loss: `f(z_h) → z_{h+1}` without history
 - Last-state-only ablation: policy on `z_h` only vs full history access
 - Latent variance analysis: does `σ_h²` correlate with problem difficulty / solution uncertainty?

@@ -45,9 +45,9 @@ prefix token: project `z_h` (dim 64) → model hidden dim (dim 1536) via a learn
 prepend as a virtual token to chunk h+1's `inputs_embeds`. The policy generates its
 next chunk conditioned on this prefix.
 
-The transition model learns: `z_h + action_h → z_{h+1}`. If this loss is small,
-`z_h` plus what was done in chunk h is sufficient to predict the next state without
-token history. That is the Markov property, empirically verified.
+The transition model learns: `z_h → z_{h+1}`. If this loss is small, `z_h` alone
+is sufficient to predict the next latent state without token history. That is the
+Markov property, empirically verified.
 
 ---
 
@@ -134,17 +134,19 @@ z (64-dim)
   → reconstruction of repr_h
 ```
 
-**Transition model** — maps current latent + action embedding to next latent:
+**Transition model** — predicts next latent from current latent:
 ```
-concat(z_h, repr_h)  (64 + 1536 = 1600-dim)
-  → Linear(1600, 512) + ReLU
+z_h  (64-dim)
+  → Linear(64, 512) + ReLU
   → Linear(512, 64)
   → z_{h+1}_predicted
 ```
 
-The action embedding for the transition model is `repr_h` — the mean-pooled hidden
-states of chunk h tokens. This is already computed for the encoder, so reusing it
-costs nothing extra. `repr_h` captures what the model DID in chunk h (the action).
+The pure Markov property is `f(z_h) → z_{h+1}`: the current state alone predicts
+the next. `repr_h` is deliberately excluded. The ELBO separately handles the
+compression task (repr_h → z_h); including repr_h in the transition would let the
+model bypass the bottleneck and weaken the gradient pressure on z_h to be
+information-dense.
 
 **Outcome head** — for Phase 0 pretraining only, attached to z_final:
 ```
@@ -230,7 +232,7 @@ L_ELBO       =  reconstruction_loss(decoder(z_h), repr_h)
              +  KL(N(μ_h, σ_h²) ∥ N(0, I))
              (summed over h = 1, 2, 3)
 
-L_transition =  ∥ f(z_h, repr_h) − z_{h+1} ∥²
+L_transition =  ∥ f(z_h) − z_{h+1} ∥²
              (summed over h = 1, 2; h=1→2 and h=2→3)
 
 L_outcome    =  BCE(outcome_head(z_final), r)
@@ -297,10 +299,10 @@ L_RL         =  GRPO policy gradient
              Sparse: fires only when at least 1 of G=8 rollouts has r=1.
              Updates: backbone, lm_head, z injection linear.
 
-L_transition =  ∥ f(z_h, repr_h) − z_{h+1} ∥²
+L_transition =  ∥ f(z_h) − z_{h+1} ∥²
              Always non-zero. Keeps Markov property active during RL training.
              Also the diagnostic metric for E1 (transition sufficiency).
-             Updates: transition model, encoder, backbone (indirectly via repr_h).
+             Updates: transition model, encoder.
 
 L_VAE        =  reconstruction_loss + KL(N(μ_h, σ_h²) ∥ N(0, I))
              Always non-zero. Prevents encoder/decoder from drifting during RL.
@@ -365,7 +367,7 @@ correlation with difficulty), and the NFR6 t-SNE gate.
 | R1.3 — fixed-size z_h | 64-dim regardless of step count |
 | R1.4 — uncertainty estimate σ_h² | VAE posterior variance, used by uncertainty arm |
 | R1.5 — z_h conditions policy before head | soft prefix token injected via inputs_embeds |
-| R2.1 — transition consistency loss | L_transition = ∥f(z_h, repr_h) − z_{h+1}∥² |
+| R2.1 — transition consistency loss | L_transition = ∥f(z_h) − z_{h+1}∥² |
 | R2.2 — Markov objective joint with RL | L_transition active throughout Phase 1 |
 | R2.3 — same loss is diagnostic metric | L_transition on held-out trajectories = E1 |
 | R3.1 — dense auxiliary signal | L_transition and L_VAE non-zero on every step |
@@ -397,7 +399,7 @@ correlation with difficulty), and the NFR6 t-SNE gate.
 | z injection | soft prefix via inputs_embeds | Q1 decision |
 | Encoder architecture | MLP 1536→512→64 (×2 outputs) | μ and log_σ² |
 | Decoder architecture | MLP 64→512→1536 | training only |
-| Transition architecture | MLP 1600→512→64 | input = concat(z_h, repr_h) |
+| Transition architecture | MLP 64→512→64 | input = z_h only (pure Markov) |
 | Outcome head | MLP 64→64→1 + sigmoid | Phase 0 only, discarded after |
 | Phase 0 data | Easier pretraining pool (TBD) | Must achieve pass@8 ≥ 20% with instruct model |
 | Phase 0 backbone | frozen (static hidden states saved to disk) | |

@@ -78,16 +78,18 @@ The conditioning must happen before the policy head — `z_h` must influence tok
 to be "Markov-shaped." The training objective must actively push `z_h` to satisfy the
 Markov property on actual reasoning trajectories.
 
-**R2.1** The training objective must include a **transition consistency loss**: given `z_h`
-and the action `a_h` (tokens generated at step `h`), a transition model must be able to
-predict `z_{h+1}` without access to the full token history. This is:
+**R2.1** The training objective must include a **transition consistency loss**: a transition
+model must be able to predict `z_{h+1}` from `z_h` alone, without access to the full token
+history. This is:
 
 ```
-L_transition = || f(z_h, a_h) − z_{h+1} ||²
+L_transition = || f(z_h) − z_{h+1} ||²
 ```
 
 where `f` is a learned transition function. This loss directly enforces the Markov property
-empirically.
+empirically. `repr_h` is deliberately excluded from `f`'s input — the ELBO handles
+repr_h → z_h compression separately; including repr_h would let the transition bypass the
+bottleneck and weaken gradient pressure on z_h.
 
 **R2.2** The Markov objective must be part of the joint training loop — not a separate
 pretraining phase. `z_h` must learn to be Markovian *while* being useful for RL.
@@ -242,9 +244,9 @@ hour on the 4060 and prevents wasting an A100 run on a non-functional VAE.
 These are required for the paper — not just nice-to-haves. Without them, the claim that
 `z_h` satisfies the Markov property is an assertion, not a result.
 
-**E1 — Transition sufficiency:** The trained transition model `f(z_h, a_h) → z_{h+1}`
+**E1 — Transition sufficiency:** The trained transition model `f(z_h) → z_{h+1}`
 must be evaluated on held-out trajectories. Report the transition loss as evidence that
-`z_h + a_h` is sufficient to predict the next state without history. This is the same
+`z_h` alone is sufficient to predict the next state without history. This is the same
 loss as R2.1 — training and evaluation use the same metric.
 
 **E2 — Policy sufficiency (last-state-only ablation):** Evaluate the trained policy in
@@ -303,7 +305,7 @@ implementation begins. They should not be resolved here.
 
 2. **Granularity of reasoning steps**: how is one "step `h`" defined for a free-form
    text rollout? Fixed token count (like Delethink)? Sentence boundary? End-of-thought
-   marker? The answer affects what `a_h` is and how the transition loss is computed.
+   marker? The answer affects how repr_h is extracted and how the transition loss is computed.
 
 3. **When is the VAE trained?** Jointly with RL from step 0? Pre-trained on rollouts
    from the pretrained model before RL starts? The answer affects gradient interference
@@ -311,8 +313,8 @@ implementation begins. They should not be resolved here.
 
 4. **λ_trans schedule**: constant or annealed? If annealed, in which direction?
 
-5. **Transition model architecture**: should `f(z_h, a_h)` encode `a_h` from token
-   embeddings, from hidden states, or from a summary embedding?
+5. **Transition model architecture**: `f(z_h) → z_{h+1}` uses z_h only. Resolved:
+   repr_h excluded to prevent bottleneck bypass (see R2.1).
 
 6. **Averaging window N for hidden state extraction**: `z_h` is derived from hidden
    states "averaged over the last N tokens" of the trajectory at step `h`. What is N?

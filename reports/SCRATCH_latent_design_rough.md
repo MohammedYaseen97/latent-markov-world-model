@@ -56,7 +56,7 @@ But "meaning as the model represents it" ≠ "position in mathematical solution 
 The hidden states still capture syntax, surface patterns, specific numbers, etc.
 
 What pushes z_h toward solution-relevant information:
-1. **L_transition** (temporal structure): z_h + action must predict z_{h+1} without
+1. **L_transition** (temporal structure): z_h alone must predict z_{h+1} without
    token history. This forces z_h to retain what's predictive of the trajectory's
    future — which is more about mathematical state than surface syntax.
 2. **L_outcome during pretraining** (quality orientation): forces the encoder's
@@ -107,8 +107,8 @@ PROBLEM: "Find the number of integers n such that..."
 │    1–5. Same extraction → traj_repr_2 → (μ_2, σ_2²) → z_2             │
 │                                                                         │
 │    Transition loss (computed at end of rollout, not inline):            │
-│    L_transition += ||f(z_1, traj_repr_1) - z_2||²                      │
-│    (transition model predicts z_2 from z_1 + what happened in chunk 1) │
+│    L_transition += ||f(z_1) - z_2||²                                    │
+│    (transition model predicts z_2 from z_1 alone — pure Markov)        │
 └───────────────────────────────┬─────────────────────────────────────────┘
                                 │ z_2 prefix embedding
                                 ↓
@@ -178,7 +178,7 @@ PHASE 0 — VAE Pretraining (NOT counted in the 200-step RL budget)
 
   Losses during Phase 0:
     L_ELBO       = reconstruction_loss + KL(q(z|τ) || N(0,1))
-    L_transition = ||f(z_h, traj_repr_h) - z_{h+1}||²
+    L_transition = ||f(z_h) - z_{h+1}||²
     L_outcome    = BCE(outcome_head(z_final), correct_or_not)
 
   What L_outcome is:
@@ -222,9 +222,9 @@ PHASE 1 — Joint RL Training (the 200-step RL budget)
                    Sparse: only fires when at least 1 of G=8 rollouts is correct
                    Updates: backbone, policy head
 
-    L_transition:  ||f(z_h, traj_repr_h) - z_{h+1}||²
+    L_transition:  ||f(z_h) - z_{h+1}||²
                    Always non-zero. Keeps Markov property active.
-                   Updates: transition model, encoder, (backbone indirectly)
+                   Updates: transition model, encoder.
 
     L_VAE:         ELBO: reconstruction + KL(q(z|τ) || N(0,1))
                    Always non-zero. Keeps encoder/decoder coherent.
@@ -248,15 +248,15 @@ src/models/vae_state_encoder.py
   │     │                [outputs μ (64-dim) and log_σ² (64-dim)]
   │     ├── decoder:     MLP(latent_dim=64 → 512 → hidden_dim=1536)
   │     │                [reconstruction, training only]
-  │     └── transition:  MLP(latent_dim + hidden_dim = 64+1536 → 512 → latent_dim=64)
-  │                      [predicts next latent from current latent + action embedding]
+  │     └── transition:  MLP(latent_dim=64 → 512 → latent_dim=64)
+  │                      [predicts next latent from current latent alone — pure Markov]
   ├── OutcomeHead        MLP(latent_dim=64 → 64 → 1) + sigmoid
   │                      [Phase 0 only, discarded before Phase 1]
   └── helpers:
         extract_hidden_states(model, input_ids, response_ids) → (hidden_dim,)
         reparameterize(mu, log_var) → z
         elbo_loss(recon, target, mu, log_var) → scalar
-        transition_loss(z_h, traj_repr_h, z_h_plus_1) → scalar
+        transition_loss(z_h, z_h_plus_1) → scalar
 
 src/training/grpo_latent.py
   ├── pretrain_vae(config, run_dir)              ← Phase 0
@@ -348,20 +348,28 @@ Applies to Phase 1 only. During Phase 0, λ_trans is a separate config hyperpara
 
 ---
 
-### Q5: How does the transition model encode action a_h?
+### Q5: Does the transition model use repr_h as an input?
 
-**Decision: reuse traj_repr_h (mean-pooled hidden states of chunk h) as the action
-embedding. No separate action encoding.**
+**Decision: No. The transition is f(z_h) → z_{h+1} — z_h only.**
 
-f(z_h, a_h) → z_{h+1}_pred
-where a_h = traj_repr_h = mean_pool(final-layer hidden states of chunk h tokens)
+The pure Markov property is: current state predicts next state. No "action" is needed
+because in the text generation setting there is no clean state/action separation —
+the tokens generated in chunk h both ARE repr_h and produce z_h. There is no
+separately-chosen action that causes a transition.
 
-Why: traj_repr_h is already computed for the VAE encoder. Reusing it as the action
-embedding is cheap (no extra compute) and semantically correct — it IS the representation
-of what the model did during chunk h.
+An earlier version included repr_h as an "action embedding" in the transition, but
+this was wrong for two reasons:
+1. repr_h is what generated z_h (not what generates z_{h+1}), so calling it an
+   "action to the next state" is a misidentification.
+2. Giving repr_h (1536-dim, lossless) to the transition model alongside z_h (64-dim,
+   lossy) lets the transition bypass the bottleneck. The model can learn to ignore z_h
+   and route entirely through repr_h, eliminating the gradient pressure on z_h to be
+   information-dense. This defeats the purpose of the loss.
 
-Architecture: 2-layer MLP, input = concat(z_h, traj_repr_h) = 64+1536 = 1600 dim,
-hidden = 512, output = 64.
+The ELBO handles repr_h → z_h compression (reconstruction + KL). The transition
+handles z_h → z_{h+1} temporal structure. Clean separation.
+
+Architecture: 2-layer MLP, input = z_h = 64 dim, hidden = 512, output = 64.
 
 ---
 
@@ -446,13 +454,13 @@ These are NOT blocking. They go in configs, not in the design doc.
 | L_outcome fate | Discarded before Phase 1 begins |
 | Phase 1 losses | L_RL + λ_t × L_transition + L_VAE |
 | λ_trans schedule | 1.0 → 0.1 linear over steps 0-100, held at 0.1 for 100-200 |
-| Action embedding | traj_repr_h (mean-pool hidden states of chunk h tokens) |
+| Transition input | z_h only (pure Markov — no repr_h in transition) |
 | Hidden state aggregation | Mean-pool over all tokens in the chunk |
 | Latent dim | 64 |
 | VAE + transition model size | < 10M params |
 | Per-chunk token budget | ~341 (latent) vs 512/256/256 (token-Markov) |
 | Outcome head architecture | 2-layer MLP (64 → 64 → 1) + sigmoid |
-| Transition model architecture | 2-layer MLP (1600 → 512 → 64) |
+| Transition model architecture | 2-layer MLP (64 → 512 → 64) |
 | Encoder architecture | MLP (1536 → 512 → 128), outputs μ+log_σ² both 64-dim |
 | Decoder architecture | MLP (64 → 512 → 1536) |
 

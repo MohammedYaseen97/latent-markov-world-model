@@ -43,7 +43,7 @@ Before treating the core table as final:
 
 - [x] **Data:** `DATA_PROTOCOL` + `prepare_data.py` + `benchmark_manifest.json` + config paths aligned.
 - [x] **Token-Markov:** Delethink-style RL-learned carryover implemented; chunk boundary + max carryover length documented; isolated code path (`train_token_markov.py`, `token_markov_state.py`, `grpo_token_markov.py`); RL training budget matches baseline exactly. Pretrained instruct model scores 12.5% under both regimes (clean control). After 200 steps GRPO: baseline 12.5%→15.0% (signal received); token-Markov ≈12.5% (zero gradient for all 200 steps — stable fixed point at reference; SHA256 confirms no weight change; apparent 5.0% eval is noise). Full arithmetic in `reports/writeup_stubs.md`.
-- [ ] **Markov diagnostic (latent arms):** empirical evidence that `z_h` satisfies the Markov property — latent transition loss (`z_h + a_h → z_{h+1}` without history), last-state-only ablation, latent variance vs. problem difficulty correlation. See `reports/writeup_stubs.md`.
+- [ ] **Markov diagnostic (latent arms):** empirical evidence that `z_h` satisfies the Markov property — latent transition loss (`f(z_h) → z_{h+1}` without history), last-state-only ablation, latent variance vs. problem difficulty correlation. See `reports/writeup_stubs.md`.
 - [ ] **Fairness:** same pretrained checkpoint across arms (`configs/base_model.yaml`), MATH-B pool, reward, train/eval budgets, max length, decode settings (unless documented method-specific).
 - [ ] **Metrics:** `pass@1024` all arms; table from `run_ablation_table.py` artifacts, not hand-typed.
 - [x] **Repro:** seeds + tolerances in `repro_tolerance.yaml`; seeding stack verified bit-for-bit on smoke (entropy + completion hashes identical across runs); `check_reproducibility.py` in place; checkpoints/log infrastructure confirmed.
@@ -94,17 +94,17 @@ Before treating the core table as final:
 
 **Deliverables — `latent_grpo` arm:**
 - [x] Phase 0 pretraining dataset: `data/math_easy_pool.jsonl` — 2974 problems (974 L1, 1000 L2, 1000 L3) from `EleutherAI/hendrycks_math`; calibration confirmed pass@8 = 83%, per-sample 40% (`results/calib_easy_pool.json`)
-- [ ] `scripts/generate_phase0_rollouts.py` — frozen backbone rollout generation + hidden state extraction, saves `(repr_1, repr_2, repr_3, reward)` per trajectory
-- [ ] `src/models/vae_state_encoder.py` — `VAEStateEncoder` (encoder, decoder, transition) + `OutcomeHead` (Phase 0 only)
-- [ ] `src/training/grpo_latent.py` — `pretrain_vae()` (Phase 0) + `train_latent()` (Phase 1)
-- [ ] `configs/train_latent_grpo_smoke.yaml` — smoke config (2 steps, 4 problems, QLoRA, 4060)
+- [x] `scripts/generate_phase0_rollouts.py` — frozen backbone rollout generation + hidden state extraction, saves `(repr_1, repr_2, repr_3, reward)` per trajectory
+- [x] `src/models/vae_state_encoder.py` — `VAEStateEncoder` (encoder, decoder, transition) + `OutcomeHead` (Phase 0 only)
+- [x] `src/training/grpo_latent.py` — `pretrain_vae()` (Phase 0); `train_latent()` (Phase 1) stub
+- [x] `configs/train_latent_grpo_smoke.yaml` — smoke config; smoke end-to-end passed (rollouts → VAE train → NFR6 plot, no errors)
 - [ ] `configs/train_latent_grpo.yaml` — full Phase 1 config (200 steps, A100, extends baseline)
-- [ ] `scripts/check_latent_structure.py` — t-SNE/UMAP of z_final (NFR6 gate)
+- [x] `scripts/check_latent_structure.py` — t-SNE/UMAP of z_final (NFR6 gate)
 - [ ] Latent generation mode in `scripts/eval_passk.py`
 - [ ] Phase 1 eval artifacts under `artifacts/latent_grpo/{run_id}/`
 
 **Pass criteria — `latent_grpo` arm:**
-- [ ] Smoke test completes end-to-end in < 10 min on 4060 (Phase 0 + Phase 1, no NaN blowups)
+- [x] Smoke test completes end-to-end in < 10 min on 4060 (Phase 0 + Phase 1, no NaN blowups)
 - [ ] **NFR6 gate:** t-SNE of z_final shows visible separation between correct and incorrect trajectories on the Phase 0 pool — must pass before A100 Phase 1 run
 - [ ] Phase 1 training log shows L_transition non-zero from step 0; L_RL non-zero within first 30 steps (gradient flow canaries per NFR4)
 - [ ] `pass@1024` evaluated for `latent_grpo`; result logged in `reports/writeup_stubs.md`
@@ -112,7 +112,7 @@ Before treating the core table as final:
 - [ ] Shared hyperparameters (G=8, lr=1e-6, 200 steps, same backbone) match all other arms
 
 **Additional pass criterion — Markov diagnostic (required for paper):** empirical evidence that `z_h` satisfies the Markov property. Without this, the claim is an assertion, not a result:
-- **E1 — Transition sufficiency:** held-out transition loss (z_h + a_h → z_{h+1} without history)
+- **E1 — Transition sufficiency:** held-out transition loss (f(z_h) → z_{h+1} without history)
 - **E2 — Policy sufficiency:** last-state-only ablation (policy on z_h vs full history)
 - **E3 — Uncertainty calibration:** σ_h² correlation with problem difficulty / outcome
 

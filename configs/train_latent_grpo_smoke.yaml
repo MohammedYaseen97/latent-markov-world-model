@@ -1,0 +1,105 @@
+# Latent Markov arm — smoke profile for RTX 4060 8 GB (pipeline verification).
+#
+# Goal: confirm the full Phase 0 pipeline (rollout generation → VAE training →
+#       NFR6 diagnostic) runs end-to-end without error on a small machine.
+#       2 steps, 4 problems — produces NO meaningful signal; just validates plumbing.
+#
+# NFR3 requirement: this config must run end-to-end in < 10 minutes on the 4060.
+# If it takes longer, reduce n_rollouts or batch_size.
+#
+# Usage:
+#   # Step 1: generate rollouts (smoke subset)
+#   python scripts/generate_phase0_rollouts.py \
+#       --pool-path data/math_easy_pool.jsonl \
+#       --output-path data/phase0_rollouts_smoke.pt \
+#       --limit 4 --n-rollouts 2 --seed 42
+#
+#   # Step 2: train VAE (smoke)
+#   python scripts/train_latent_grpo.py \
+#       --config configs/train_latent_grpo_smoke.yaml
+#
+#   # Step 3: check latent structure (NFR6 gate, smoke subset)
+#   python scripts/check_latent_structure.py \
+#       --rollout-path data/phase0_rollouts_smoke.pt \
+#       --checkpoint-path runs/latent_grpo_smoke/phase0_vae.pt \
+#       --output-dir runs/latent_grpo_smoke/plots
+
+extends: "configs/base_model.yaml"
+
+experiment:
+  name: "latent_grpo_smoke"
+  profile: "smoke"
+  state_mode: "latent_markov"
+
+# ---------------------------------------------------------------------------
+# Latent arm architecture
+# ---------------------------------------------------------------------------
+latent_markov:
+  latent_dim: 64           # z_h dimension (design decision Q1)
+  hidden_dim: 1536         # Qwen2.5-1.5B last-layer hidden size
+  n_chunks: 3              # fixed: chunks per rollout
+  chunk_tokens: 341        # tokens per chunk for Phase 1 (341×3 = 1023 ≈ 1024)
+
+# ---------------------------------------------------------------------------
+# Phase 0 — VAE pretraining
+# ---------------------------------------------------------------------------
+phase0:
+  rollout_path: "data/phase0_rollouts_smoke.pt"   # produced by generate_phase0_rollouts.py
+  checkpoint_path: "runs/latent_grpo_smoke/phase0_vae.pt"
+
+  # Smoke: 2 steps only (4 problems × 2 rollouts = 8 trajectories → 1 batch of 8)
+  num_epochs: 1
+  batch_size: 8             # all 8 smoke trajectories in one batch
+
+  learning_rate: 3.0e-4    # AdamW; higher than RL lr since VAE is small and cold-start
+
+  # Loss weights (λ). Equal by default; tune after NFR6 diagnostic.
+  lambda_elbo: 1.0
+  lambda_trans: 1.0
+  lambda_out: 1.0
+
+  logging_steps: 1
+  save_steps: 10            # smoke: save at end only
+
+# ---------------------------------------------------------------------------
+# Phase 0 rollout generation (smoke parameters — passed to generate_phase0_rollouts.py)
+# ---------------------------------------------------------------------------
+phase0_rollouts:
+  pool_path: "data/math_easy_pool.jsonl"
+  output_path: "data/phase0_rollouts_smoke.pt"
+  n_rollouts: 2             # G=2 for smoke (minimum to get reward variance)
+  total_tokens: 1024
+  limit: 4                  # smoke: 4 problems only
+  seed: 42
+  temperature: 1.0
+  top_p: 1.0
+
+# ---------------------------------------------------------------------------
+# NFR6 diagnostic (check_latent_structure.py)
+# ---------------------------------------------------------------------------
+nfr6:
+  rollout_path: "data/phase0_rollouts_smoke.pt"
+  checkpoint_path: "runs/latent_grpo_smoke/phase0_vae.pt"
+  output_dir: "runs/latent_grpo_smoke/plots"
+  method: "tsne"            # "tsne" or "umap"
+
+# ---------------------------------------------------------------------------
+# Phase 1 (not active in smoke; included for config completeness)
+# ---------------------------------------------------------------------------
+training:
+  seed: 42
+  learning_rate: 1.0e-6    # matches all other arms (train_baseline_grpo.yaml)
+  num_generations: 2        # G=2 for smoke
+  batch_size: 2             # problems per step
+  grad_accum_steps: 1
+  max_completion_length: 1024
+  temperature: 1.0
+  top_p: 1.0
+  max_steps: 2
+  num_epochs: 1
+  gradient_checkpointing: true   # required to fit 1.5B + QLoRA on 8 GB
+  logging_steps: 1
+  save_steps: 5
+
+evaluation:
+  path: "data/math_beyond_smoke.jsonl"
