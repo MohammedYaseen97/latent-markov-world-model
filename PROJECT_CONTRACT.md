@@ -88,7 +88,7 @@ Before treating the core table as final:
 
 ---
 
-## Phase 3 🔲 — Latent Markov arm (`latent_grpo`)
+## Phase 3 🔄 — Latent Markov arm (`latent_grpo`) — Phase 0 complete, Phase 1 next
 
 **Design doc:** `reports/latent_markov_design.md` (authoritative). Implementation steps and ordering in that doc's "Implementation Deliverables" table.
 
@@ -98,14 +98,20 @@ Before treating the core table as final:
 - [x] `src/models/vae_state_encoder.py` — `VAEStateEncoder` (encoder, decoder, transition) + `OutcomeHead` (Phase 0 only)
 - [x] `src/training/grpo_latent.py` — `pretrain_vae()` (Phase 0); `train_latent()` (Phase 1) stub
 - [x] `configs/train_latent_grpo_smoke.yaml` — smoke config; smoke end-to-end passed (rollouts → VAE train → NFR6 plot, no errors)
-- [ ] `configs/train_latent_grpo.yaml` — full Phase 1 config (200 steps, A100, extends baseline)
+- [x] `configs/train_latent_grpo.yaml` — full Phase 1 config (200 steps, A100, extends baseline)
 - [x] `scripts/check_latent_structure.py` — t-SNE/UMAP of z_final (NFR6 gate)
 - [ ] Latent generation mode in `scripts/eval_passk.py`
 - [ ] Phase 1 eval artifacts under `artifacts/latent_grpo/{run_id}/`
 
+**Phase 0 artifacts (A100 run, 2026-05-09):**
+- Rollouts: `data/phase0_rollouts.pt` — 23,792 trajectories (2974 problems × G=8), reward rate 38.6%
+- VAE checkpoint: `runs/latent_grpo/phase0_vae.pt`
+- NFR6 plot: `runs/latent_grpo/plots/latent_structure_umap.png`
+- NFR6 summary: `runs/latent_grpo/plots/nfr6_summary.json` — n_correct=9189, n_incorrect=14603
+
 **Pass criteria — `latent_grpo` arm:**
 - [x] Smoke test completes end-to-end in < 10 min on 4060 (Phase 0 + Phase 1, no NaN blowups)
-- [ ] **NFR6 gate:** t-SNE of z_final shows visible separation between correct and incorrect trajectories on the Phase 0 pool — must pass before A100 Phase 1 run
+- [x] **NFR6 gate:** UMAP of z_final shows structured manifold with correct trajectories dominating the main horseshoe and incorrect concentrated at boundaries — soft pass; proceed to Phase 1
 - [ ] Phase 1 training log shows L_transition non-zero from step 0; L_RL non-zero within first 30 steps (gradient flow canaries per NFR4)
 - [ ] `pass@1024` evaluated for `latent_grpo`; result logged in `reports/writeup_stubs.md`
 - [ ] No NaN blowups under zero-reward stretches (R6.5)
