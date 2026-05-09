@@ -1,20 +1,107 @@
-# Latent arm — VAE latent Markov state, no uncertainty bonus.
-# Inherits all shared training knobs from train_baseline_grpo.yaml.
-# Only method-specific fields are set here.
+# Latent Markov arm — full A100 profile.
+#
+# Phase 0: freeze backbone, pretrain VAEStateEncoder + OutcomeHead on the
+#           math_easy_pool (2974 problems × 8 rollouts = ~23,792 trajectories).
+# Phase 1: unfreeze backbone (QLoRA), run GRPO with z injection on MATH-B-I.
+#
+# Inherits shared training knobs (lr, G, steps, backbone, dtype) from
+# train_baseline_grpo.yaml. Only latent-specific fields are set here.
+#
+# Usage:
+#   # 0. Generate the easy pool (pulls from HuggingFace — no upload needed)
+#   python scripts/prepare_easy_pool.py
+#
+#   # 1. Generate Phase 0 rollouts (A100, ~2-3 h for 2974 problems × 8)
+#   python scripts/generate_phase0_rollouts.py \
+#       --pool-path data/math_easy_pool.jsonl \
+#       --output-path data/phase0_rollouts.pt \
+#       --n-rollouts 8 --seed 42
+#
+#   # 2. Train VAE — Phase 0
+#   python scripts/train_latent.py \
+#       --config configs/train_latent_grpo.yaml --phase 0
+#
+#   # 3. NFR6 gate — inspect latent structure before Phase 1
+#   python scripts/check_latent_structure.py \
+#       --rollout-path data/phase0_rollouts.pt \
+#       --checkpoint-path runs/latent_grpo/phase0_vae.pt \
+#       --output-dir runs/latent_grpo/plots --method umap
+#
+#   # 4. Phase 1 GRPO (only after NFR6 passes)
+#   python scripts/train_latent.py \
+#       --config configs/train_latent_grpo.yaml --phase 1
 
 extends: "configs/train_baseline_grpo.yaml"
 
 experiment:
   name: "latent_grpo"
-  state_mode: "latent"
+  profile: "full"
+  state_mode: "latent_markov"
 
+# ---------------------------------------------------------------------------
+# Latent arm architecture (shared across Phase 0 and Phase 1)
+# ---------------------------------------------------------------------------
+latent_markov:
+  latent_dim: 64            # z_h dimension (design decision Q1)
+  hidden_dim: 1536          # Qwen2.5-1.5B last-layer hidden size
+  n_chunks: 3               # fixed: chunks per rollout
+  chunk_tokens: 341         # tokens per chunk (341 × 3 = 1023 ≈ 1024)
+
+# ---------------------------------------------------------------------------
+# Phase 0 rollout generation (parameters for generate_phase0_rollouts.py)
+# ---------------------------------------------------------------------------
+phase0_rollouts:
+  pool_path: "data/math_easy_pool.jsonl"
+  output_path: "data/phase0_rollouts.pt"
+  n_rollouts: 8             # G=8; match eval pass@8 budget
+  total_tokens: 1024        # completion budget per rollout
+  seed: 42
+  temperature: 1.0
+  top_p: 1.0
+
+# ---------------------------------------------------------------------------
+# Phase 0 — VAE pretraining on frozen backbone
+# ---------------------------------------------------------------------------
+phase0:
+  rollout_path: "data/phase0_rollouts.pt"
+  checkpoint_path: "runs/latent_grpo/phase0_vae.pt"
+
+  # 3 epochs over ~23,792 trajectories ≈ 280 steps at batch_size=256.
+  # Conservative: VAE is small (64-dim) and cold-start; 3 epochs is enough
+  # to get meaningful L_outcome signal without memorising the easy pool.
+  num_epochs: 3
+  batch_size: 256           # A100 80 GB handles this comfortably
+
+  learning_rate: 3.0e-4     # AdamW; higher than RL lr (VAE is small, cold-start)
+
+  # Loss weights. Start balanced; tune only if NFR6 gate shows poor separation.
+  lambda_elbo: 1.0
+  lambda_trans: 1.0
+  lambda_out: 1.0
+
+  logging_steps: 10
+  save_steps: 100
+
+# ---------------------------------------------------------------------------
+# Phase 1 — joint GRPO on MATH-B-I (inherits baseline training block)
+# Overrides: seed to 11 (matches all latent arms), lambda weights added.
+# ---------------------------------------------------------------------------
 training:
   seed: 11
+  gradient_checkpointing: false   # A100, 1.5B — not needed
 
-vae:
-  # TODO(phase3): Fill these before implementation.
-  latent_dim: null          # Start small: 64-128 per PROJECT_BRIEF.md
-  encoder_layers: null      # MLP depth: 2-3 layers
-  decoder_layers: null      # MLP depth: 2-3 layers
-  input: "hidden_states"    # Final-layer hidden states averaged over last N tokens per reasoning step
-  conditioning: "concat"    # z concatenated with token embedding before policy head
+# Phase 1 loss weights (λ_trans, λ_vae ride alongside L_RL).
+# λ_trans kept small so L_RL dominates when rewards do fire.
+# Tune after confirming L_transition is non-zero from step 0 (NFR4 canary).
+phase1_loss:
+  lambda_trans: 0.1
+  lambda_vae: 0.05
+
+# ---------------------------------------------------------------------------
+# NFR6 diagnostic (check_latent_structure.py)
+# ---------------------------------------------------------------------------
+nfr6:
+  rollout_path: "data/phase0_rollouts.pt"
+  checkpoint_path: "runs/latent_grpo/phase0_vae.pt"
+  output_dir: "runs/latent_grpo/plots"
+  method: "umap"            # umap preferred on full dataset (faster than tsne at N≈24k)
