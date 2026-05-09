@@ -182,8 +182,9 @@ def pretrain_vae(config: dict[str, Any], run_dir: Path) -> None:
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=4,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=True,
     )
     steps_per_epoch = len(dataloader)
     total_steps = num_epochs * steps_per_epoch
