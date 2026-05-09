@@ -339,9 +339,26 @@ def run_batch(
         full_ids[i, :L]  = seq
         full_attn[i, :L] = 1
 
-    fwd = model(full_ids, attention_mask=full_attn, output_hidden_states=True)
-    last_hidden = fwd.hidden_states[-1]  # (B, max_full, hidden_dim)
-    del fwd, full_ids, full_attn
+    # Capture only the final-layer hidden states via a forward hook instead of
+    # output_hidden_states=True, which would store all 28 intermediate layers
+    # (~28x more memory, causing OOM on long-sequence batches).
+    _captured: dict[str, torch.Tensor] = {}
+
+    def _capture_last_hidden(
+        module: torch.nn.Module,
+        inp: tuple,
+        out: tuple,
+    ) -> None:
+        _captured["last_hidden"] = out[0].detach()  # (B, seq_len, hidden_dim)
+
+    hook = model.model.register_forward_hook(_capture_last_hidden)
+    try:
+        model(full_ids, attention_mask=full_attn)
+    finally:
+        hook.remove()
+
+    last_hidden = _captured["last_hidden"]  # (B, max_full, hidden_dim)
+    del full_ids, full_attn
     torch.cuda.empty_cache()
 
     # ── Chunk extraction + grading ─────────────────────────────────────────
