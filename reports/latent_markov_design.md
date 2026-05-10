@@ -446,9 +446,12 @@ Ordered by dependency. Each step is a gate for the next.
 | 6 | Smoke config + smoke end-to-end pass on 4060 | `configs/train_latent_grpo_smoke.yaml` | ✅ |
 | 7 | **NFR6 gate** — UMAP of z_final: structured horseshoe manifold, correct trajectories dominate core, incorrect at boundaries; soft pass → proceed to Phase 1. Plot: `runs/latent_grpo/plots/latent_structure_umap.png` | `scripts/check_latent_structure.py` | ✅ |
 | 8 | `train_latent()` — Phase 1 custom GRPO loop (L_RL + λ_t × L_transition + L_VAE) | `src/training/grpo_latent.py` | 🔜 |
-| 9 | Latent eval mode in pass@k script | `scripts/eval_passk.py` | ⬜ |
+| 8a | `generate_latent_traces()` — chunked inference engine: z injection per chunk via `inputs_embeds`, returns chunk_ids + repr_h + z_h + old_log_probs per rollout | `src/training/grpo_latent.py` | ✅ |
+| 8b | `latent_training_step()` — assembles L_RL (differentiable log-prob re-computation with z prefixes) + λ_t × L_transition + L_VAE | `src/training/grpo_latent.py` | ✅ |
+| 9 | `_generate_latent_eval()` — same chunked z-injection inference as 8a but in eval mode (no grad, n_samples repeats) | `scripts/eval_passk.py` | ✅ |
 | 10 | Full Phase 1 config (200 steps, A100) | `configs/train_latent_grpo.yaml` | ✅ |
 | 11 | A100 run: Phase 1 → eval | — | ⬜ |
+| 12 | **E1 + E3 Markov diagnostics** — held-out transition loss (E1) + σ_h² correlation with outcome (E3). E2 is covered by the ablation table. | `scripts/eval_markov_diagnostics.py` | ✅ |
 
 ---
 

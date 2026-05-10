@@ -118,9 +118,9 @@ Before treating the core table as final:
 - [ ] Shared hyperparameters (G=8, lr=1e-6, 200 steps, same backbone) match all other arms
 
 **Additional pass criterion — Markov diagnostic (required for paper):** empirical evidence that `z_h` satisfies the Markov property. Without this, the claim is an assertion, not a result:
-- **E1 — Transition sufficiency:** held-out transition loss (f(z_h) → z_{h+1} without history)
-- **E2 — Policy sufficiency:** last-state-only ablation (policy on z_h vs full history)
-- **E3 — Uncertainty calibration:** σ_h² correlation with problem difficulty / outcome
+- **E1 — Transition sufficiency:** held-out transition loss (f(z_h) → z_{h+1} without history) → `scripts/eval_markov_diagnostics.py`
+- **E2 — Policy sufficiency:** last-state-only ablation (latent arm pass@1024 vs baseline) → covered by ablation table via `eval_passk.py`; no separate script needed
+- **E3 — Uncertainty calibration:** σ_h² correlation with outcome → `scripts/eval_markov_diagnostics.py`
 
 ## Phase 3b 🔲 — Uncertainty arm (`latent_grpo_uncertainty`)
 

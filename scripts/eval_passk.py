@@ -88,11 +88,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--generation-mode",
-        choices=("baseline", "token_markov"),
+        choices=("baseline", "token_markov", "latent_markov"),
         default="baseline",
         help=(
             "baseline: flat single-sequence generation (default). "
-            "token_markov: Delethink chunked generation — requires --train-config."
+            "token_markov: Delethink chunked generation — requires --train-config. "
+            "latent_markov: chunked generation with z_h injection — requires --train-config "
+            "and a Phase 1 checkpoint containing vae + z_injector weights."
         ),
     )
     p.add_argument(
@@ -337,6 +339,225 @@ def _estimate_pass_at_k_metrics(
                 remaining -= this_batch
 
             per_problem.append((len(completions), _grade(completions, problem["ground_truth"])))
+
+    return {
+        f"pass@{k}": sum(_unbiased_pass_at_k(n, c, k) for n, c in per_problem) / len(per_problem)
+        for k in ks
+    }
+
+
+def _generate_latent_eval(
+    model: "AutoModelForCausalLM",
+    tokenizer: "AutoTokenizer",
+    vae: "VAEStateEncoder",
+    z_injector: "ZInjector",
+    problem: dict[str, Any],
+    chunk_tokens: int,
+    temperature: float,
+    top_p: float,
+    device: torch.device,
+) -> str:
+    """Generate one full completion for a problem using the latent Markov arm's
+    chunked z-injection inference (eval mode — no gradient, deterministic z = μ).
+
+    This is the eval-time counterpart of generate_latent_traces() in
+    src/training/grpo_latent.py.  The generation protocol is identical
+    (3 chunks, z_{h-1} prefix injected via inputs_embeds for chunks 2 and 3)
+    but runs with model.eval() and vae.eval() so reparameterize() returns
+    the deterministic mean μ rather than a stochastic sample.
+
+    Generation protocol (one rollout, batch_size = 1)
+    ──────────────────────────────────────────────────
+    Chunk 1:
+        • prompt_ids = tokenize(system + problem)
+        • generate(input_ids=prompt_ids, max_new_tokens=chunk_tokens) → chunk1_ids
+        • repr_1 = extract hidden states for chunk 1 tokens (forward hook on model.model)
+        • mu_1, logvar_1 = vae.encode(repr_1)
+        • z_1 = mu_1  (eval mode — deterministic)
+
+    Chunk 2:
+        • embed_layer = model.get_input_embeddings()
+        • prefix = z_injector.get_prefix_embedding(z_1)        # (1, 1, hidden_dim)
+        • inputs_embeds = cat([prefix, embed_layer(chunk1_ids)], dim=1)
+        • generate(inputs_embeds=inputs_embeds, max_new_tokens=chunk_tokens) → chunk2_ids
+        • repr_2, z_2 = same pattern
+
+    Chunk 3:
+        • inputs_embeds = cat([z_injector(z_2), embed_layer(chunk2_ids)], dim=1)
+        • generate → chunk3_ids
+
+    Return:
+        Full completion string: decode(chunk1_ids + chunk2_ids + chunk3_ids)
+
+    Args:
+        model:        backbone, already loaded and set to eval mode by the caller.
+        tokenizer:    Qwen tokenizer.
+        vae:          VAEStateEncoder in eval mode (reparameterize returns μ).
+        z_injector:   ZInjector in eval mode.
+        problem:      dict with "prompt" and "ground_truth" keys.
+        chunk_tokens: max new tokens per chunk.
+        temperature:  sampling temperature (use 1.0 for consistency with training).
+        top_p:        nucleus sampling cutoff.
+        device:       CUDA device.
+    """
+    from src.training.grpo_baseline import SYSTEM_PROMPT
+
+    pad_id      = tokenizer.eos_token_id
+    embed_layer = model.get_input_embeddings()
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": problem["prompt"]},
+    ]
+    prompt_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0].to(device)
+    pl = prompt_ids.shape[0]
+
+    # ── Chunk 1 ────────────────────────────────────────────────────────
+    gen1 = model.generate(
+        prompt_ids.unsqueeze(0),
+        attention_mask=torch.ones(1, pl, dtype=torch.long, device=device),
+        max_new_tokens=chunk_tokens, do_sample=True,
+        temperature=temperature, top_p=top_p,
+        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
+    )
+    chunk1_ids = gen1[0, pl:].cpu()
+    L1 = chunk1_ids.shape[0]
+
+    # repr_1 via output_hidden_states (works for plain and PEFT/QLoRA models)
+    full1 = torch.cat([prompt_ids, chunk1_ids.to(device)]).unsqueeze(0)
+    fwd1  = model(full1, attention_mask=torch.ones_like(full1), output_hidden_states=True)
+    repr_1 = fwd1.hidden_states[-1][0, pl:pl+L1, :].mean(0).unsqueeze(0)   # (1, H)
+    mu_1, logvar_1 = vae.encode(repr_1)
+    z_1 = vae.reparameterize(mu_1, logvar_1)                   # deterministic μ in eval mode
+
+    # ── Chunk 2 ────────────────────────────────────────────────────────
+    z_pfx1     = z_injector.get_prefix_embedding(z_1)            # (1, 1, H)
+    chunk1_emb = embed_layer(chunk1_ids.to(device)).unsqueeze(0)  # (1, L1, H)
+    ie2 = torch.cat([z_pfx1, chunk1_emb], dim=1)               # (1, 1+L1, H)
+    am2 = torch.ones(1, 1 + L1, dtype=torch.long, device=device)
+
+    gen2 = model.generate(
+        inputs_embeds=ie2, attention_mask=am2,
+        max_new_tokens=chunk_tokens, do_sample=True,
+        temperature=temperature, top_p=top_p,
+        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
+    )
+    chunk2_ids = (gen2[0, 1+L1:] if gen2.shape[1] > chunk_tokens else gen2[0]).cpu()
+    L2 = chunk2_ids.shape[0]
+
+    # repr_2
+    chunk2_emb = embed_layer(chunk2_ids.to(device)).unsqueeze(0)
+    fe2  = torch.cat([z_pfx1, chunk1_emb, chunk2_emb], dim=1)
+    fwd2 = model(inputs_embeds=fe2, attention_mask=torch.ones(1, fe2.shape[1], dtype=torch.long, device=device), output_hidden_states=True)
+    repr_2 = fwd2.hidden_states[-1][0, 1+L1:1+L1+L2, :].mean(0).unsqueeze(0)
+    mu_2, logvar_2 = vae.encode(repr_2)
+    z_2 = vae.reparameterize(mu_2, logvar_2)
+
+    # ── Chunk 3 ────────────────────────────────────────────────────────
+    z_pfx2    = z_injector.get_prefix_embedding(z_2)
+    chunk2_emb2 = embed_layer(chunk2_ids.to(device)).unsqueeze(0)
+    ie3 = torch.cat([z_pfx2, chunk2_emb2], dim=1)
+    am3 = torch.ones(1, 1 + L2, dtype=torch.long, device=device)
+
+    gen3 = model.generate(
+        inputs_embeds=ie3, attention_mask=am3,
+        max_new_tokens=chunk_tokens, do_sample=True,
+        temperature=temperature, top_p=top_p,
+        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
+    )
+    chunk3_ids = (gen3[0, 1+L2:] if gen3.shape[1] > chunk_tokens else gen3[0]).cpu()
+
+    all_ids = torch.cat([chunk1_ids, chunk2_ids, chunk3_ids])
+    return tokenizer.decode(all_ids, skip_special_tokens=True)
+
+
+def _estimate_pass_at_k_metrics_latent(
+    *,
+    problems: list[dict[str, Any]],
+    checkpoint: str,
+    ks: list[int],
+    eval_cfg: dict[str, Any],
+    train_cfg: dict[str, Any],
+) -> dict[str, float]:
+    """Compute pass@k for the latent Markov arm using chunked z-injection inference.
+
+    Loads the Phase 1 checkpoint (backbone + VAE + ZInjector), then calls
+    _generate_latent_eval() for each sample of each problem.
+
+    This function does NOT support vLLM (the z-injection inputs_embeds path is
+    incompatible with vLLM's offline engine).  HF generate only.
+
+    Args:
+        problems:   list of problem dicts from the eval JSONL pool.
+        checkpoint: path to the Phase 1 backbone directory (containing the adapter
+                    or merged weights from _save_phase1_checkpoint).
+        ks:         list of k values for pass@k (e.g. [1, 16, 1024]).
+        eval_cfg:   top-level evaluation config dict.
+        train_cfg:  training config (reads latent_markov.chunk_tokens, phase0.checkpoint_path).
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from src.models.vae_state_encoder import VAEStateEncoder, ZInjector
+    from src.training.grpo_baseline import SYSTEM_PROMPT
+
+    latent_cfg  = train_cfg["latent_markov"]
+    phase0_cfg  = train_cfg["phase0"]
+    chunk_tokens = int(latent_cfg.get("chunk_tokens", 341))
+    latent_dim   = int(latent_cfg.get("latent_dim", 64))
+    hidden_dim   = int(latent_cfg.get("hidden_dim", 1536))
+    temperature  = float(eval_cfg.get("temperature", 1.0))
+    top_p        = float(eval_cfg.get("top_p", 1.0))
+    n_samples    = max(ks)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ── Load backbone ──────────────────────────────────────────────────
+    model = AutoModelForCausalLM.from_pretrained(
+        checkpoint, torch_dtype=torch.bfloat16, device_map="auto",
+    )
+    model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(
+        checkpoint, trust_remote_code=True, padding_side="left",
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # ── Load Phase 1 VAE + ZInjector ──────────────────────────────────
+    # Phase 1 checkpoint is saved as phase1_latent.pt alongside the backbone dir.
+    p1_ckpt_path = Path(checkpoint).parent / "phase1_latent.pt"
+    p1_ckpt = torch.load(p1_ckpt_path, weights_only=False, map_location=device)
+
+    vae = VAEStateEncoder(hidden_dim=hidden_dim, latent_dim=latent_dim).to(device)
+    vae.load_state_dict(p1_ckpt["vae"])
+    vae.eval()
+
+    z_injector = ZInjector(latent_dim=latent_dim, hidden_dim=hidden_dim).to(device)
+    z_injector.load_state_dict(p1_ckpt["z_injector"])
+    z_injector.eval()
+
+    # ── Eval loop ─────────────────────────────────────────────────────
+    per_problem: list[tuple[int, int]] = []
+
+    for problem in tqdm(problems, desc="Evaluating (latent-Markov HF)", unit="problem"):
+        completions: list[str] = []
+        for _ in range(n_samples):
+            with torch.no_grad():
+                text = _generate_latent_eval(
+                    model=model,
+                    tokenizer=tokenizer,
+                    vae=vae,
+                    z_injector=z_injector,
+                    problem=problem,
+                    chunk_tokens=chunk_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    device=device,
+                )
+            completions.append(text)
+        per_problem.append((len(completions), _grade(completions, problem["ground_truth"])))
 
     return {
         f"pass@{k}": sum(_unbiased_pass_at_k(n, c, k) for n, c in per_problem) / len(per_problem)
@@ -638,6 +859,20 @@ def main() -> None:
             )
         train_cfg = load_yaml_with_extends(args.train_config.resolve(), root=REPO_ROOT)
         metrics = _estimate_pass_at_k_metrics_token_markov(
+            problems=problems,
+            checkpoint=checkpoint,
+            ks=ks,
+            eval_cfg=eval_cfg,
+            train_cfg=train_cfg,
+        )
+    elif args.generation_mode == "latent_markov":
+        if args.train_config is None:
+            raise ValueError(
+                "--train-config is required for --generation-mode latent_markov. "
+                "Pass e.g. configs/train_latent_grpo.yaml."
+            )
+        train_cfg = load_yaml_with_extends(args.train_config.resolve(), root=REPO_ROOT)
+        metrics = _estimate_pass_at_k_metrics_latent(
             problems=problems,
             checkpoint=checkpoint,
             ks=ks,

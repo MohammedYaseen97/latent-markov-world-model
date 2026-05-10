@@ -421,7 +421,7 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     try:
-        import flash_attn  # noqa: F401
+        import flash_attn  # noqa: F401  # type: ignore[import-untyped]
         attn_impl = "flash_attention_2"
     except ImportError:
         attn_impl = "sdpa"   # PyTorch built-in; still faster than eager
