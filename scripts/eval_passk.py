@@ -429,7 +429,7 @@ def _generate_latent_eval(
     # repr_1 via output_hidden_states (works for plain and PEFT/QLoRA models)
     full1 = torch.cat([prompt_ids, chunk1_ids.to(device)]).unsqueeze(0)
     fwd1  = model(full1, attention_mask=torch.ones_like(full1), output_hidden_states=True)
-    repr_1 = fwd1.hidden_states[-1][0, pl:pl+L1, :].mean(0).unsqueeze(0)   # (1, H)
+    repr_1 = fwd1.hidden_states[-1][0, pl:pl+L1, :].mean(0).unsqueeze(0).float()   # (1, H)
     mu_1, logvar_1 = vae.encode(repr_1)
     z_1 = vae.reparameterize(mu_1, logvar_1)                   # deterministic μ in eval mode
 
@@ -452,7 +452,7 @@ def _generate_latent_eval(
     chunk2_emb = embed_layer(chunk2_ids.to(device)).unsqueeze(0)
     fe2  = torch.cat([z_pfx1, chunk1_emb, chunk2_emb], dim=1)
     fwd2 = model(inputs_embeds=fe2, attention_mask=torch.ones(1, fe2.shape[1], dtype=torch.long, device=device), output_hidden_states=True)
-    repr_2 = fwd2.hidden_states[-1][0, 1+L1:1+L1+L2, :].mean(0).unsqueeze(0)
+    repr_2 = fwd2.hidden_states[-1][0, 1+L1:1+L1+L2, :].mean(0).unsqueeze(0).float()
     mu_2, logvar_2 = vae.encode(repr_2)
     z_2 = vae.reparameterize(mu_2, logvar_2)
 
