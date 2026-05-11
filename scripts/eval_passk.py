@@ -515,19 +515,22 @@ def _estimate_pass_at_k_metrics_latent(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ── Load backbone ──────────────────────────────────────────────────
+    # _save_phase1_checkpoint writes the backbone to <checkpoint>/backbone/
+    # and phase1_latent.pt to <checkpoint>/phase1_latent.pt.
+    ckpt_dir     = Path(checkpoint)
+    backbone_dir = ckpt_dir / "backbone"
     model = AutoModelForCausalLM.from_pretrained(
-        checkpoint, torch_dtype=torch.bfloat16, device_map="auto",
+        str(backbone_dir), torch_dtype=torch.bfloat16, device_map="auto",
     )
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(
-        checkpoint, trust_remote_code=True, padding_side="left",
+        str(backbone_dir), trust_remote_code=True, padding_side="left",
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # ── Load Phase 1 VAE + ZInjector ──────────────────────────────────
-    # Phase 1 checkpoint is saved as phase1_latent.pt alongside the backbone dir.
-    p1_ckpt_path = Path(checkpoint).parent / "phase1_latent.pt"
+    p1_ckpt_path = ckpt_dir / "phase1_latent.pt"
     p1_ckpt = torch.load(p1_ckpt_path, weights_only=False, map_location=device)
 
     vae = VAEStateEncoder(hidden_dim=hidden_dim, latent_dim=latent_dim).to(device)

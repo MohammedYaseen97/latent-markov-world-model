@@ -445,12 +445,13 @@ Ordered by dependency. Each step is a gate for the next.
 | 5 | `pretrain_vae()` — Phase 0 training loop; checkpoint → `runs/latent_grpo/phase0_vae.pt` | `src/training/grpo_latent.py` | ✅ |
 | 6 | Smoke config + smoke end-to-end pass on 4060 | `configs/train_latent_grpo_smoke.yaml` | ✅ |
 | 7 | **NFR6 gate** — UMAP of z_final: structured horseshoe manifold, correct trajectories dominate core, incorrect at boundaries; soft pass → proceed to Phase 1. Plot: `runs/latent_grpo/plots/latent_structure_umap.png` | `scripts/check_latent_structure.py` | ✅ |
-| 8 | `train_latent()` — Phase 1 custom GRPO loop (L_RL + λ_t × L_transition + L_VAE) | `src/training/grpo_latent.py` | 🔜 |
+| 8 | `train_latent()` — Phase 1 custom GRPO loop (L_RL + λ_t × L_transition + L_VAE) | `src/training/grpo_latent.py` | ✅ |
 | 8a | `generate_latent_traces()` — chunked inference engine: z injection per chunk via `inputs_embeds`, returns chunk_ids + repr_h + z_h + old_log_probs per rollout | `src/training/grpo_latent.py` | ✅ |
 | 8b | `latent_training_step()` — assembles L_RL (differentiable log-prob re-computation with z prefixes) + λ_t × L_transition + L_VAE | `src/training/grpo_latent.py` | ✅ |
 | 9 | `_generate_latent_eval()` — same chunked z-injection inference as 8a but in eval mode (no grad, n_samples repeats) | `scripts/eval_passk.py` | ✅ |
 | 10 | Full Phase 1 config (200 steps, A100) | `configs/train_latent_grpo.yaml` | ✅ |
-| 11 | A100 run: Phase 1 → eval | — | ⬜ |
+| 11a | A100 Phase 1 training — 200 steps on `data/math_beyond_math_b_i_base.jsonl` | `configs/train_latent_grpo.yaml` | ✅ |
+| 11b | pass@k eval on MATH-B-I holdout | `scripts/eval_passk.py` | 🔜 |
 | 12 | **E1 + E3 Markov diagnostics** — held-out transition loss (E1) + σ_h² correlation with outcome (E3). E2 is covered by the ablation table. | `scripts/eval_markov_diagnostics.py` | ✅ |
 
 ---
@@ -503,6 +504,37 @@ Key observations:
    will be reinforced, incorrect ones suppressed, pulling the clusters further apart.
 
 **Verdict: NFR6 gate passed. Proceed to Phase 1.**
+
+---
+
+## Markov Diagnostics Results (Phase 1 A100 run, 2026-05-11)
+
+Run on the checkpoint produced by the 200-step Phase 1 training on `data/math_beyond_math_b_i_base.jsonl`.
+
+### E1 — Transition Sufficiency
+
+| Metric | Value |
+|--------|-------|
+| Held-out transition loss `‖f(z_h) − z_{h+1}‖²` | **0.00396** |
+| Held-out trajectories (n) | 4,758 |
+
+The transition model generalises to unseen trajectories with near-zero MSE in 64-dim latent space. The Markov property holds empirically: z_h contains sufficient information to predict z_{h+1} without access to the full token history. **E1: pass.**
+
+### E3 — Uncertainty Calibration
+
+| Metric | Value |
+|--------|-------|
+| Mean σ² — correct trajectories | 0.9718 |
+| Mean σ² — incorrect trajectories | 0.9839 |
+| Pearson r (σ² vs reward) | **−0.31** |
+| Pearson p-value | ≈ 0.0 |
+| n correct / n incorrect | 9,189 / 14,603 |
+
+Higher latent uncertainty correlates significantly with lower reward (r = −0.31, p ≈ 0). The sign is correct: harder / less-resolved trajectories have higher posterior variance.
+
+**Note on σ² magnitudes:** both groups sit close to 1.0 (the prior variance), indicating mild posterior collapse — the encoder routes most information through μ and keeps σ near the prior. The correlation is real but the absolute δσ² = 0.012 is small. For the `latent_grpo_uncertainty` arm this means the bonus signal will need per-step normalisation (or log(σ²)) to have practical range. **E3: soft pass.**
+
+**Verdict: E1 passes strongly. E3 passes softly. Proceed to pass@k eval (deliverable 11b).**
 
 ---
 
