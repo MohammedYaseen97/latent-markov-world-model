@@ -1125,6 +1125,7 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
             _save_phase1_checkpoint(
                 ckpt_path / f"checkpoint-{global_step + 1}",
                 model, vae, z_injector, optimizer, global_step + 1, log_history,
+                tokenizer=tokenizer,
             )
 
         step_bar.set_postfix(
@@ -1138,7 +1139,8 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
 
     # Final save.
     _save_phase1_checkpoint(
-        ckpt_path / "final", model, vae, z_injector, optimizer, max_steps, log_history
+        ckpt_path / "final", model, vae, z_injector, optimizer, max_steps, log_history,
+        tokenizer=tokenizer,
     )
     logger.info("Phase 1 complete. Checkpoint → %s", ckpt_path / "final")
 
@@ -1151,6 +1153,7 @@ def _save_phase1_checkpoint(
     optimizer: torch.optim.Optimizer,
     step: int,
     log_history: list[dict],
+    tokenizer=None,
 ) -> None:
     """Save backbone, VAE, ZInjector, and optimizer state to `directory`."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -1165,6 +1168,9 @@ def _save_phase1_checkpoint(
     )
     # Backbone saved separately via HF API (handles QLoRA adapter merging).
     model.save_pretrained(str(directory / "backbone"))
+    # Tokenizer must be saved alongside the backbone so eval can use chat templates.
+    if tokenizer is not None:
+        tokenizer.save_pretrained(str(directory / "backbone"))
     (directory / "trainer_state.json").write_text(
         json.dumps({"global_step": step, "log_history": log_history}, indent=2)
     )

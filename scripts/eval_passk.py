@@ -523,9 +523,20 @@ def _estimate_pass_at_k_metrics_latent(
         str(backbone_dir), torch_dtype=torch.bfloat16, device_map="auto",
     )
     model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(backbone_dir), trust_remote_code=True, padding_side="left",
+    # Try loading the tokenizer from the saved backbone first; fall back to the
+    # original backbone model ID for checkpoints saved before the tokenizer fix.
+    _tok_src = str(backbone_dir)
+    _tok_candidate = AutoTokenizer.from_pretrained(
+        _tok_src, trust_remote_code=True, padding_side="left",
     )
+    if _tok_candidate.chat_template is None:
+        # Tokenizer was not saved alongside the backbone — load from the original.
+        _tok_src = train_cfg["primary"]["huggingface_repo_id"]
+        tokenizer = AutoTokenizer.from_pretrained(
+            _tok_src, trust_remote_code=True, padding_side="left",
+        )
+    else:
+        tokenizer = _tok_candidate
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
