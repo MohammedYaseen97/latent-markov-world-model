@@ -536,7 +536,9 @@ def _generate_latent_eval_batch(
         L1 = c1_lens[i]; tot = pl + L1
         full1[i, :tot] = torch.cat([prompt_ids, chunk1_ids_list[i].to(device)])
         mask1[i, :tot] = 1
-    fwd1   = model(full1, attention_mask=mask1, output_hidden_states=True)
+    # Use model.model (backbone without lm_head) — no logit tensor materialised.
+    # For B=64 this saves ~12 GB vs calling the full CausalLM model.
+    fwd1   = model.model(full1, attention_mask=mask1, output_hidden_states=True)
     repr_1 = torch.stack([
         fwd1.hidden_states[-1][i, pl:pl + c1_lens[i], :].mean(0).float()
         for i in range(B)
@@ -583,7 +585,7 @@ def _generate_latent_eval_batch(
         fe2[i, 1:1+L1]    = embed_layer(chunk1_ids_list[i].to(device))
         fe2[i, 1+L1:tot]  = embed_layer(chunk2_ids_list[i].to(device))
         fa2[i, :tot]       = 1
-    fwd2   = model(inputs_embeds=fe2, attention_mask=fa2, output_hidden_states=True)
+    fwd2   = model.model(inputs_embeds=fe2, attention_mask=fa2, output_hidden_states=True)
     repr_2 = torch.stack([
         fwd2.hidden_states[-1][i, 1+c1_lens[i]:1+c1_lens[i]+c2_lens[i], :].mean(0).float()
         for i in range(B)
@@ -710,8 +712,8 @@ def _estimate_pass_at_k_metrics_latent(
     # Use mini-batching: generate `mini_batch` samples per model call instead of 1.
     # Each batch costs the same 5 model calls as a single sample, giving an
     # ~mini_batch-x speedup on the generation-dominated work.
-    # 16 sequences × ~700 tokens fits comfortably on A100 80 GB.
-    mini_batch   = min(n_samples, 16)
+    # Tune for your GPU: A100 80 GB with 1.5B model comfortably handles 64.
+    mini_batch   = min(n_samples, 64)
     per_problem: list[tuple[int, int]] = []
 
     n_batches = math.ceil(n_samples / mini_batch)
