@@ -714,8 +714,8 @@ def _estimate_pass_at_k_metrics_latent(
     # Use mini-batching: generate `mini_batch` samples per model call instead of 1.
     # Each batch costs the same 5 model calls as a single sample, giving an
     # ~mini_batch-x speedup on the generation-dominated work.
-    # Tune for your GPU: A100 80 GB with 1.5B model comfortably handles 64.
-    mini_batch   = min(n_samples, 64)
+    # Tune for your GPU: A100 80 GB with 1.5B model comfortably handles 128.
+    mini_batch   = min(n_samples, 128)
     per_problem: list[tuple[int, int]] = []
 
     n_batches = math.ceil(n_samples / mini_batch)
