@@ -404,6 +404,7 @@ def _generate_latent_eval(
 
     pad_id      = tokenizer.eos_token_id
     embed_layer = model.get_input_embeddings()
+    model_dtype = next(model.parameters()).dtype   # bfloat16 in practice
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -434,9 +435,9 @@ def _generate_latent_eval(
     z_1 = vae.reparameterize(mu_1, logvar_1)                   # deterministic μ in eval mode
 
     # ── Chunk 2 ────────────────────────────────────────────────────────
-    z_pfx1     = z_injector.get_prefix_embedding(z_1)            # (1, 1, H)
-    chunk1_emb = embed_layer(chunk1_ids.to(device)).unsqueeze(0)  # (1, L1, H)
-    ie2 = torch.cat([z_pfx1, chunk1_emb], dim=1)               # (1, 1+L1, H)
+    z_pfx1     = z_injector.get_prefix_embedding(z_1).to(model_dtype)   # (1, 1, H)
+    chunk1_emb = embed_layer(chunk1_ids.to(device)).unsqueeze(0)         # (1, L1, H)
+    ie2 = torch.cat([z_pfx1, chunk1_emb], dim=1)                        # (1, 1+L1, H)
     am2 = torch.ones(1, 1 + L1, dtype=torch.long, device=device)
 
     gen2 = model.generate(
@@ -457,7 +458,7 @@ def _generate_latent_eval(
     z_2 = vae.reparameterize(mu_2, logvar_2)
 
     # ── Chunk 3 ────────────────────────────────────────────────────────
-    z_pfx2    = z_injector.get_prefix_embedding(z_2)
+    z_pfx2      = z_injector.get_prefix_embedding(z_2).to(model_dtype)
     chunk2_emb2 = embed_layer(chunk2_ids.to(device)).unsqueeze(0)
     ie3 = torch.cat([z_pfx2, chunk2_emb2], dim=1)
     am3 = torch.ones(1, 1 + L2, dtype=torch.long, device=device)
