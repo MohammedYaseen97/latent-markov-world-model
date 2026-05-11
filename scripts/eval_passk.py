@@ -41,6 +41,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.utils.config_loader import load_yaml_with_extends
 from src.training.grpo_baseline import SYSTEM_PROMPT, answers_equivalent, extract_answer
+from src.models.vae_state_encoder import VAEStateEncoder, ZInjector
 
 
 def parse_args() -> argparse.Namespace:
