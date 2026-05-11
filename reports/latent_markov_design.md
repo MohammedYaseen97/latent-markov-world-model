@@ -438,21 +438,22 @@ Ordered by dependency. Each step is a gate for the next.
 
 | # | Deliverable | File | Status |
 |---|-------------|------|--------|
-| 1 | Phase 0 dataset: `data/math_easy_pool.jsonl` — 2974 problems (L1/L2/L3), pass@8 = 83% | `scripts/prepare_easy_pool.py` | ✅ |
-| 2 | `VAEStateEncoder` — encoder, decoder, transition model | `src/models/vae_state_encoder.py` | ✅ |
+| 1 | Phase 0 dataset: `data/math_easy_pool.jsonl` — L1–L5 from `EleutherAI/hendrycks_math` (v2: was L1-L3) | `scripts/prepare_easy_pool.py` | ⬜ re-run |
+| 2 | `VAEStateEncoder` — encoder, decoder, transition model; `compute_elbo` now accepts `kl_weight` | `src/models/vae_state_encoder.py` | ✅ |
 | 3 | `OutcomeHead` — 2-layer MLP on z_final, Phase 0 only | `src/models/vae_state_encoder.py` | ✅ |
-| 4 | Phase 0 rollout generation — `data/phase0_rollouts.pt` (23,792 trajectories, reward rate 38.6%) | `scripts/generate_phase0_rollouts.py` | ✅ |
-| 5 | `pretrain_vae()` — Phase 0 training loop; checkpoint → `runs/latent_grpo/phase0_vae.pt` | `src/training/grpo_latent.py` | ✅ |
-| 6 | Smoke config + smoke end-to-end pass on 4060 | `configs/train_latent_grpo_smoke.yaml` | ✅ |
-| 7 | **NFR6 gate** — UMAP of z_final: structured horseshoe manifold, correct trajectories dominate core, incorrect at boundaries; soft pass → proceed to Phase 1. Plot: `runs/latent_grpo/plots/latent_structure_umap.png` | `scripts/check_latent_structure.py` | ✅ |
-| 8 | `train_latent()` — Phase 1 custom GRPO loop (L_RL + λ_t × L_transition + L_VAE) | `src/training/grpo_latent.py` | ✅ |
+| 4 | Phase 0 rollout generation — `data/phase0_rollouts.pt` (re-run on v2 pool) | `scripts/generate_phase0_rollouts.py` | ⬜ re-run |
+| 5 | `pretrain_vae()` — Phase 0 training loop with KL annealing; checkpoint → `runs/latent_grpo/phase0_vae.pt` | `src/training/grpo_latent.py` | ✅ |
+| 6 | Smoke config — re-smoke after v2 code changes | `configs/train_latent_grpo_smoke.yaml` | ⬜ re-smoke |
+| 7 | **NFR6 gate** — UMAP of z_final on v2 Phase 0 checkpoint | `scripts/check_latent_structure.py` | ⬜ re-run |
+| 8 | `train_latent()` — Phase 1 custom GRPO loop (v2: gradient flow fixed, lambda_vae wired, batch_size=4) | `src/training/grpo_latent.py` | ✅ |
 | 8a | `generate_latent_traces()` — chunked inference engine: z injection per chunk via `inputs_embeds`, returns chunk_ids + repr_h + z_h + old_log_probs per rollout | `src/training/grpo_latent.py` | ✅ |
-| 8b | `latent_training_step()` — assembles L_RL (differentiable log-prob re-computation with z prefixes) + λ_t × L_transition + L_VAE | `src/training/grpo_latent.py` | ✅ |
-| 9 | `_generate_latent_eval()` — same chunked z-injection inference as 8a but in eval mode (no grad, n_samples repeats) | `scripts/eval_passk.py` | ✅ |
-| 10 | Full Phase 1 config (200 steps, A100) | `configs/train_latent_grpo.yaml` | ✅ |
-| 11a | A100 Phase 1 training — 200 steps on `data/math_beyond_math_b_i_base.jsonl` | `configs/train_latent_grpo.yaml` | ✅ |
-| 11b | pass@k eval on MATH-B-I holdout | `scripts/eval_passk.py` | 🔜 |
-| 12 | **E1 + E3 Markov diagnostics** — held-out transition loss (E1) + σ_h² correlation with outcome (E3). E2 is covered by the ablation table. | `scripts/eval_markov_diagnostics.py` | ✅ |
+| 8b | `latent_training_step()` — L_RL + λ_t × L_transition + λ_vae × L_VAE; L_RL now flows through encoder via fresh z | `src/training/grpo_latent.py` | ✅ |
+| 9 | `_generate_latent_eval()` + `latent_markov_pretrained` eval mode | `scripts/eval_passk.py` | ✅ |
+| 10 | Full Phase 1 config (200 steps, batch_size=4, A100) | `configs/train_latent_grpo.yaml` | ✅ |
+| 10a | **Controlled baseline eval** — `latent_grpo_pretrained` (Phase 0 VAE + pretrained backbone) | `scripts/eval_passk.py` | ⬜ pending Phase 0 v2 |
+| 11a | A100 Phase 1 training — 200 steps on `data/math_beyond_math_b_i_base.jsonl` | `configs/train_latent_grpo.yaml` | ⬜ pending Phase 0 v2 |
+| 11b | pass@k eval on MATH-B-I holdout | `scripts/eval_passk.py` | ⬜ pending Phase 1 v2 |
+| 12 | **E1 + E3 Markov diagnostics** on v2 checkpoint | `scripts/eval_markov_diagnostics.py` | ⬜ pending Phase 1 v2 |
 
 ---
 
@@ -507,7 +508,86 @@ Key observations:
 
 ---
 
-## Markov Diagnostics Results (Phase 1 A100 run, 2026-05-11)
+## Redesign v2 (2026-05-11)
+
+**Trigger:** Phase 1 v1 run (A100, 2026-05-11) produced pass@1024 = 7.5%, below baseline (15%) and below the pretrained floor (12.5%). Six root causes identified.
+
+---
+
+### Fix 1 — lambda_vae bug (dead config → wired)
+
+**Problem:** `phase1_loss.lambda_vae: 0.05` in the YAML was read from config but never passed to `latent_training_step`. The code used `l_total = l_rl + lambda_t * l_trans + l_vae` — L_VAE at weight 1.0 throughout. At 1.0, L_VAE is orders of magnitude larger than the near-zero L_RL, locking the encoder into its Phase 0 fixed point and drowning any rare reward signal.
+
+**Fix:** `lambda_vae` is now read from `phase1_cfg` and passed as an argument to `latent_training_step`. Loss is `l_total = l_rl + lambda_t * l_trans + lambda_vae * l_vae` with `lambda_vae = 0.05`.
+
+---
+
+### Fix 2 — Gradient flow restored (encoder now trained by L_RL)
+
+**Problem:** In the training step, z_h for the L_RL forward pass was fetched from the trace as a detached constant (`traces[i]["z_1"]`, etc.). This blocked L_RL gradients from reaching the VAE encoder. The encoder was updated by L_VAE and L_transition only — objectives that have nothing to do with whether z_h is useful *for the policy*. The z_injector and encoder were trained by completely orthogonal signals that never communicated.
+
+**Fix:** The VAE forward pass (`vae.forward(repr_list)`) is now performed once at the top of `latent_training_step`, producing a live `z_list` (with gradients). This same `z_list` is used for:
+1. L_VAE and L_transition (VAE regularisation — unchanged)
+2. L_RL prefix embeddings for chunks 2 and 3 (`z_pfx1 = z_injector.get_prefix_embedding(z_list[0])`)
+
+Gradient chain for L_RL: `backbone ← L_RL, z_injector ← L_RL, encoder ← L_RL (via z_list)`. The encoder now gets end-to-end gradient signal from task performance. `repr_h` tensors from the rollout remain detached constants throughout — backbone receives no gradient from L_VAE or L_transition.
+
+*Note on reparameterization:* z_h during training is resampled (new ε) relative to rollout. The z prefix embedding therefore differs slightly from rollout time, slightly invalidating the importance ratio. This is accepted: σ² ≈ 1.0 from Phase 0, so the z_h variance is one standard deviation; the induced prefix difference is a linear function of this, which is small relative to the chunk length.
+
+---
+
+### Fix 3 — Effective training budget (batch_size 1 → 4)
+
+**Problem:** `batch_size=1` in the custom latent loop means 1 problem per gradient step. The baseline TRL with `batch_size=8` + `grad_accum_steps=4` processes ~4 problems per weight update. Over 200 steps: latent arm = 200 problem-encounters vs baseline ≈ 800. Reward density scales linearly with encounters; the latent arm was running at ~25% of the baseline's effective gradient signal budget.
+
+**Fix:** `batch_size: 4` in `train_latent_grpo.yaml`. With gradient checkpointing enabled, A100 80GB handles 4 problems × 8 rollouts = 32 sequences per step. Problem-encounters over 200 steps: 800 — matching the baseline. If OOM: fall back to batch_size=2 and max_steps=400.
+
+---
+
+### Fix 4 — λ_t schedule flipped (decay → warmup)
+
+**Problem:** v1 schedule: linear decay from 1.0 → 0.1 over steps 0–100. At step 0, λ_t = 1.0 means L_transition (always non-zero) completely dominates L_RL (near-zero). The encoder learns to be Markov-consistent on hard-problem trajectories before z carries any task-relevant signal — enforcing self-consistency on useless representations.
+
+**Fix:** v2 schedule: linear warmup from 0.1 → 0.5 over steps 0–100, then constant at 0.5. At step 0, λ_t = 0.1 lets the rare L_RL events shape z first. As training progresses and z starts accumulating some structure, λ_t ramps up to enforce Markov consistency. Held at 0.5 for the second half so the Markov property remains active as a regulariser throughout.
+
+```python
+def lambda_trans_schedule(step, max_steps=200, floor=0.1, peak=0.5):
+    halfway = max_steps // 2
+    if step >= halfway: return peak
+    return floor + (peak - floor) * (step / halfway)
+```
+
+---
+
+### Fix 5 — KL annealing in Phase 0 (posterior collapse prevention)
+
+**Problem:** E3 diagnostic showed mean σ² = 0.97–0.98 for both correct and incorrect trajectories — both near the prior (1.0). The KL term in the standard ELBO (weight 1.0 from step 0) pushed σ toward the prior aggressively during Phase 0, preventing the encoder from developing a meaningful uncertainty signal. The δσ² = 0.012 between correct/incorrect is too small to be useful as an exploration signal in the uncertainty arm.
+
+**Fix:** `kl_weight` parameter added to `VAEStateEncoder.compute_elbo`. In `pretrain_vae`, `kl_weight` is linearly ramped from 0 → 1 over the first `kl_warmup_frac` (default 0.5) of Phase 0 training steps. Early steps optimise reconstruction freely; KL pressure increases gradually. Config key: `phase0.kl_warmup_frac: 0.5`.
+
+---
+
+### Fix 6 — Phase 0 pool upgraded to L1–L5
+
+**Problem:** v1 Phase 0 pool was L1–L3 only (38.6% per-rollout reward rate — mostly success trajectories from easy problems). Phase 1 MATH-B-I problems have ~0.02% per-sample success — an enormous distributional gap. The VAE's latent space was calibrated for "easy solvable" trajectories; Phase 1 rollouts (almost all failures on hard problems) land in a region of latent space the VAE never saw during Phase 0. The z_h prefixes injected during early Phase 1 are essentially out-of-distribution noise.
+
+**Fix:** `prepare_easy_pool.py` default levels changed from `[1, 2, 3]` to `[1, 2, 3, 4, 5]`. L4–L5 problems are partially solvable (lower per-rollout success but non-zero), introducing harder failure trajectories into Phase 0 training. The VAE learns structure over a wider difficulty range, reducing the distributional gap to Phase 1.
+
+---
+
+### Controlled Latent Baseline (`latent_grpo_pretrained`)
+
+**Definition:** Phase 0 VAE + pretrained backbone + fresh ZInjector, evaluated on MATH-B-I with no Phase 1 updates.
+
+**Purpose:** Establishes the capability floor under the latent generation regime, parallel to `baseline_pretrained` (12.5%) and `token_markov_pretrained` (12.5%) for the other arms. Without this baseline, we cannot distinguish "Phase 1 improved from X to Y" from "the latent regime itself costs performance, and Phase 1 partially recovered it."
+
+**Evaluation:** Use `--generation-mode latent_markov_pretrained` in `eval_passk.py`. Loads backbone directly from HF model ID (no LoRA) and VAE from `phase0.checkpoint_path` in the train config.
+
+**Gate:** `latent_grpo_pretrained` pass@1024 ≥ 12.5% (pretrained floor). If the Phase 0 z injection with fresh ZInjector degrades performance below 12.5%, the ZInjector initialisation scheme may need adjustment before Phase 1.
+
+---
+
+## Markov Diagnostics Results (Phase 1 A100 run, 2026-05-11 — v1, superseded)
 
 Run on the checkpoint produced by the 200-step Phase 1 training on `data/math_beyond_math_b_i_base.jsonl`.
 

@@ -89,12 +89,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--generation-mode",
-        choices=("baseline", "token_markov", "latent_markov"),
+        choices=("baseline", "token_markov", "latent_markov", "latent_markov_pretrained"),
         default="baseline",
         help=(
             "baseline: flat single-sequence generation (default). "
             "token_markov: Delethink chunked generation — requires --train-config. "
-            "latent_markov: chunked generation with z_h injection — requires --train-config "
+            "latent_markov: chunked generation with z_h injection — requires --train-config. "
+            "latent_markov_pretrained: controlled latent baseline — Phase 0 VAE + pretrained "
+            "backbone (no Phase 1); requires --train-config. "
             "and a Phase 1 checkpoint containing vae + z_injector weights."
         ),
     )
@@ -758,6 +760,108 @@ def _estimate_pass_at_k_metrics_latent(
     }
 
 
+def _estimate_pass_at_k_metrics_latent_pretrained(
+    *,
+    problems: list[dict[str, Any]],
+    ks: list[int],
+    eval_cfg: dict[str, Any],
+    train_cfg: dict[str, Any],
+) -> dict[str, float]:
+    """Compute pass@k for the controlled latent baseline (latent_grpo_pretrained).
+
+    Loads the original pretrained backbone directly from HF (no LoRA, no Phase 1
+    updates) together with the Phase 0 VAE checkpoint and a freshly initialised
+    ZInjector.  This establishes the capability floor under the latent generation
+    regime — the equivalent of baseline_pretrained and token_markov_pretrained for
+    the other arms.
+
+    The backbone is identified from train_cfg["primary"]["huggingface_repo_id"].
+    The Phase 0 VAE is loaded from train_cfg["phase0"]["checkpoint_path"].
+    ZInjector weights are randomly initialised (not trained by Phase 1).
+
+    Args:
+        problems:  list of problem dicts from the eval JSONL pool.
+        ks:        list of k values for pass@k (e.g. [1, 16, 1024]).
+        eval_cfg:  top-level evaluation config dict.
+        train_cfg: training config (reads primary.*, latent_markov.*, phase0.*).
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from src.models.vae_state_encoder import VAEStateEncoder, ZInjector
+    from src.training.grpo_baseline import SYSTEM_PROMPT
+
+    primary_cfg  = train_cfg["primary"]
+    latent_cfg   = train_cfg["latent_markov"]
+    phase0_cfg   = train_cfg["phase0"]
+
+    model_id     = primary_cfg["huggingface_repo_id"]
+    revision     = primary_cfg.get("revision", "main")
+    chunk_tokens = int(latent_cfg.get("chunk_tokens", 341))
+    latent_dim   = int(latent_cfg.get("latent_dim", 64))
+    hidden_dim   = int(latent_cfg.get("hidden_dim", 1536))
+    temperature  = float(eval_cfg.get("temperature", 1.0))
+    top_p        = float(eval_cfg.get("top_p", 1.0))
+    n_samples    = max(ks)
+
+    vae0_path    = Path(phase0_cfg.get("checkpoint_path", "runs/latent_grpo/phase0_vae.pt"))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"[latent_markov_pretrained] Loading pretrained backbone {model_id} @ {revision} …",
+          file=sys.stderr)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, revision=revision, torch_dtype=torch.bfloat16, device_map="auto",
+    )
+    model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, revision=revision, trust_remote_code=True, padding_side="left",
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print(f"[latent_markov_pretrained] Loading Phase 0 VAE from {vae0_path} …", file=sys.stderr)
+    ckpt = torch.load(str(vae0_path), weights_only=False, map_location=device)
+    vae = VAEStateEncoder(hidden_dim=hidden_dim, latent_dim=latent_dim).to(device)
+    vae.load_state_dict(ckpt["vae"])
+    vae.eval()
+
+    z_injector = ZInjector(latent_dim=latent_dim, hidden_dim=hidden_dim).to(device)
+    z_injector.eval()
+
+    mini_batch   = min(n_samples, 64)
+    per_problem: list[tuple[int, int]] = []
+
+    for prob_idx, problem in enumerate(tqdm(problems, desc="problems (latent_pretrained)",
+                                            unit="prob")):
+        completions: list[str] = []
+        remaining = n_samples
+        while remaining > 0:
+            B = min(mini_batch, remaining)
+            with torch.no_grad():
+                batch_texts = _generate_latent_eval_batch(
+                    model=model,
+                    tokenizer=tokenizer,
+                    vae=vae,
+                    z_injector=z_injector,
+                    problem=problem,
+                    n_samples=B,
+                    chunk_tokens=chunk_tokens,
+                    hidden_dim=hidden_dim,
+                    temperature=temperature,
+                    top_p=top_p,
+                    device=device,
+                )
+            completions.extend(batch_texts)
+            remaining -= B
+        per_problem.append((len(completions), _grade(completions, problem["ground_truth"])))
+
+    return {
+        f"pass@{k}": sum(_unbiased_pass_at_k(n, c, k) for n, c in per_problem) / len(per_problem)
+        for k in ks
+    }
+
+
 def _estimate_pass_at_k_metrics_token_markov(
     *,
     problems: list[dict[str, Any]],
@@ -1068,6 +1172,19 @@ def main() -> None:
         metrics = _estimate_pass_at_k_metrics_latent(
             problems=problems,
             checkpoint=checkpoint,
+            ks=ks,
+            eval_cfg=eval_cfg,
+            train_cfg=train_cfg,
+        )
+    elif args.generation_mode == "latent_markov_pretrained":
+        if args.train_config is None:
+            raise ValueError(
+                "--train-config is required for --generation-mode latent_markov_pretrained. "
+                "Pass e.g. configs/train_latent_grpo.yaml."
+            )
+        train_cfg = load_yaml_with_extends(args.train_config.resolve(), root=REPO_ROOT)
+        metrics = _estimate_pass_at_k_metrics_latent_pretrained(
+            problems=problems,
             ks=ks,
             eval_cfg=eval_cfg,
             train_cfg=train_cfg,

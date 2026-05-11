@@ -66,13 +66,18 @@ phase0:
   rollout_path: "data/phase0_rollouts.pt"
   checkpoint_path: "runs/latent_grpo/phase0_vae.pt"
 
-  # 3 epochs over ~23,792 trajectories ≈ 280 steps at batch_size=256.
-  # Conservative: VAE is small (64-dim) and cold-start; 3 epochs is enough
-  # to get meaningful L_outcome signal without memorising the easy pool.
+  # 3 epochs over the easy pool trajectories.
+  # Pool v2 includes L1–L5 so the VAE sees harder trajectories, bridging
+  # the distributional gap to Phase 1 MATH-B-I problems.
   num_epochs: 3
   batch_size: 256           # A100 80 GB handles this comfortably
 
   learning_rate: 3.0e-4     # AdamW; higher than RL lr (VAE is small, cold-start)
+
+  # KL annealing: ramp kl_weight from 0 → 1 over the first kl_warmup_frac of
+  # Phase 0 training steps. Prevents the posterior collapse (σ² ≈ prior) seen
+  # in v1 where both correct/incorrect trajectories had indistinguishable σ².
+  kl_warmup_frac: 0.5
 
   # Loss weights. Start balanced; tune only if NFR6 gate shows poor separation.
   lambda_elbo: 1.0
@@ -88,19 +93,22 @@ phase0:
 # ---------------------------------------------------------------------------
 training:
   seed: 11
-  # batch_size=1 here means 1 problem per step (× G=8 rollouts = 8 sequences).
-  # The baseline sets batch_size=8 for TRL, which interprets it as 8 *sequences*
-  # (all from 1 prompt). The custom latent loop treats it as *problems*, so
-  # inheriting 8 would make B=8×8=64 — blowing 77 GB on a 80 GB A100.
-  batch_size: 1
-  gradient_checkpointing: true    # belt-and-suspenders: reduces per-chunk activation memory
+  # batch_size here = problems per gradient step (× G=8 rollouts each).
+  # v1 used 1, giving only 200 problem-encounters over 200 steps vs the baseline's
+  # ~800 (4 grad-accum × 1 problem × 200 steps). v2 uses 4 to close that gap:
+  # 4 × 200 = 800 problem-encounters, matching the baseline's effective budget.
+  # Gradient checkpointing keeps activation memory manageable on A100 80 GB.
+  # If OOM occurs, fall back to batch_size=2 and double max_steps to 400.
+  batch_size: 4
+  gradient_checkpointing: true
 
-# Phase 1 loss weights (λ_trans, λ_vae ride alongside L_RL).
-# λ_trans kept small so L_RL dominates when rewards do fire.
-# Tune after confirming L_transition is non-zero from step 0 (NFR4 canary).
+# Phase 1 loss weights. Both are now wired in the code (v1 had lambda_vae as dead config).
+# λ_vae = 0.05: soft VAE anchor. Prevents encoder drift without dominating L_RL.
+# λ_trans: controlled by lambda_trans_schedule() warmup (0.1 → 0.5 over 200 steps).
+#           The value here is documentation; the schedule function is authoritative.
 phase1_loss:
-  lambda_trans: 0.1
-  lambda_vae: 0.05
+  lambda_trans: 0.5   # peak value reached by lambda_trans_schedule at step 100
+  lambda_vae: 0.05    # wired — L_VAE is scaled by this throughout Phase 1
 
 # ---------------------------------------------------------------------------
 # NFR6 diagnostic (check_latent_structure.py)

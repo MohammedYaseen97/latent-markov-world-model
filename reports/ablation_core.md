@@ -9,8 +9,11 @@
 |-----|--------|---------|-----------|-----|
 | `baseline_grpo` | 0.0002 | 0.0031 | 0.1500 | 20260430T083332Z |
 | `token_markov_grpo` | 0.0001 | 0.0019 | **0.0500 †** | 20260430T102111Z |
-| `latent_grpo` | — | — | — | — |
+| `latent_grpo_pretrained` | — | — | — | pending (Phase 0 v2) |
+| `latent_grpo` | — | — | — | pending (Phase 3 v2 re-run) |
 | `latent_grpo_uncertainty` | — | — | — | — |
+
+**latent_grpo v1 result (2026-05-11, superseded):** pass@1024 = 7.5% (below baseline 15%). Six root causes identified and fixed in v2 redesign. See `reports/latent_markov_design.md §Redesign v2` and `PROJECT_CONTRACT.md §Phase 3` for full analysis. Phase 3 is being re-run from scratch with v2 design.
 
 **† token_markov_grpo eval note:** this number is a single noisy vLLM run (2/40 problems).
 SHA256 of checkpoint-200 equals SHA256 of the pretrained model — zero weight updates
@@ -26,5 +29,6 @@ and arithmetic.
 |-----|-------------------|
 | `baseline_grpo` | `artifacts/baseline_grpo/20260430T083332Z/eval_metrics.json` |
 | `token_markov_grpo` | `artifacts/token_markov_grpo/20260430T102111Z/eval_metrics.json` |
-| `latent_grpo` | `—` |
+| `latent_grpo_pretrained` | `—` (pending Phase 0 v2 + controlled baseline eval) |
+| `latent_grpo` | `—` (pending Phase 3 v2 re-run; v1 artifact at `artifacts/latent_grpo/20260511T025154Z/eval_passk.json`) |
 | `latent_grpo_uncertainty` | `—` |

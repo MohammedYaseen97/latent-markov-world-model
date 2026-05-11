@@ -2,8 +2,16 @@
 """Build the Phase 0 VAE pretraining pool from EleutherAI/hendrycks_math.
 
 Loads all 7 subject configs, filters to the requested difficulty levels (default
-Level 1–3), extracts the boxed answer from each solution, and writes a JSONL with
+Level 1–5), extracts the boxed answer from each solution, and writes a JSONL with
 the same schema used by all other pool files in this repo.
+
+Pool v2 change: default levels expanded from 1–3 to 1–5. The v1 L1-L3-only pool
+had a 38.6% per-rollout reward rate, meaning the VAE was trained almost entirely
+on successful trajectories from easy problems. Phase 1's MATH-B-I problems sit at
+~0.02% per-sample success — a huge distributional gap. Including L4–L5 problems
+(harder but still partially solvable) introduces failure trajectories at harder
+difficulty levels, bridging the gap between the Phase 0 latent space and the
+Phase 1 problem distribution.
 
 Output: ``data/math_easy_pool.jsonl``
 
@@ -92,8 +100,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--output-dir", type=Path, default=REPO_ROOT / "data")
     p.add_argument(
-        "--levels", type=int, nargs="+", default=[1, 2, 3],
-        help="Difficulty levels to include (1–5). Default: 1 2 3",
+        "--levels", type=int, nargs="+", default=[1, 2, 3, 4, 5],
+        help="Difficulty levels to include (1–5). Default: 1 2 3 4 5 (pool v2).",
     )
     p.add_argument(
         "--splits", nargs="+", default=["train", "test"],

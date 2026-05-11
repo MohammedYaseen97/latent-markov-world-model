@@ -94,10 +94,11 @@ def vae_training_step(
     lambda_trans: float,
     lambda_out: float,
     device: torch.device,
+    kl_weight: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """Compute the combined Phase 0 loss for one mini-batch.
 
-    L_total = λ_elbo × L_ELBO  +  λ_trans × L_transition  +  λ_out × L_outcome
+    L_total = λ_elbo × L_ELBO(kl_weight)  +  λ_trans × L_transition  +  λ_out × L_outcome
 
     Args:
         batch:        mini-batch dict from RolloutDataset.
@@ -109,6 +110,7 @@ def vae_training_step(
         lambda_trans: L_transition loss weight.
         lambda_out:   L_outcome (BCE) loss weight.
         device:       compute device.
+        kl_weight:    KL annealing weight passed through to compute_elbo (0 → 1 warmup).
 
     Returns:
         Dict with scalar tensors:
@@ -127,7 +129,7 @@ def vae_training_step(
     mu_list     = [r[1] for r in results]
     logvar_list = [r[2] for r in results]
 
-    l_elbo  = vae.compute_elbo(repr_list, z_list, mu_list, logvar_list)
+    l_elbo  = vae.compute_elbo(repr_list, z_list, mu_list, logvar_list, kl_weight=kl_weight)
     l_trans = vae.compute_transition_loss(z_list)
     l_out   = F.binary_cross_entropy(outcome_head(z_list[-1]), reward)
 
@@ -166,16 +168,20 @@ def pretrain_vae(config: dict[str, Any], run_dir: Path) -> None:
     """
     phase0_cfg = config["phase0"]
 
-    rollout_path = Path(phase0_cfg["rollout_path"])
-    num_epochs   = phase0_cfg.get("num_epochs", 3)
-    batch_size   = phase0_cfg.get("batch_size", 256)
-    lr           = phase0_cfg.get("learning_rate", 3e-4)
-    lambda_elbo  = phase0_cfg.get("lambda_elbo", 1.0)
-    lambda_trans = phase0_cfg.get("lambda_trans", 1.0)
-    lambda_out   = phase0_cfg.get("lambda_out", 1.0)
+    rollout_path  = Path(phase0_cfg["rollout_path"])
+    num_epochs    = phase0_cfg.get("num_epochs", 3)
+    batch_size    = phase0_cfg.get("batch_size", 256)
+    lr            = phase0_cfg.get("learning_rate", 3e-4)
+    lambda_elbo   = phase0_cfg.get("lambda_elbo", 1.0)
+    lambda_trans  = phase0_cfg.get("lambda_trans", 1.0)
+    lambda_out    = phase0_cfg.get("lambda_out", 1.0)
     logging_steps = phase0_cfg.get("logging_steps", 10)
     save_steps    = phase0_cfg.get("save_steps", 100)
     ckpt_path     = Path(phase0_cfg.get("checkpoint_path", run_dir / "phase0_vae.pt"))
+    # KL annealing: ramp kl_weight from 0 → 1 over the first kl_warmup_frac of training.
+    # Prevents posterior collapse by letting the encoder develop structure before the
+    # KL penalty pushes σ toward the prior. Default: ramp over 50% of total steps.
+    kl_warmup_frac = float(phase0_cfg.get("kl_warmup_frac", 0.5))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Phase 0 — device: %s", device)
@@ -228,6 +234,11 @@ def pretrain_vae(config: dict[str, Any], run_dir: Path) -> None:
         for batch in dataloader:
             optimizer.zero_grad()
 
+            # KL annealing: linearly ramp kl_weight from 0 → 1 over the first
+            # kl_warmup_frac of total training steps, then hold at 1.0.
+            warmup_steps = max(1, int(total_steps * kl_warmup_frac))
+            kl_weight = min(1.0, global_step / warmup_steps)
+
             metrics = vae_training_step(
                 batch,
                 vae,
@@ -236,6 +247,7 @@ def pretrain_vae(config: dict[str, Any], run_dir: Path) -> None:
                 lambda_trans=lambda_trans,
                 lambda_out=lambda_out,
                 device=device,
+                kl_weight=kl_weight,
             )
 
             loss: torch.Tensor = metrics["loss"]
@@ -255,15 +267,16 @@ def pretrain_vae(config: dict[str, Any], run_dir: Path) -> None:
             if global_step % logging_steps == 0:
                 n = logging_steps
                 entry = {
-                    "step":  global_step,
-                    "epoch": round(global_step / steps_per_epoch, 2),
+                    "step":      global_step,
+                    "epoch":     round(global_step / steps_per_epoch, 2),
+                    "kl_weight": round(kl_weight, 4),
                     **{k: pending.get(k, 0.0) / n for k in ("loss", "elbo", "transition", "outcome")},
                 }
                 log_history.append(entry)
                 pending = {}
                 logger.info(
-                    "step %d | loss %.4f | elbo %.4f | trans %.4f | outcome %.4f",
-                    entry["step"], entry["loss"], entry["elbo"],
+                    "step %d | kl_w=%.3f | loss %.4f | elbo %.4f | trans %.4f | outcome %.4f",
+                    entry["step"], entry["kl_weight"], entry["loss"], entry["elbo"],
                     entry["transition"], entry["outcome"],
                 )
 
@@ -311,21 +324,26 @@ def _save_phase0_checkpoint(
 # Phase 1 helpers — plumbing
 # ---------------------------------------------------------------------------
 
-def lambda_trans_schedule(step: int, max_steps: int = 200, floor: float = 0.1) -> float:
+def lambda_trans_schedule(
+    step: int, max_steps: int = 200, floor: float = 0.1, peak: float = 0.5
+) -> float:
     """Return the transition loss weight λ_t for the current training step.
 
-    Schedule (per design doc §Phase 1):
-      - steps 0 … max_steps//2 : linear decay from 1.0 → floor
-      - steps max_steps//2 … end : constant at floor
+    Schedule (v2 — warmup, not decay):
+      - steps 0 … max_steps//2 : linear warmup from floor → peak
+      - steps max_steps//2 … end : constant at peak
 
-    Rationale: high λ_t early provides dense gradient flow while L_RL ≈ 0
-    (sparse reward).  Decaying λ_t lets L_RL dominate once rewards start
-    appearing.  The floor keeps L_transition active as a Markov regulariser.
+    Rationale: the v1 schedule started at 1.0, which dominated L_RL before z
+    carried any useful signal and locked the encoder into a Markov-consistent but
+    task-irrelevant structure.  Starting low (floor=0.1) lets the rare early L_RL
+    events shape z first; ramping to peak (0.5) establishes Markov pressure once
+    the encoder has started learning from rewards.  Held constant at peak for the
+    second half so Markov regularisation remains active throughout.
     """
     halfway = max_steps // 2
     if step >= halfway:
-        return floor
-    return 1.0 - (1.0 - floor) * (step / halfway)
+        return peak
+    return floor + (peak - floor) * (step / halfway)
 
 
 def compute_grpo_advantages(
@@ -472,6 +490,10 @@ def generate_latent_traces(
                            shape of each: (chunk_len,)
           "repr_1", "repr_2", "repr_3": Tensor (hidden_dim,) on CPU, detached
           "z_1",    "z_2",    "z_3"   : Tensor (latent_dim,) on CPU, detached
+          "mu_1",   "mu_2"            : Tensor (latent_dim,) on CPU — encoder μ for z_1/z_2
+          "lv_1",   "lv_2"            : Tensor (latent_dim,) on CPU — encoder log-σ² for z_1/z_2
+          (mu/lv stored so the training step can recover the exact rollout ε and replay it
+           with live encoder params, eliminating the ε inconsistency in the IS ratio.)
     """
     pad_id      = tokenizer.eos_token_id
     embed_layer = model.get_input_embeddings()
@@ -550,6 +572,8 @@ def generate_latent_traces(
     mu_1, logvar_1 = vae.encode(repr_1_batch)
     z_1_batch = vae.reparameterize(mu_1, logvar_1)        # (B, latent_dim)
     z_1_list  = list(z_1_batch.detach().cpu())
+    mu_1_list  = list(mu_1.detach().cpu())                # store μ₁ for ε recovery at train-time
+    lv_1_list  = list(logvar_1.detach().cpu())            # store log-σ²₁ for ε recovery
     pad_emb   = embed_layer(torch.tensor([pad_id], dtype=torch.long, device=device))  # (1, H)
 
     # ── Chunk 2: [z_1 prefix | chunk1] as inputs_embeds ───────────────
@@ -615,6 +639,8 @@ def generate_latent_traces(
     mu_2, logvar_2 = vae.encode(repr_2_batch)
     z_2_batch = vae.reparameterize(mu_2, logvar_2)
     z_2_list  = list(z_2_batch.detach().cpu())
+    mu_2_list  = list(mu_2.detach().cpu())                # store μ₂ for ε recovery at train-time
+    lv_2_list  = list(logvar_2.detach().cpu())            # store log-σ²₂ for ε recovery
     z_pfx2    = z_injector.get_prefix_embedding(z_2_batch)   # (B, 1, H)
 
     # ── Chunk 3: [z_2 prefix | chunk2] as inputs_embeds ───────────────
@@ -698,6 +724,8 @@ def generate_latent_traces(
             "old_log_probs": [old_lp1_list[i], old_lp2_list[i], old_lp3_list[i]],
             "repr_1": repr_1_list[i], "repr_2": repr_2_list[i], "repr_3": repr_3_list[i],
             "z_1":    z_1_list[i],    "z_2":    z_2_list[i],    "z_3":    z_3_list[i],
+            "mu_1":   mu_1_list[i],   "lv_1":   lv_1_list[i],
+            "mu_2":   mu_2_list[i],   "lv_2":   lv_2_list[i],
         })
 
     return trajectories
@@ -712,47 +740,49 @@ def latent_training_step(
     traces: list[dict],
     advantages: list[float],
     lambda_t: float,
+    lambda_vae: float,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
     """Compute the combined Phase 1 loss for one training step.
 
-    L_total = L_RL  +  λ_t × L_transition  +  L_VAE
+    L_total = L_RL  +  λ_t × L_transition  +  λ_vae × L_VAE
 
     ── L_RL (GRPO policy gradient) ──────────────────────────────────────────
     For each chunk h and each rollout i, re-run a differentiable forward pass
-    through the backbone (WITH gradient) using the same inputs_embeds structure
-    as generate_latent_traces() but with the z values from the trace detached
-    (treat them as fixed conditioning, not as part of the gradient path for L_RL).
+    through the backbone (WITH gradient).  The z_h values used as chunk prefixes
+    are ε-consistent with the rollout: we recover the exact noise vector ε that was
+    drawn during rollout (from stored z_h, μ_h, σ_h) and re-apply it with the live
+    encoder outputs (μ_live, σ_live), so z_rl_h = z_rollout_h exactly in value while
+    the computation graph connects through μ_live and σ_live.
+
+    This eliminates the IS-ratio bias that would arise if a fresh ε were drawn at
+    training time (the prefix token would differ from rollout, violating the
+    importance-sampling assumption).
+
+    Gradient flow: backbone ← L_RL, z_injector ← L_RL,
+    and crucially encoder ← L_RL (via z_h → z_injector → prefix → backbone).
+    repr_h tensors from the rollout remain detached constants throughout —
+    backbone parameters receive no gradient from L_VAE or L_transition.
 
     For each token t in chunk h of rollout i:
         log_pi_current(t) = log p_θ(token_t | context_h_i)   ← differentiable
         log_pi_old(t)     = traces[i]["old_log_probs"][h][t]  ← constant from trace
 
-    GRPO objective (without clipping for simplicity; add PPO-style clipping later):
+    GRPO objective (without clipping; add PPO-style clipping if instability observed):
         L_RL = -mean over all (i, h, t) of:
                advantage_i × (log_pi_current - log_pi_old)
-
-    Note: L_RL updates backbone parameters + z_injector (via the inputs_embeds path).
-    It does NOT flow gradients into the VAE encoder (z values are detached).
 
     ── L_VAE and L_transition (VAE regularisation) ───────────────────────────
     These losses use the repr_h tensors stored in the traces (computed with the
     backbone at trace-generation time, treated as constants here).  This keeps
-    L_VAE and L_transition from updating backbone parameters — only the small
-    VAE modules receive gradient from these terms.
+    L_VAE and L_transition from updating backbone parameters — backbone gets
+    gradient only from L_RL.
 
-    Steps:
-        repr_list = [torch.stack([t["repr_h"] for t in traces]) for h in 1,2,3]
-                    → each tensor: (B*G, hidden_dim), on device
-        results   = vae.forward(repr_list)           # differentiable VAE pass
-        z_list    = [r[0] for r in results]
-        mu_list   = [r[1] for r in results]
-        logvar_list = [r[2] for r in results]
-        L_VAE     = vae.compute_elbo(repr_list, z_list, mu_list, logvar_list)
-        L_trans   = vae.compute_transition_loss(z_list)
+    The z_list computed here for L_VAE/L_transition is the SAME z_list reused for
+    L_RL prefixes (one VAE forward pass, shared across all three loss terms).
 
     ── Total ─────────────────────────────────────────────────────────────────
-        L_total = L_RL + lambda_t × L_trans + L_VAE
+        L_total = L_RL + lambda_t × L_trans + lambda_vae × L_VAE
 
     Args:
         model:      backbone in training mode.
@@ -761,6 +791,7 @@ def latent_training_step(
         traces:     output of generate_latent_traces() for this step.
         advantages: aligned list of GRPO advantages (output of compute_grpo_advantages()).
         lambda_t:   current transition loss weight (from lambda_trans_schedule()).
+        lambda_vae: L_VAE loss weight (from phase1_loss.lambda_vae in config).
         device:     CUDA device.
 
     Returns:
@@ -773,7 +804,10 @@ def latent_training_step(
     B           = len(traces)
     adv         = torch.tensor(advantages, dtype=torch.float32, device=device)
 
-    # ── L_VAE + L_transition (repr_h from traces = detached constants) ─
+    # ── One VAE forward: repr_h (detached constants from trace) → z_list ─
+    # z_list is computed WITH gradient through the encoder.  Used for:
+    #   • L_VAE and L_transition (fresh ε is fine — these are expectations over ε)
+    # mu_list / logvar_list are additionally used below for ε-consistent L_RL prefixes.
     repr_list = [
         torch.stack([t["repr_1"] for t in traces]).to(device),
         torch.stack([t["repr_2"] for t in traces]).to(device),
@@ -786,12 +820,36 @@ def latent_training_step(
     l_vae   = vae.compute_elbo(repr_list, z_list, mu_list, logvar_list)
     l_trans = vae.compute_transition_loss(z_list)
 
+    # ── ε-consistent z for L_RL prefix embeddings ────────────────────────
+    # The policy gradient IS ratio compares log π_current(chunk | context) with
+    # log π_old, where context includes the z prefix.  If training uses z = μ + ε₂·σ
+    # (fresh noise) while rollout used z = μ + ε₁·σ (different noise), the prefix
+    # token differs → biased ratio.
+    #
+    # Fix: recover the exact rollout ε from stored (z, μ, σ), then reapply it with
+    # the live encoder outputs (which have gradient).  Because encoder weights have
+    # not been updated yet within this step, μ_live = μ_rollout and σ_live = σ_rollout,
+    # so z_rl = z_rollout exactly — with full gradient flow through μ_live / σ_live.
+    #
+    #   ε_stored = (z_rollout − μ_rollout) / σ_rollout    (constant, no grad)
+    #   z_rl     = μ_live + ε_stored · σ_live              (live grad path)
+    def _z_rl(z_key: str, mu_key: str, lv_key: str, h: int) -> torch.Tensor:
+        z_ro  = torch.stack([t[z_key]  for t in traces]).to(device)
+        mu_ro = torch.stack([t[mu_key] for t in traces]).to(device)
+        lv_ro = torch.stack([t[lv_key] for t in traces]).to(device)
+        sig_ro = (0.5 * lv_ro).exp().clamp(min=1e-8)
+        eps    = ((z_ro - mu_ro) / sig_ro).detach()          # constant ε, no grad
+        sig_live = (0.5 * logvar_list[h]).exp()
+        return mu_list[h] + eps * sig_live                   # exact value, live grad
+
+    z_rl_0 = _z_rl("z_1", "mu_1", "lv_1", 0)   # used as chunk-2 prefix
+    z_rl_1 = _z_rl("z_2", "mu_2", "lv_2", 1)   # used as chunk-3 prefix
+
     # ── L_RL: three differentiable forward passes, one per chunk ───────
-    # z values from traces are detached → only backbone + z_injector get gradient.
     log_ratio_sum = torch.zeros(1, device=device)
     token_count   = 0
 
-    # Chunk 1: token-ID forward pass over [prompt | chunk1]
+    # Chunk 1: token-ID forward pass over [prompt | chunk1] (no z prefix)
     chunk1_ids_list = [t["chunk_ids"][0] for t in traces]
     prompt_ids_list = [t["prompt_ids"] for t in traces]
     c1_lens  = [c.shape[0] for c in chunk1_ids_list]
@@ -819,9 +877,9 @@ def latent_training_step(
         token_count  += rl
     del fi1, fa1, logits1
 
-    # Chunk 2: inputs_embeds [z_1_detached | chunk1 | chunk2]
-    z1_det = torch.stack([t["z_1"].to(device) for t in traces])   # detached from trace
-    z_pfx1 = z_injector.get_prefix_embedding(z1_det)               # grad flows into z_injector
+    # Chunk 2: inputs_embeds [z_1 | chunk1 | chunk2]
+    # z_rl_0 is ε-consistent with rollout (exact same z value, live grad path).
+    z_pfx1 = z_injector.get_prefix_embedding(z_rl_0)
     chunk2_ids_list = [t["chunk_ids"][1] for t in traces]
     c2_lens = [c.shape[0] for c in chunk2_ids_list]
 
@@ -830,8 +888,8 @@ def latent_training_step(
     fa2 = torch.zeros(B, max_f2, dtype=torch.long, device=device)
     for i in range(B):
         L1 = c1_lens[i]; L2 = c2_lens[i]; tot = 1 + L1 + L2
-        fe2[i, 0, :]         = z_pfx1[i, 0, :]
-        fe2[i, 1:1+L1, :]    = embed_layer(chunk1_ids_list[i].to(device))
+        fe2[i, 0, :]        = z_pfx1[i, 0, :]
+        fe2[i, 1:1+L1, :]   = embed_layer(chunk1_ids_list[i].to(device))
         fe2[i, 1+L1:tot, :] = embed_layer(chunk2_ids_list[i].to(device))
         fa2[i, :tot] = 1
     logits2 = model(inputs_embeds=fe2, attention_mask=fa2).logits
@@ -845,9 +903,9 @@ def latent_training_step(
         token_count  += L2
     del fe2, fa2, logits2
 
-    # Chunk 3: inputs_embeds [z_2_detached | chunk2 | chunk3]
-    z2_det = torch.stack([t["z_2"].to(device) for t in traces])
-    z_pfx2 = z_injector.get_prefix_embedding(z2_det)
+    # Chunk 3: inputs_embeds [z_2 | chunk2 | chunk3]
+    # z_rl_1 is ε-consistent with rollout (exact same z value, live grad path).
+    z_pfx2 = z_injector.get_prefix_embedding(z_rl_1)
     chunk3_ids_list = [t["chunk_ids"][2] for t in traces]
     c3_lens = [c.shape[0] for c in chunk3_ids_list]
 
@@ -872,7 +930,7 @@ def latent_training_step(
     del fe3, fa3, logits3
 
     l_rl    = -(log_ratio_sum / max(token_count, 1))
-    l_total = l_rl + lambda_t * l_trans + l_vae
+    l_total = l_rl + lambda_t * l_trans + lambda_vae * l_vae
 
     return {
         "total":   l_total,
@@ -919,6 +977,10 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     latent_cfg   = config["latent_markov"]
     phase0_cfg   = config["phase0"]
     phase1_cfg   = config.get("phase1_loss", {})
+    lambda_vae   = float(phase1_cfg.get("lambda_vae", 0.05))
+    # lambda_trans from config is unused directly — lambda_trans_schedule() controls the
+    # warmup curve; the config value is documentation of intent only.
+    logger.info("Phase 1 loss weights: lambda_vae=%.4f, lambda_trans via warmup schedule", lambda_vae)
 
     model_id     = primary["huggingface_repo_id"]
     revision     = primary.get("revision", "main")
@@ -1087,6 +1149,7 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
             traces=traces,
             advantages=advantages,
             lambda_t=lambda_t,
+            lambda_vae=lambda_vae,
             device=device,
         )
 
@@ -1114,9 +1177,9 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
             log_history.append(entry)
             pending = {}
             logger.info(
-                "step %d | λ_t=%.2f | total=%.4f | rl=%.4f | vae=%.4f | "
-                "trans=%.4f | reward=%.2f%%",
-                entry["step"], entry["lambda_t"], entry["total"],
+                "step %d | λ_t=%.2f λ_vae=%.3f | total=%.4f | rl=%.4f | "
+                "vae=%.4f | trans=%.4f | reward=%.2f%%",
+                entry["step"], entry["lambda_t"], lambda_vae, entry["total"],
                 entry["l_rl"], entry["l_vae"], entry["l_trans"],
                 entry["reward_rate"] * 100,
             )

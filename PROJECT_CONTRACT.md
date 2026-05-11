@@ -88,32 +88,47 @@ Before treating the core table as final:
 
 ---
 
-## Phase 3 🔄 — Latent Markov arm (`latent_grpo`) — Phase 0 complete, Phase 1 next
+## Phase 3 🔄 — Latent Markov arm (`latent_grpo`) — v2 redesign, running from scratch
+
+**v2 redesign (2026-05-11):** Phase 1 produced 7.5% pass@1024 (below baseline 15%). Six root causes identified and fixed before re-running. Full rationale in `reports/latent_markov_design.md §Redesign v2`. Summary:
+1. **lambda_vae bug fixed** — was running at 1.0 (dead config), now wired at 0.05 from YAML.
+2. **Gradient flow restored** — L_RL now flows through encoder via fresh z_h (not detached trace z). All three loss terms update the encoder jointly.
+3. **batch_size 1 → 4** — 4× more problem-encounters per step, closing the reward-density gap vs the baseline.
+4. **λ_t schedule flipped** — warmup (0.1 → 0.5) instead of decay (1.0 → 0.1). Avoids locking encoder into Markov structure before z carries signal.
+5. **KL annealing added** — kl_weight 0 → 1 over first 50% of Phase 0 steps. Prevents posterior collapse that made σ² useless as uncertainty signal.
+6. **Phase 0 pool upgraded** — L1–L5 (was L1–L3). Includes harder trajectories to bridge distributional gap to Phase 1 MATH-B-I problems.
+
+All Phase 3 artifact items below are reset to [ ] and must be re-run in order.
 
 **Design doc:** `reports/latent_markov_design.md` (authoritative). Implementation steps and ordering in that doc's "Implementation Deliverables" table.
 
-**Deliverables — `latent_grpo` arm:**
-- [x] Phase 0 pretraining dataset: `data/math_easy_pool.jsonl` — 2974 problems (974 L1, 1000 L2, 1000 L3) from `EleutherAI/hendrycks_math`; calibration confirmed pass@8 = 83%, per-sample 40% (`results/calib_easy_pool.json`)
-- [x] `scripts/generate_phase0_rollouts.py` — frozen backbone rollout generation + hidden state extraction, saves `(repr_1, repr_2, repr_3, reward)` per trajectory
-- [x] `src/models/vae_state_encoder.py` — `VAEStateEncoder` (encoder, decoder, transition) + `OutcomeHead` (Phase 0 only)
-- [x] `src/training/grpo_latent.py` — `pretrain_vae()` (Phase 0); `train_latent()` (Phase 1) stub
-- [x] `configs/train_latent_grpo_smoke.yaml` — smoke config; smoke end-to-end passed (rollouts → VAE train → NFR6 plot, no errors)
-- [x] `configs/train_latent_grpo.yaml` — full Phase 1 config (200 steps, A100, extends baseline)
+**Deliverables — `latent_grpo` arm (v2):**
+- [ ] Phase 0 pretraining dataset: `data/math_easy_pool.jsonl` — L1–L5 from `EleutherAI/hendrycks_math` (v2: was L1-L3 only); re-run `scripts/prepare_easy_pool.py` to regenerate
+- [ ] Phase 0 rollouts: `data/phase0_rollouts.pt` — re-run `scripts/generate_phase0_rollouts.py` on new pool
+- [x] `src/models/vae_state_encoder.py` — `VAEStateEncoder` (encoder, decoder, transition) + `OutcomeHead` (Phase 0 only); `compute_elbo` now accepts `kl_weight`
+- [x] `src/training/grpo_latent.py` — all Phase 0 + Phase 1 training loops (v2: kl warmup, lambda_trans warmup, gradient flow fix, lambda_vae wired, batch_size=4)
+- [x] `configs/train_latent_grpo_smoke.yaml` — smoke config (needs re-smoke after code changes)
+- [x] `configs/train_latent_grpo.yaml` — full Phase 1 config (v2: batch_size=4, kl_warmup_frac=0.5, lambda_vae wired)
 - [x] `scripts/check_latent_structure.py` — t-SNE/UMAP of z_final (NFR6 gate)
-- [ ] Latent generation mode in `scripts/eval_passk.py`
-- [ ] Phase 1 eval artifacts under `artifacts/latent_grpo/{run_id}/`
+- [x] Latent generation mode in `scripts/eval_passk.py` (including `latent_markov_pretrained` for controlled baseline)
+- [ ] Phase 0 VAE pretraining: VAE checkpoint → `runs/latent_grpo/phase0_vae.pt`
+- [ ] NFR6 gate: UMAP of z_final shows structured manifold (re-run after new Phase 0)
+- [ ] **Controlled latent baseline** — eval `latent_grpo_pretrained`: Phase 0 VAE + pretrained backbone (no Phase 1 updates). This is the latent-regime capability floor, equivalent to `baseline_pretrained` and `token_markov_pretrained` for the other arms. Must be evaluated before Phase 1 training begins so the Phase 1 improvement is measured against a real baseline, not inferred.
+- [ ] Phase 1 training: 200 steps on MATH-B-I, checkpoint → `artifacts/latent_grpo/{run_id}/`
+- [ ] Phase 1 eval: pass@k on MATH-B-I holdout; result logged in `reports/ablation_core.md`
 
-**Phase 0 artifacts (A100 run, 2026-05-09):**
-- Rollouts: `data/phase0_rollouts.pt` — 23,792 trajectories (2974 problems × G=8), reward rate 38.6%
+**v1 Phase 0 artifacts (A100 run, 2026-05-09 — superseded by v2):**
+- Rollouts: `data/phase0_rollouts.pt` — 23,792 trajectories (2974 L1-L3 problems × G=8), reward rate 38.6%
 - VAE checkpoint: `runs/latent_grpo/phase0_vae.pt`
 - NFR6 plot: `runs/latent_grpo/plots/latent_structure_umap.png`
-- NFR6 summary: `runs/latent_grpo/plots/nfr6_summary.json` — n_correct=9189, n_incorrect=14603
+- These artifacts are from the v1 run. Re-running from scratch with v2 design; these will be overwritten.
 
-**Pass criteria — `latent_grpo` arm:**
-- [x] Smoke test completes end-to-end in < 10 min on 4060 (Phase 0 + Phase 1, no NaN blowups)
-- [x] **NFR6 gate:** UMAP of z_final shows structured manifold with correct trajectories dominating the main horseshoe and incorrect concentrated at boundaries — soft pass; proceed to Phase 1
-- [ ] Phase 1 training log shows L_transition non-zero from step 0; L_RL non-zero within first 30 steps (gradient flow canaries per NFR4)
-- [ ] `pass@1024` evaluated for `latent_grpo`; result logged in `reports/writeup_stubs.md`
+**Pass criteria — `latent_grpo` arm (v2):**
+- [ ] Smoke test completes end-to-end in < 10 min on 4060 (re-smoke after v2 code changes)
+- [ ] **NFR6 gate:** UMAP of z_final shows structured manifold (re-run on v2 Phase 0 checkpoint)
+- [ ] `latent_grpo_pretrained` eval (controlled baseline): pass@1024 ≥ pretrained baseline (confirms z injection does not degrade capability before Phase 1)
+- [ ] Phase 1 training log shows L_transition non-zero from step 0; L_RL non-zero within first 30 steps; lambda_vae=0.05 confirmed in log
+- [ ] `pass@1024` for `latent_grpo` ≥ 18.0% (≥ 3pp above baseline_grpo — required to clear noise floor on 40-problem pool)
 - [ ] No NaN blowups under zero-reward stretches (R6.5)
 - [ ] Shared hyperparameters (G=8, lr=1e-6, 200 steps, same backbone) match all other arms
 

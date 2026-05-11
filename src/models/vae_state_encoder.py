@@ -193,10 +193,15 @@ class VAEStateEncoder(nn.Module):
         z_list:      list[torch.Tensor],
         mu_list:     list[torch.Tensor],
         logvar_list: list[torch.Tensor],
+        kl_weight:   float = 1.0,
     ) -> torch.Tensor:
         """Compute the ELBO loss summed over all N_CHUNKS chunks.
 
-        L_ELBO = Σ_h [ MSE(decode(z_h), repr_h) + KL(N(μ_h, σ_h²) ∥ N(0, I)) ]
+        L_ELBO = Σ_h [ MSE(decode(z_h), repr_h) + kl_weight × KL(N(μ_h, σ_h²) ∥ N(0, I)) ]
+
+        kl_weight supports KL annealing: start near 0 during early Phase 0 steps so the
+        encoder develops structure freely, then ramp to 1.0 to enforce the prior.  Prevents
+        the posterior collapse observed in the first run (σ² ≈ 1.0 for all trajectories).
 
         KL for a diagonal Gaussian (per sample, summed over latent dims):
             KL = -0.5 * Σ_j (1 + log σ²_j - μ_j² - σ_j²)
@@ -206,9 +211,10 @@ class VAEStateEncoder(nn.Module):
             z_list:      sampled latents.    List of N_CHUNKS (batch, latent_dim).
             mu_list:     posterior means.    List of N_CHUNKS (batch, latent_dim).
             logvar_list: posterior log σ².   List of N_CHUNKS (batch, latent_dim).
+            kl_weight:   weight applied to the KL term only (default 1.0 = standard ELBO).
 
         Returns:
-            Scalar tensor — reconstruction + KL, averaged over batch, summed over chunks.
+            Scalar tensor — reconstruction + weighted KL, averaged over batch, summed over chunks.
         """
         assert len(repr_list) == len(z_list) == len(mu_list) == len(logvar_list), \
             "All lists must have the same length"
@@ -217,7 +223,7 @@ class VAEStateEncoder(nn.Module):
             rec_loss = F.mse_loss(self.decode(z_list[i]), repr_list[i])
             kl_loss  = -0.5 * (1 + logvar_list[i] - mu_list[i] ** 2
                                 - logvar_list[i].exp()).sum(dim=-1).mean()
-            loss += rec_loss + kl_loss
+            loss += rec_loss + kl_weight * kl_loss
         return loss
 
     def compute_transition_loss(
