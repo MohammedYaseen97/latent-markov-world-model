@@ -88,7 +88,12 @@ phase0:
 # ---------------------------------------------------------------------------
 training:
   seed: 11
-  gradient_checkpointing: false   # A100, 1.5B — not needed
+  # batch_size=1 here means 1 problem per step (× G=8 rollouts = 8 sequences).
+  # The baseline sets batch_size=8 for TRL, which interprets it as 8 *sequences*
+  # (all from 1 prompt). The custom latent loop treats it as *problems*, so
+  # inheriting 8 would make B=8×8=64 — blowing 77 GB on a 80 GB A100.
+  batch_size: 1
+  gradient_checkpointing: true    # belt-and-suspenders: reduces per-chunk activation memory
 
 # Phase 1 loss weights (λ_trans, λ_vae ride alongside L_RL).
 # λ_trans kept small so L_RL dominates when rewards do fire.
