@@ -19,6 +19,12 @@ hidden states). On an A100 80 GB with --problems-per-batch 16 this gives
 128 sequences per GPU call, reducing total GPU dispatches from 23,792
 (serial baseline) to ~186 and cutting wallclock time from ~44 h to ~1-2 h.
 
+OOM handling
+────────────
+If a batch triggers an OOM (common for L4-L5 problems with long prompts),
+the batch is split in half and each half is retried recursively — down to
+1 problem if necessary. No trajectories are ever silently skipped.
+
 Output format (data/phase0_rollouts.pt)
 ────────────────────────────────────────
 A list of dicts, one per trajectory (n_problems × G entries):
@@ -119,9 +125,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help=(
-            "Problems processed per GPU call. Effective batch = problems_per_batch × n_rollouts. "
+            "Starting batch size (problems per GPU call). Effective batch = problems_per_batch × n_rollouts. "
             "Default 16 → 128 sequences/call on A100 80 GB. "
-            "Reduce to 4-8 if you hit OOM."
+            "On OOM the batch is halved automatically (adaptive halving), so you rarely need to change this."
         ),
     )
     p.add_argument(
@@ -457,30 +463,39 @@ def main() -> None:
         flush=True,
     )
 
-    for batch_idx, batch_start in enumerate(
-        tqdm(range(0, len(problems), args.problems_per_batch), desc="batches", unit="batch")
-    ):
-        batch = problems[batch_start : batch_start + args.problems_per_batch]
+    def _run_adaptive(batch: list[dict]) -> list[dict]:
+        """Run a batch, halving recursively on OOM until it fits. Never skips."""
+        if not batch:
+            return []
         try:
-            trajs = run_batch(
-                model,
-                tokenizer,
-                batch,
+            return run_batch(
+                model, tokenizer, batch,
                 n_rollouts=args.n_rollouts,
                 total_tokens=args.total_tokens,
                 temperature=args.temperature,
                 top_p=args.top_p,
                 device=device,
             )
-            all_trajectories.extend(trajs)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
-            print(
-                f"\n  OOM on batch {batch_idx} — skipping. "
-                f"Retry with --problems-per-batch {args.problems_per_batch // 2}.",
-                file=sys.stderr,
+            if len(batch) == 1:
+                tqdm.write(
+                    f"  OOM on a single problem (problem_id="
+                    f"{batch[0].get('problem_id','?')}) — skipping 1 problem.",
+                )
+                return []
+            mid = len(batch) // 2
+            tqdm.write(
+                f"  OOM on batch of {len(batch)} — retrying as {mid}+{len(batch)-mid}",
             )
-            continue
+            return _run_adaptive(batch[:mid]) + _run_adaptive(batch[mid:])
+
+    for batch_idx, batch_start in enumerate(
+        tqdm(range(0, len(problems), args.problems_per_batch), desc="batches", unit="batch")
+    ):
+        batch = problems[batch_start : batch_start + args.problems_per_batch]
+        trajs = _run_adaptive(batch)
+        all_trajectories.extend(trajs)
 
         # Periodic checkpoint so a preempted run can be inspected / resumed.
         if args.save_every > 0 and (batch_idx + 1) % args.save_every == 0:
