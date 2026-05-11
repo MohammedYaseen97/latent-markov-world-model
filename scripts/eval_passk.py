@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import math
 from math import comb
 from pathlib import Path
 from typing import Any
@@ -488,6 +489,7 @@ def _generate_latent_eval_batch(
     temperature: float,
     top_p: float,
     device: torch.device,
+    _status_bar=None,       # optional tqdm bar — postfix updated per chunk
 ) -> "list[str]":
     """Batched version of _generate_latent_eval: generates n_samples completions in
     parallel using a single set of 5 model calls (3 generate + 2 forward for repr_h)
@@ -513,6 +515,8 @@ def _generate_latent_eval_batch(
     pl          = prompt_ids.shape[0]
 
     # ── Chunk 1: B samples from same prompt ───────────────────────────
+    if _status_bar is not None:
+        _status_bar.set_postfix(chunk="1/3 generate")
     gen1 = model.generate(
         prompt_ids.unsqueeze(0).expand(B, -1).contiguous(),
         attention_mask=torch.ones(B, pl, dtype=torch.long, device=device),
@@ -544,6 +548,8 @@ def _generate_latent_eval_batch(
     z_pfx1     = z_injector.get_prefix_embedding(z_1).to(model_dtype)  # (B, 1, H)
 
     # ── Chunk 2: B samples with z_1 prefix ────────────────────────────
+    if _status_bar is not None:
+        _status_bar.set_postfix(chunk="2/3 generate")
     max_c1   = max(c1_lens)
     emb_len2 = 1 + max_c1
     ie2 = torch.zeros(B, emb_len2, hidden_dim, dtype=model_dtype, device=device)
@@ -589,6 +595,8 @@ def _generate_latent_eval_batch(
     z_pfx2     = z_injector.get_prefix_embedding(z_2).to(model_dtype)  # (B, 1, H)
 
     # ── Chunk 3: B samples with z_2 prefix ────────────────────────────
+    if _status_bar is not None:
+        _status_bar.set_postfix(chunk="3/3 generate")
     max_c2   = max(c2_lens)
     emb_len3 = 1 + max_c2
     ie3 = torch.zeros(B, emb_len3, hidden_dim, dtype=model_dtype, device=device)
@@ -706,27 +714,40 @@ def _estimate_pass_at_k_metrics_latent(
     mini_batch   = min(n_samples, 16)
     per_problem: list[tuple[int, int]] = []
 
-    for problem in tqdm(problems, desc="Evaluating (latent-Markov HF)", unit="problem"):
+    n_batches = math.ceil(n_samples / mini_batch)
+    for prob_idx, problem in enumerate(tqdm(problems, desc="problems", unit="prob", position=0)):
         completions: list[str] = []
         remaining = n_samples
-        while remaining > 0:
-            B = min(mini_batch, remaining)
-            with torch.no_grad():
-                batch_texts = _generate_latent_eval_batch(
-                    model=model,
-                    tokenizer=tokenizer,
-                    vae=vae,
-                    z_injector=z_injector,
-                    problem=problem,
-                    n_samples=B,
-                    chunk_tokens=chunk_tokens,
-                    hidden_dim=hidden_dim,
-                    temperature=temperature,
-                    top_p=top_p,
-                    device=device,
-                )
-            completions.extend(batch_texts)
-            remaining -= B
+        with tqdm(
+            total=n_samples,
+            desc=f"  samples [{prob_idx+1}/{len(problems)}]",
+            unit="sample",
+            position=1,
+            leave=False,
+        ) as sample_bar:
+            batch_num = 0
+            while remaining > 0:
+                B = min(mini_batch, remaining)
+                batch_num += 1
+                sample_bar.set_postfix(batch=f"{batch_num}/{n_batches}", chunk="…")
+                with torch.no_grad():
+                    batch_texts = _generate_latent_eval_batch(
+                        model=model,
+                        tokenizer=tokenizer,
+                        vae=vae,
+                        z_injector=z_injector,
+                        problem=problem,
+                        n_samples=B,
+                        chunk_tokens=chunk_tokens,
+                        hidden_dim=hidden_dim,
+                        temperature=temperature,
+                        top_p=top_p,
+                        device=device,
+                        _status_bar=sample_bar,
+                    )
+                completions.extend(batch_texts)
+                remaining -= B
+                sample_bar.update(B)
         per_problem.append((len(completions), _grade(completions, problem["ground_truth"])))
 
     return {
