@@ -475,6 +475,151 @@ def _generate_latent_eval(
     return tokenizer.decode(all_ids, skip_special_tokens=True)
 
 
+def _generate_latent_eval_batch(
+    *,
+    model,
+    tokenizer,
+    vae,
+    z_injector,
+    problem: dict,
+    n_samples: int,
+    chunk_tokens: int,
+    hidden_dim: int,
+    temperature: float,
+    top_p: float,
+    device: torch.device,
+) -> "list[str]":
+    """Batched version of _generate_latent_eval: generates n_samples completions in
+    parallel using a single set of 5 model calls (3 generate + 2 forward for repr_h)
+    instead of 5 × n_samples sequential calls.
+
+    Mirrors generate_latent_traces() in grpo_latent.py but omits log-prob
+    collection and returns decoded strings only.
+    """
+    from src.training.grpo_baseline import SYSTEM_PROMPT
+
+    B           = n_samples
+    embed_layer = model.get_input_embeddings()
+    model_dtype = next(model.parameters()).dtype
+    pad_id      = tokenizer.eos_token_id
+    pad_emb     = embed_layer(torch.tensor([pad_id], dtype=torch.long, device=device))
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": problem["prompt"]},
+    ]
+    prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt_ids  = tokenizer(prompt_text, return_tensors="pt").input_ids[0].to(device)
+    pl          = prompt_ids.shape[0]
+
+    # ── Chunk 1: B samples from same prompt ───────────────────────────
+    gen1 = model.generate(
+        prompt_ids.unsqueeze(0).expand(B, -1).contiguous(),
+        attention_mask=torch.ones(B, pl, dtype=torch.long, device=device),
+        max_new_tokens=chunk_tokens, do_sample=True,
+        temperature=temperature, top_p=top_p,
+        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
+    )
+    chunk1_ids_list = [gen1[i, pl:].cpu() for i in range(B)]
+    c1_lens         = [c.shape[0] for c in chunk1_ids_list]
+    del gen1
+
+    # repr_1: one batched forward pass [prompt | chunk1] per sample
+    max_f1 = pl + max(c1_lens)
+    full1  = torch.zeros(B, max_f1, dtype=torch.long, device=device)
+    mask1  = torch.zeros(B, max_f1, dtype=torch.long, device=device)
+    for i in range(B):
+        L1 = c1_lens[i]; tot = pl + L1
+        full1[i, :tot] = torch.cat([prompt_ids, chunk1_ids_list[i].to(device)])
+        mask1[i, :tot] = 1
+    fwd1   = model(full1, attention_mask=mask1, output_hidden_states=True)
+    repr_1 = torch.stack([
+        fwd1.hidden_states[-1][i, pl:pl + c1_lens[i], :].mean(0).float()
+        for i in range(B)
+    ]).to(device)
+    del full1, mask1, fwd1
+
+    mu_1, lv_1 = vae.encode(repr_1)
+    z_1        = vae.reparameterize(mu_1, lv_1)                   # (B, latent_dim)
+    z_pfx1     = z_injector.get_prefix_embedding(z_1).to(model_dtype)  # (B, 1, H)
+
+    # ── Chunk 2: B samples with z_1 prefix ────────────────────────────
+    max_c1   = max(c1_lens)
+    emb_len2 = 1 + max_c1
+    ie2 = torch.zeros(B, emb_len2, hidden_dim, dtype=model_dtype, device=device)
+    am2 = torch.zeros(B, emb_len2, dtype=torch.long, device=device)
+    for i in range(B):
+        L1 = c1_lens[i]; off = max_c1 - L1
+        ie2[i, :off]          = pad_emb
+        ie2[i, off]            = z_pfx1[i, 0]
+        ie2[i, off+1:off+1+L1] = embed_layer(chunk1_ids_list[i].to(device))
+        am2[i, off:]           = 1
+    gen2 = model.generate(
+        inputs_embeds=ie2, attention_mask=am2,
+        max_new_tokens=chunk_tokens, do_sample=True,
+        temperature=temperature, top_p=top_p,
+        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
+    )
+    chunk2_ids_list = [
+        (gen2[i, emb_len2:] if gen2.shape[1] > chunk_tokens else gen2[i]).cpu()
+        for i in range(B)
+    ]
+    c2_lens = [c.shape[0] for c in chunk2_ids_list]
+    del ie2, am2, gen2
+
+    # repr_2: one batched forward pass [z_pfx1 | chunk1 | chunk2]
+    max_fwd2 = max(1 + c1_lens[i] + c2_lens[i] for i in range(B))
+    fe2 = torch.zeros(B, max_fwd2, hidden_dim, dtype=model_dtype, device=device)
+    fa2 = torch.zeros(B, max_fwd2, dtype=torch.long, device=device)
+    for i in range(B):
+        L1 = c1_lens[i]; L2 = c2_lens[i]; tot = 1 + L1 + L2
+        fe2[i, 0]         = z_pfx1[i, 0]
+        fe2[i, 1:1+L1]    = embed_layer(chunk1_ids_list[i].to(device))
+        fe2[i, 1+L1:tot]  = embed_layer(chunk2_ids_list[i].to(device))
+        fa2[i, :tot]       = 1
+    fwd2   = model(inputs_embeds=fe2, attention_mask=fa2, output_hidden_states=True)
+    repr_2 = torch.stack([
+        fwd2.hidden_states[-1][i, 1+c1_lens[i]:1+c1_lens[i]+c2_lens[i], :].mean(0).float()
+        for i in range(B)
+    ]).to(device)
+    del fe2, fa2, fwd2
+
+    mu_2, lv_2 = vae.encode(repr_2)
+    z_2        = vae.reparameterize(mu_2, lv_2)
+    z_pfx2     = z_injector.get_prefix_embedding(z_2).to(model_dtype)  # (B, 1, H)
+
+    # ── Chunk 3: B samples with z_2 prefix ────────────────────────────
+    max_c2   = max(c2_lens)
+    emb_len3 = 1 + max_c2
+    ie3 = torch.zeros(B, emb_len3, hidden_dim, dtype=model_dtype, device=device)
+    am3 = torch.zeros(B, emb_len3, dtype=torch.long, device=device)
+    for i in range(B):
+        L2 = c2_lens[i]; off = max_c2 - L2
+        ie3[i, :off]          = pad_emb
+        ie3[i, off]            = z_pfx2[i, 0]
+        ie3[i, off+1:off+1+L2] = embed_layer(chunk2_ids_list[i].to(device))
+        am3[i, off:]           = 1
+    gen3 = model.generate(
+        inputs_embeds=ie3, attention_mask=am3,
+        max_new_tokens=chunk_tokens, do_sample=True,
+        temperature=temperature, top_p=top_p,
+        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
+    )
+    chunk3_ids_list = [
+        (gen3[i, emb_len3:] if gen3.shape[1] > chunk_tokens else gen3[i]).cpu()
+        for i in range(B)
+    ]
+    del ie3, am3, gen3
+
+    return [
+        tokenizer.decode(
+            torch.cat([chunk1_ids_list[i], chunk2_ids_list[i], chunk3_ids_list[i]]),
+            skip_special_tokens=True,
+        )
+        for i in range(B)
+    ]
+
+
 def _estimate_pass_at_k_metrics_latent(
     *,
     problems: list[dict[str, Any]],
@@ -554,24 +699,34 @@ def _estimate_pass_at_k_metrics_latent(
     z_injector.eval()
 
     # ── Eval loop ─────────────────────────────────────────────────────
+    # Use mini-batching: generate `mini_batch` samples per model call instead of 1.
+    # Each batch costs the same 5 model calls as a single sample, giving an
+    # ~mini_batch-x speedup on the generation-dominated work.
+    # 16 sequences × ~700 tokens fits comfortably on A100 80 GB.
+    mini_batch   = min(n_samples, 16)
     per_problem: list[tuple[int, int]] = []
 
     for problem in tqdm(problems, desc="Evaluating (latent-Markov HF)", unit="problem"):
         completions: list[str] = []
-        for _ in range(n_samples):
+        remaining = n_samples
+        while remaining > 0:
+            B = min(mini_batch, remaining)
             with torch.no_grad():
-                text = _generate_latent_eval(
+                batch_texts = _generate_latent_eval_batch(
                     model=model,
                     tokenizer=tokenizer,
                     vae=vae,
                     z_injector=z_injector,
                     problem=problem,
+                    n_samples=B,
                     chunk_tokens=chunk_tokens,
+                    hidden_dim=hidden_dim,
                     temperature=temperature,
                     top_p=top_p,
                     device=device,
                 )
-            completions.append(text)
+            completions.extend(batch_texts)
+            remaining -= B
         per_problem.append((len(completions), _grade(completions, problem["ground_truth"])))
 
     return {
