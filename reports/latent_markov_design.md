@@ -1,7 +1,6 @@
 # Latent Markov Arm: Design Document
 
 Requirements reference: `reports/latent_markov_requirements.md`
-Companion scratch doc (design rationale and conversation record): `reports/SCRATCH_latent_design_rough.md`
 
 ---
 
@@ -51,6 +50,139 @@ Markov property, empirically verified.
 
 ---
 
+## Pipeline and Gradient Flow (ASCII Block Diagram)
+
+The full pipeline runs in two phases. Phase 0 pretrains the VAE and ZInjector jointly
+with a frozen backbone. Phase 1 runs joint RL with all components live.
+
+```
+══════════════════════════════════════════════════════════════════════════════════
+  PHASE 0 — ONLINE VAE PRE-TRAINING  (backbone FROZEN)
+══════════════════════════════════════════════════════════════════════════════════
+
+  Easy MATH pool, 200 steps, batch_size=4, G=8
+
+      problem prompt
+            │
+      ┌─────▼──────────────────────────────────────────────────────────────────┐
+      │  BACKBONE  (Qwen 1.5B-Instruct)                         [FROZEN]       │
+      │                                                                        │
+      │  generate: 341 tokens, no z prefix  →  chunk1_ids                      │
+      │  forward:  [prompt ‖ chunk1]  →  repr_1 = mean_pool    [LIVE]          │
+      └─────────────────────────┬──────────────────────────────────────────────┘
+                                │  repr_1  [LIVE]
+                     ┌──────────▼──────────────────────────────────────────────┐
+                     │  VAE Encoder  (MLP 1536→512→64×2)           [UPDATES]   │
+                     │  μ_1, log_σ_1²  =  encoder(repr_1)                      │
+                     │  ε_1 ~ N(0,I)  [reparameterization trick]               │
+                     │  z_1  =  μ_1  +  ε_1 · exp(½·log_σ_1²)                  │
+                     └──────────┬──────────────────────────────────────────────┘
+                                │  z_1  (64-dim)
+                     ┌──────────▼──────────────────────────────────────────────┐
+                     │  ZInjector  (Linear 64→1536, init std=0.01)  [UPDATES]  │
+                     │  prefix_1  =  W_inj · z_1             [in graph]        │
+                     └──────────┬──────────────────────────────────────────────┘
+                                │  prefix_1  (1536-dim embedding)
+      ┌─────────────────────────▼──────────────────────────────────────────────┐
+      │  BACKBONE  [FROZEN, with_grad]                                         │
+      │                                                                        │
+      │  generate: 341 tokens, inputs=[prefix_1 ‖ chunk1]  →  chunk2_ids       │
+      │  forward:  [prefix_1_emb ‖ prompt ‖ chunk1 ‖ chunk2]                   │
+      │            →  repr_2 = mean_pool(last-layer hidden)    [LIVE]          │
+      └─────────────────────────┬──────────────────────────────────────────────┘
+                                │  repr_2  [LIVE]
+                     ┌──────────▼──────────────────────────────────────────────┐
+                     │  VAE Encoder  →  z_2  (64-dim)               [UPDATES]  │
+                     │  ZInjector    →  prefix_2  (1536-dim)        [UPDATES]  │
+                     └──────────┬──────────────────────────────────────────────┘
+                                │  prefix_2  (1536-dim embedding)
+      ┌─────────────────────────▼──────────────────────────────────────────────┐
+      │  BACKBONE  [FROZEN, with_grad]                                         │
+      │                                                                        │
+      │  generate: 342 tokens, inputs=[prefix_2 ‖ chunk2]  →  chunk3_ids       │
+      │            grade full output  →  reward r                              │
+      │  forward:  [prefix_2_emb ‖ ... ‖ chunk3]                               │
+      │            →  repr_3 = mean_pool(last-layer hidden)    [LIVE]          │
+      └─────────────────────────┬──────────────────────────────────────────────┘
+                                │  repr_3  [LIVE]
+                     ┌──────────▼──────────────────────────────────────────────┐
+                     │  VAE Encoder  →  z_3 (= z_final)             [UPDATES]  │
+                     └──────────┬──────────────────────────────────────────────┘
+                                │  z_3  (64-dim)
+                     ┌──────────▼──────────────────────────────────────────────┐
+                     │  Outcome Head  (MLP 64→64→1 + sigmoid)       [UPDATES]  │
+                     │  P̂(correct)  =  σ(MLP(z_3))                             │
+                     └──────────┬──────────────────────────────────────────────┘
+                                │
+  ┌─────────────────────────────▼──────────────────────────────────────────────────┐
+  │  PHASE 0 LOSSES                                                                │
+  │                                                                                │
+  │  L_ELBO  = Σ_h  [ MSE(decode(z_h), repr_h) + kl_w(t) · KL(N(μ_h,σ_h²)‖N(0,I))] │
+  │  L_trans = ‖ f(z_1) − z_2 ‖²  +  ‖ f(z_2) − z_3 ‖²                             │
+  │  L_out   = BCE( P̂(correct), r )                                                │
+  │  L_total = L_ELBO  +  λ_t · L_trans  +  λ_o · L_out                            │
+  └────────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │  GRADIENT ROUTES (Phase 0)                                                  │
+  │                                                                             │
+  │  L_ELBO  →  encoder ✓   decoder ✓                                          │
+  │  L_trans →  transition ✓   encoder ✓   ZInjector ✓                         │
+  │             ( L_trans → z_{h+1} → repr_{h+1}[LIVE] → backbone               │
+  │                                   → prefix_h → ZInjector )                  │
+  │  L_out   →  OutcomeHead ✓   encoder ✓                                      │
+  │  All     →  backbone activations  [passthrough; ∂L/∂θ_bb accumulated        │
+  │              but optimizer never called on backbone params]                 │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+══════════════════════════════════════════════════════════════════════════════════
+  PHASE 1 — JOINT RL TRAINING  (backbone UNFROZEN)
+══════════════════════════════════════════════════════════════════════════════════
+
+  Hard 40-problem MATH-B-I pool, 200 steps, batch_size=4, G=8
+
+  ┌──────────────────── ROLLOUT (no_grad) ─────────────────────────────────────┐
+  │                                                                            │
+  │  Same 3-chunk loop as Phase 0.  G=8 rollouts per problem.                  │
+  │  Store per rollout: chunk_ids, reward.  (No repr_h, z_h, or log_π_old.)    │
+  │  Compute GRPO advantages from group rewards.                               │
+  │                                                                            │
+  └────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────── TRAINING STEP (with_grad) ─────────────────────────────┐
+  │                                                                            │
+  │  Re-run the full 3-chunk pipeline (identical to Phase 0 except backbone    │
+  │  is unfrozen) for each rollout, using stored chunk_ids for log_π.          │
+  │  repr_h and z_h are LIVE (not stored from rollout).                        │
+  │  IS ratio = 1 exactly (same policy, no update between rollout and step).   │
+  │                                                                            │
+  │  ┌─────────────────────────────────────────────────────────────────────┐   │
+  │  │  PHASE 1 LOSSES                                                     │   │
+  │  │                                                                     │   │
+  │  │  L_RL    = −adv · log_π_current             [GRPO; sparse; IS = 1]  │   │
+  │  │  L_trans = ‖f(z_1)−z_2‖²  +  ‖f(z_2)−z_3‖²   [always non-zero]      │   │
+  │  │  L_VAE   = MSE(decode(z_h), repr_h) + kl_w · KL  [always non-zero]  │   │
+  │  │                                                                     │   │
+  │  │  L_total = L_RL  +  λ_t · L_trans  +  λ_vae · L_VAE                 │   │
+  │  └─────────────────────────────────────────────────────────────────────┘   │
+  │                                                                            │
+  │  ┌─────────────────────────────────────────────────────────────────────┐   │
+  │  │  GRADIENT ROUTES (Phase 1)                                          │   │
+  │  │                                                                     │   │
+  │  │  L_RL    →  lm_head ✓   backbone ✓   ZInjector ✓   encoder ✓       │   │
+  │  │             ( L_RL → log_π → backbone → prefix_h → ZInjector        │   │
+  │  │                                       → z_h → encoder → repr_h )    │   │
+  │  │  L_trans →  transition ✓   encoder ✓   ZInjector ✓   backbone ✓    │   │
+  │  │             ( L_trans → z_{h+1} → repr_{h+1}[LIVE] → backbone       │   │
+  │  │                                   → prefix_h → ZInjector )          │   │
+  │  │  L_VAE   →  encoder ✓   decoder ✓   backbone ✓                     │   │
+  │  │  All losses reach backbone: repr_h is LIVE; backbone.step() called. │   │
+  │  └─────────────────────────────────────────────────────────────────────┘   │
+  └────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## The Mechanism (full rollout)
 
 ```
@@ -59,32 +191,32 @@ ROLLOUT FOR ONE PROBLEM
 
 query q = [system prompt] + [problem]
 
-┌──────────────────────────────────────────────────────────────┐
-│ CHUNK 1                                                      │
+┌───────────────────────────────────────────────────────────────┐
+│ CHUNK 1                                                       │
 │  input:  q                      (no z prefix — no prior state)│
-│  generate: up to 341 tokens                                  │
-│  extract: mean_pool(hidden_states_of_341_tokens) = repr_1    │
-│  encode: encoder(repr_1) → (μ_1, σ_1²) → sample z_1        │
-│  project: z_1 (64-dim) → linear → (1536-dim) = prefix_1     │
-└─────────────────────────┬────────────────────────────────────┘
+│  generate: up to 341 tokens                                   │
+│  extract: mean_pool(hidden_states_of_341_tokens) = repr_1     │
+│  encode: encoder(repr_1) → (μ_1, σ_1²) → sample z_1           │
+│  project: z_1 (64-dim) → ZInjector → (1536-dim) = prefix_1    │
+└─────────────────────────┬─────────────────────────────────────┘
                           │ prefix_1 prepended to chunk 2 input
                           ▼
-┌──────────────────────────────────────────────────────────────┐
-│ CHUNK 2                                                      │
-│  input:  [prefix_1] + q          (z_1 as virtual token)     │
-│  generate: up to 341 tokens                                  │
-│  extract: mean_pool(hidden_states_of_341_tokens) = repr_2    │
-│  encode: encoder(repr_2) → (μ_2, σ_2²) → sample z_2        │
-│  project: z_2 → prefix_2                                    │
-└─────────────────────────┬────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│ CHUNK 2                                                       │
+│  input:  [prefix_1] + q          (z_1 as virtual token)       │
+│  generate: up to 341 tokens                                   │
+│  extract: mean_pool(hidden_states_of_341_tokens) = repr_2     │
+│  encode: encoder(repr_2) → (μ_2, σ_2²) → sample z_2           │
+│  project: z_2 → prefix_2                                      │
+└─────────────────────────┬─────────────────────────────────────┘
                           │ prefix_2 prepended to chunk 3 input
                           ▼
-┌──────────────────────────────────────────────────────────────┐
-│ CHUNK 3                                                      │
-│  input:  [prefix_2] + q          (z_2 as virtual token)     │
-│  generate: up to 342 tokens                                  │
-│  extract: repr_3 → z_3 = z_final                            │
-└─────────────────────────┬────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│ CHUNK 3                                                       │
+│  input:  [prefix_2] + q          (z_2 as virtual token)       │
+│  generate: up to 342 tokens                                   │
+│  extract: repr_3 → z_3 = z_final                              │
+└─────────────────────────┬─────────────────────────────────────┘
                           │
                           ▼
        Grade full output: r = 1.0 if correct, 0.0 otherwise
@@ -119,6 +251,7 @@ token-space state.
 All three components are small MLPs satisfying R4.4 (< 10M params total).
 
 **Encoder** — maps trajectory representation to latent distribution:
+
 ```
 repr_h (1536-dim)
   → Linear(1536, 512) + ReLU
@@ -127,6 +260,7 @@ repr_h (1536-dim)
 ```
 
 **Decoder** — maps latent back to trajectory representation (training only, R4.2):
+
 ```
 z (64-dim)
   → Linear(64, 512) + ReLU
@@ -135,6 +269,7 @@ z (64-dim)
 ```
 
 **Transition model** — predicts next latent from current latent:
+
 ```
 z_h  (64-dim)
   → Linear(64, 512) + ReLU
@@ -148,138 +283,118 @@ compression task (repr_h → z_h); including repr_h in the transition would let 
 model bypass the bottleneck and weaken the gradient pressure on z_h to be
 information-dense.
 
-**Outcome head** — for Phase 0 pretraining only, attached to z_final:
+**Outcome head** — Phase 0 only, attached to z_final:
+
 ```
 z_final (64-dim)
   → Linear(64, 64) + ReLU
   → Linear(64, 1) + Sigmoid
   → P(correct)
 ```
+
 Discarded before Phase 1 begins. Used only to shape the encoder during pretraining.
 
-**Policy conditioning** — z injection:
+**ZInjector** — projects z_h into the backbone's embedding space as a soft prefix token:
+
 ```
-z_h (64-dim) → Linear(64, 1536) → prefix_embedding (1536-dim)
+z_h (64-dim) → Linear(64, 1536, bias=False) → prefix_embedding (1536-dim)
 ```
+
 Prepended to chunk h+1's input via `inputs_embeds`. Not a real token — no vocabulary
 entry. Does not consume the 1024-token generation budget (R5.2).
 
+**ZInjector initialisation:** `nn.init.normal_(weight, std=0.01)`.
+Default Kaiming-uniform gives std ≈ 0.125, making the prefix embedding O(1) magnitude —
+the same as a real token embedding — which injects random noise and confuses the
+pretrained backbone immediately. Starting at std=0.01 keeps the prefix ~12× smaller
+than a token embedding, making it effectively neutral at init. Phase 0 online training
+will grow the weights via L_transition and L_outcome before Phase 1 begins. Same principle
+as LoRA zero-init for new adapter parameters inserted into a frozen backbone.
+
 The encoder is shared across all three chunks (same weights applied three times).
-Training Phase 0 updates the encoder weights based on chunk 3's z_final (via L_outcome);
-those same weights produce z_1 and z_2 from chunks 1 and 2 (R4.3, R4.5).
 
 ---
 
 ## Training: Two Phases
 
-The training is split into Phase 0 (VAE pretraining) and Phase 1 (joint RL).
-
 ### Why two phases?
 
-The VAE arrives at joint RL training as a cold-start module. If RL training begins
-immediately with a randomly initialised encoder, `z_h` is noise and the policy
-conditions on noise. When sparse RL rewards do appear (≈ 0.02% per sample), GRPO
-updates land on a meaningless latent space.
+The VAE and ZInjector arrive cold. If joint RL begins immediately with randomly
+initialised encoder and ZInjector, `z_h` is noise and the policy conditions on noise.
+When sparse RL rewards do appear (≈ 0.02% per sample), GRPO updates land on a
+meaningless latent space.
 
-The fix mirrors how the LLM backbone is prepared for RL: the backbone is pretrained on
-general data before RL begins. The VAE should be pretrained on related-but-easier data
-before RL begins. Phase 0 is VAE pretraining.
+Phase 0 pretrains VAE and ZInjector jointly on an easier pool while the backbone is
+frozen. This orients the latent space toward solution-quality information before RL
+begins, so when Phase 1 rewards do arrive, they land on structured representations.
 
 ---
 
-### Phase 0 — VAE Pretraining
+### Phase 0 — Online VAE Pretraining
 
-**Backbone: FROZEN throughout Phase 0.**
+**Backbone: FROZEN for weight updates. Gradients still pass through backbone activations
+(required by the L_transition → ZInjector gradient chain).**
 
-**Data: Easier pretraining pool (TBD — see calibration step).**
+**Data: L1–L5 MATH pool (`data/math_easy_pool.jsonl`), 4974 problems.**
 
-The pool must satisfy: the pretrained instruct model solves ≥20% of problems at pass@8, so
-`L_outcome` receives a mix of correct and incorrect trajectory labels. Calibration
-(`scripts/calibrate_pool.py --pool-path <candidate>`) must confirm this before
-any Phase 0 compute is spent.
+The pool must satisfy: the pretrained instruct model solves ≥20% of problems at pass@8
+so L_outcome receives a mix of correct and incorrect trajectory labels. L1–L5 provides
+this calibration while staying out of the hard MATH-B-I eval pool.
 
-Candidate: `hendrycks/competition_math` Level 1–3 (standard MATH competition problems at
-lower difficulty). These provide the same mathematical domain and hidden-state distribution
-expected during Phase 1 RL, without contaminating the hard MATH-Beyond eval pool.
+**Generation:** live, online. Each Phase 0 step generates a mini-batch of complete
+3-chunk rollouts using the backbone with z prefix injection (the same inference loop
+as Phase 1). No pre-saved rollouts. No separate rollout-generation script.
 
-Why a separate pool at all:
-- Not in the eval pool → no contamination of the RL target environment
-- Easier → rollouts contain both correct and incorrect trajectories → rich labels for L_outcome
-- Same reasoning domain → hidden states have the right distributional character for the encoder
+**G=8 rollouts per problem per step.** Even though L_out is supervised (BCE), running
+G=8 rollouts per problem per step provides variance in outcome labels within each batch
+— some rollouts pass, some fail — giving L_out richer supervision than a single
+deterministic rollout would. L_trans and L_VAE additionally benefit from seeing diverse
+solution trajectories for the same problem in each step.
 
-**Generation (one-time, before training loop, no grad):**
+This is the critical architectural choice over an offline approach:
 
-```
-1. Run frozen backbone on Phase 0 pool × G=8 rollouts (no_grad)
-2. For each rollout, extract final-layer hidden states per chunk, mean-pool
-   → save (repr_1, repr_2, repr_3, reward_label) per trajectory to disk
-3. Backbone is NOT in the VAE training computational graph
-```
+- The VAE and ZInjector see repr tensors extracted from *z-injected* generation —
+the same distribution they will face in Phase 1. No train/eval distribution mismatch.
+- The ZInjector is fully trained by Phase 0: L_transition provides gradient via the
+path `L_trans → z_{h+1} → repr_{h+1}[LIVE] → backbone → prefix_h → ZInjector`.
+Phase 1 starts with a warm, task-shaped ZInjector, not a cold random one.
+- No separate rollout generation script or pre-computed tensor cache needed.
 
-Using static, pre-saved hidden states (not live backbone inference) is deliberate.
-If the backbone were in the graph with `requires_grad_(False)` on its parameters,
-L_outcome on z_final would propagate backward through the frozen backbone's operations
-to reach z_1 and z_2 activations — treating the backbone as a fixed differentiable
-function. That is mathematically possible but requires storing activations for a
-28-layer 1.5B transformer per step. Static hidden states avoid this: gradient
-terminates at the constant `repr_h` tensors. Phase 0 backward passes update only
-the small VAE modules.
+**repr_h computation:** forward pass `[prefix_h_emb ‖ prompt ‖ ... ‖ chunk_h]` with
+a registered forward hook on the backbone's last layer. `repr_h = mean_pool` of the
+hidden states over the chunk_h token positions. Hook avoids the memory overhead of
+`output_hidden_states=True` for all 28 layers.
 
 **Phase 0 losses:**
 
 ```
-L_ELBO       =  reconstruction_loss(decoder(z_h), repr_h)
-             +  KL(N(μ_h, σ_h²) ∥ N(0, I))
-             (summed over h = 1, 2, 3)
+L_ELBO    =  Σ_h [ MSE(decode(z_h), repr_h) + kl_w(t) · KL(N(μ_h,σ_h²) ‖ N(0,I)) ]
 
-L_transition =  ∥ f(z_h) − z_{h+1} ∥²
-             (summed over h = 1, 2; h=1→2 and h=2→3)
+L_trans   =  ‖ f(z_1) − z_2 ‖²  +  ‖ f(z_2) − z_3 ‖²
 
-L_outcome    =  BCE(outcome_head(z_final), r)
-             (z_final = z_3 from the last chunk)
+L_out     =  BCE(outcome_head(z_final), r)
 
-L_phase0     =  λ_elbo × L_ELBO  +  λ_trans × L_transition  +  λ_out × L_outcome
+L_phase0  =  L_ELBO  +  λ_trans · L_trans  +  λ_out · L_out
 ```
 
-Default weights: λ_elbo = 1.0, λ_trans = 1.0, λ_out = 1.0. Specified in config.
+Default weights: `λ_trans = 1.0`, `λ_out = 1.0`. Specified in config.
 
-**Why L_outcome is not redundant with Phase 1's L_RL:**
+**KL annealing:** `kl_weight` ramps linearly from 0 → 1 over the first `kl_warmup_frac`
+(default 0.5) of Phase 0 steps. Without annealing, the KL term from step 0 drives σ²
+toward the prior (1.0) before the encoder has learned to compress repr_h meaningfully —
+posterior collapse. KL annealing lets reconstruction dominate early, then gradually
+introduces the regularisation pressure. Config key: `phase0.kl_warmup_frac: 0.5`.
 
-L_outcome and L_RL both connect `z_h` to outcome quality, but they operate in
-different phases, on different problem sets, under different reward density conditions:
+**λ_trans schedule in Phase 0:** same warmup logic as Phase 1 (described below) applied
+from Phase 0 step 0. Prevents the transition loss from enforcing Markov consistency on
+useless representations before the encoder has any structure.
 
-- L_outcome fires on every trajectory during Phase 0 on the easier pretraining pool
-  where the model actually succeeds sometimes. On easier problems with ~20%+ per-sample
-  success and G=8 rollouts, most batches contain both positive and negative examples.
-  Gradient flows from L_outcome through the encoder to shape what information survives
-  the 1536→64 bottleneck.
-- L_RL fires ≈ 0 times per step during Phase 1 on the hard 40 problems (0.02%
-  per-sample success). The backbone is also not in the graph during Phase 0, so
-  L_outcome cannot update backbone parameters.
-- L_RL primarily updates the backbone/policy head. L_outcome specifically targets
-  the encoder. They update different components.
+**Phase 0 budget:** `phase0.n_steps` in config. Default: 200 steps, batch_size=4,
+G=8 → 800 problem-encounters, 6400 total rollouts (matches Phase 1 encounter count).
+Phase 0 is more expensive than an offline approach (live backbone forward passes per
+step) but fully eliminates distribution mismatch.
 
-If L_RL were dense, L_outcome would be redundant — L_RL would eventually shape the
-encoder indirectly. It is non-redundant specifically because L_RL is sparse.
-
-**What L_outcome achieves:**
-
-The 1536→64 bottleneck has no inherent reason to retain solution-quality-relevant
-information — it might compress surface syntax statistics or token frequency patterns
-instead. L_outcome provides explicit pressure: of all the information in repr_3,
-retain what predicts whether the trajectory succeeded. L_transition provides
-cross-chunk consistency: z_2 must be consistent with z_3 (via the h=2→3 transition
-loss), so quality-relevant structure in z_3 propagates structurally backward to z_2
-and z_1 via consistency constraints.
-
-**Phase 0 budget:** Specified in config (`vae_pretrain_steps` or epochs).
-Default candidate: 2–3 epochs over the Phase 0 pool with G=8 precomputed
-rollouts. Cost is negligible — no backbone backward pass.
-
-**Gate:** NFR6 applies after Phase 0. Run the encoder on the saved rollouts, produce
-t-SNE/UMAP of z_final coloured by correct/incorrect. If no separation is visible,
-Phase 0 failed to orient the encoder toward quality. Diagnose before proceeding to
-Phase 1 (try: larger latent dim, longer Phase 0, higher λ_out).
+**Gate:** NFR6 (see below) must pass before Phase 1 begins.
 
 ---
 
@@ -287,52 +402,82 @@ Phase 1 (try: larger latent dim, longer Phase 0, higher λ_out).
 
 **Backbone: UNFROZEN.**
 **Outcome head: DISCARDED.**
-**VAE: initialised from Phase 0 weights.**
+**VAE + ZInjector: initialised from Phase 0 checkpoint.**
 
-**Data: hard 40-problem MATH-B-I pool** — same as baseline and token-Markov arms.
+**Data:** hard 40-problem MATH-B-I pool — same as baseline and token-Markov arms.
 
 **Phase 1 losses:**
 
 ```
 L_RL         =  GRPO policy gradient
-             =  -advantage × log_prob  (standard GRPO, same as baseline arm)
-             Sparse: fires only when at least 1 of G=8 rollouts has r=1.
-             Updates: backbone, lm_head, z injection linear.
+             =  -advantage × log_π_current   [IS = 1; same policy as rollout]
+             Sparse: fires only when ≥1 of G=8 rollouts has r=1.
 
-L_transition =  ∥ f(z_h) − z_{h+1} ∥²
-             Always non-zero. Keeps Markov property active during RL training.
+L_transition =  ‖ f(z_h) − z_{h+1} ‖²
+             Always non-zero. Keeps Markov property active during RL.
              Also the diagnostic metric for E1 (transition sufficiency).
-             Updates: transition model, encoder.
 
-L_VAE        =  reconstruction_loss + KL(N(μ_h, σ_h²) ∥ N(0, I))
-             Always non-zero. Prevents encoder/decoder from drifting during RL.
-             Updates: encoder, decoder.
+L_VAE        =  MSE(decode(z_h), repr_h)  +  kl_w · KL(N(μ_h, σ_h²) ‖ N(0, I))
+             Always non-zero. Prevents encoder/decoder drift during RL.
 
-L_phase1     =  L_RL  +  λ_t × L_transition  +  L_VAE
+L_phase1     =  L_RL  +  λ_t × L_transition  +  λ_vae × L_VAE
 ```
 
 **λ_t schedule (transition loss weight):**
 
-```
-λ_t = 1.0                               for steps 0  – 100  (linear decay)
-    → linear decay to 0.1               at step 100
-    = 0.1                               for steps 100 – 200  (held constant)
+```python
+def lambda_trans_schedule(step, max_steps=200, floor=0.1, peak=0.5):
+    halfway = max_steps // 2
+    if step >= halfway: return peak
+    return floor + (peak - floor) * (step / halfway)
 ```
 
-High early → L_transition provides dense gradient flow while L_RL ≈ 0.
-Low late → L_RL dominates once sparse rewards start appearing.
-Floor at 0.1 → L_transition remains active as Markov regulariser and diagnostic.
+Warmup 0.1 → 0.5 over steps 0–100, then constant at 0.5.
+
+Rationale: At step 0, L_RL is near-zero (sparse reward, hard problems). Starting
+λ_t = 0.1 lets the rare early reward events shape z before the Markov consistency
+constraint locks in structure. As z accumulates signal, λ_t ramps to enforce Markov
+consistency. Held at 0.5 for the second half so L_transition remains an active
+regulariser throughout. Starting at the old high value (1.0) would force Markov
+self-consistency on useless early representations.
+
+**λ_vae = 0.05.** L_VAE at weight 1.0 is orders of magnitude larger than near-zero
+L_RL, which would lock the encoder into its Phase 0 fixed point and drown any sparse
+reward signal. 0.05 keeps VAE regularisation active without dominating.
+
+**Phase 1 is structurally identical to Phase 0** except: (a) the backbone is unfrozen,
+(b) L_RL replaces L_out, (c) G=8 rollouts are collected per problem before the training
+step to compute GRPO advantages. The training step re-runs the full 3-chunk pipeline
+with grad — no stored repr_h, z_h, μ, or log_π_old. Because the training step uses
+the same policy that generated the rollout with no intervening weight update, IS = 1
+exactly and no importance-sampling correction is needed.
+
+**On-policy GRPO loop (200 steps):** every single training step is:
+1. `[no_grad]` collect G=8 fresh rollouts for the current batch of 4 problems → 32 sequences
+2. Grade all 32, compute GRPO advantages from normalised group rewards per problem
+3. `[with_grad]` re-run full 3-chunk pipeline for all 32 sequences → live log_π, repr_h, z_h
+4. Compute L_total, backward, step optimiser
+5. Discard rollouts. Advance to next step.
+
+No replay buffer. No multi-epoch reuse of rollouts. Rollouts are collected fresh at
+every step and used for exactly one gradient update — standard on-policy GRPO.
+
+All three losses reach the backbone via live repr_h in the computation graph;
+`backbone.step()` is called (unlike Phase 0 where .step() is skipped).
+
+**batch_size = 4.** With batch_size=1, the custom latent loop processes only 200
+problem-encounters over 200 steps, vs ~800 for the baseline (TRL batch_size=8,
+grad_accum=4). Reward density scales with encounters. At batch_size=4: 4×8=32
+sequences per step, 800 problem-encounters over 200 steps — matching the baseline.
+If OOM: fall back to batch_size=2 and max_steps=400.
 
 **Why Phase 1 is expected to work better than token-Markov:**
 
-1. No context resets → per-sample success ≈ 0.02% (same as baseline), not 0.015%.
-   `P(≥1 correct | G=8) ≈ 0.16%` vs. 0.12% for token-Markov. Small but non-trivial.
-
-2. L_transition and L_VAE provide dense gradient flow even when L_RL = 0. The backbone
-   and encoder are learning from every step, not only from the rare reward events.
-
-3. `z_h` arrives from Phase 0 already oriented toward quality — not random noise. When
-   rare RL rewards do appear, GRPO updates land on a structured latent space.
+1. No context resets → per-sample success ≈ same as baseline, not near-zero.
+2. L_transition and L_VAE provide dense gradient flow even when L_RL = 0. All
+  components learn from every step, not only from rare reward events.
+3. ZInjector and z_h arrive from Phase 0 already oriented toward quality — not cold
+  random noise. When rare RL rewards appear, GRPO lands on structured latent space.
 
 ---
 
@@ -345,67 +490,83 @@ learned it from pretraining — not raw token statistics, but also not provably
 "position in mathematical solution space." Three forces push z_h toward solution-relevant
 representations during training:
 
-1. L_outcome (Phase 0): directly rewards z_final for retaining information predictive
-   of correct vs incorrect trajectories on easier math problems.
-2. L_transition (both phases): forces z_h to retain information predictive of z_{h+1},
-   which rewards trajectory-structure information over surface syntax.
-3. L_RL (Phase 1, sparse): when it fires, rewards z_h values associated with successful
-   reasoning paths.
+1. **L_outcome (Phase 0):** directly rewards z_final for retaining information predictive
+  of correct vs incorrect trajectories on easier math problems.
+2. **L_transition (both phases):** forces z_h to retain information predictive of z_{h+1},
+  which rewards trajectory-structure information over surface syntax.
+3. **L_RL (Phase 1, sparse):** when it fires, rewards z_h values associated with
+  successful reasoning paths.
 
-Whether these forces are sufficient is empirically tested by the diagnostics (Section 5
-of requirements doc): E1 (transition loss on held-out trajectories), E3 (variance
-correlation with difficulty), and the NFR6 t-SNE gate.
+Whether these forces are sufficient is empirically tested by the diagnostics (E1, E3)
+and the NFR6 t-SNE gate.
 
 ---
 
 ## Requirements Satisfaction
 
-| Requirement | Satisfied by |
-|-------------|-------------|
-| R1.1 — z_h at each step | VAE encoder applied after each chunk |
-| R1.2 — derived from backbone hidden states | mean_pool(final-layer hidden states of chunk h) |
-| R1.3 — fixed-size z_h | 64-dim regardless of step count |
-| R1.4 — uncertainty estimate σ_h² | VAE posterior variance, used by uncertainty arm |
-| R1.5 — z_h conditions policy before head | soft prefix token injected via inputs_embeds |
-| R2.1 — transition consistency loss | L_transition = ∥f(z_h) − z_{h+1}∥² |
-| R2.2 — Markov objective joint with RL | L_transition active throughout Phase 1 |
-| R2.3 — same loss is diagnostic metric | L_transition on held-out trajectories = E1 |
-| R3.1 — dense auxiliary signal | L_transition and L_VAE non-zero on every step |
-| R3.2 — transition loss satisfies R3.1 | explicitly: L_transition is always computable |
-| R3.4 — gradients in first ~20 steps | L_transition + L_VAE flow from step 0 |
-| R4.1 — encoder: MLP, dim 64–128 | 1536 → 512 → 64, latent dim 64 |
-| R4.2 — decoder: training only | decoder not used at eval/inference |
-| R4.3 — reparameterization trick | z = μ + ε·σ, ε ~ N(0, I) |
-| R4.4 — VAE < 10M params | encoder + decoder + transition ≈ 4–5M |
-| R4.5 — same latent dim both arms | 64-dim shared between latent and latent+uncertainty |
-| R5.1 — z_h injected before policy head | soft prefix prepended to inputs_embeds |
-| R5.2 — z_h not in token budget | virtual prefix token, not counted in 1024 generation tokens |
-| R5.3 — same backbone | Qwen/Qwen2.5-1.5B-Instruct throughout |
-| R6.1 — GRPO hyperparameters locked | inherited from train_baseline_grpo.yaml via extends |
-| R6.2 — reward unchanged | binary correctness, same math_reward function |
-| R6.3 — total loss | L_RL + λ_t × L_transition (+β_t × KL in reward for uncertainty arm) |
-| R6.4 — hyperparameters documented | λ_t schedule above; β_t in uncertainty arm design |
-| R6.5 — no NaN blowups when reward=0 | L_transition + L_VAE keep gradients finite; gate in smoke |
-| R7.1–R7.5 — fairness | same checkpoint, pool, reward, budget, token limit as all arms |
+
+| Requirement                                | Satisfied by                                                   |
+| ------------------------------------------ | -------------------------------------------------------------- |
+| R1.1 — z_h at each step                    | VAE encoder applied after each chunk                           |
+| R1.2 — derived from backbone hidden states | mean_pool(final-layer hidden states of chunk h)                |
+| R1.3 — fixed-size z_h                      | 64-dim regardless of step count                                |
+| R1.4 — uncertainty estimate σ_h²           | VAE posterior variance, used by uncertainty arm                |
+| R1.5 — z_h conditions policy before head   | soft prefix token injected via inputs_embeds                   |
+| R2.1 — transition consistency loss         | L_transition = ‖f(z_h) − z_{h+1}‖²                             |
+| R2.2 — Markov objective joint with RL      | L_transition active throughout Phase 1                         |
+| R2.3 — same loss is diagnostic metric      | L_transition on held-out trajectories = E1                     |
+| R3.1 — dense auxiliary signal              | L_transition and L_VAE non-zero on every step                  |
+| R3.2 — transition loss satisfies R3.1      | explicitly: L_transition is always computable                  |
+| R3.4 — gradients in first ~20 steps        | L_transition + L_VAE flow from step 0                          |
+| R4.1 — encoder: MLP, dim 64–128            | 1536 → 512 → 64, latent dim 64                                 |
+| R4.2 — decoder: training only              | decoder not used at eval/inference                             |
+| R4.3 — reparameterization trick            | z = μ + ε·σ, ε ~ N(0, I)                                       |
+| R4.4 — VAE < 10M params                    | encoder + decoder + transition ≈ 4–5M                          |
+| R4.5 — same latent dim both arms           | 64-dim shared between latent and latent+uncertainty            |
+| R5.1 — z_h injected before policy head     | soft prefix prepended to inputs_embeds                         |
+| R5.2 — z_h not in token budget             | virtual prefix token, not counted in 1024 generation tokens    |
+| R5.3 — same backbone                       | Qwen/Qwen2.5-1.5B-Instruct throughout                          |
+| R6.1 — GRPO hyperparameters locked         | inherited from train_baseline_grpo.yaml via extends            |
+| R6.2 — reward unchanged                    | binary correctness, same math_reward function                  |
+| R6.3 — total loss                          | L_RL + λ_t × L_transition + λ_vae × L_VAE                      |
+| R6.4 — hyperparameters documented          | λ_t schedule above; β_t in uncertainty arm design              |
+| R6.5 — no NaN blowups when reward=0        | L_transition + L_VAE keep gradients finite; gate in smoke      |
+| R7.1–R7.5 — fairness                       | same checkpoint, pool, reward, budget, token limit as all arms |
+
 
 ---
 
 ## Key Parameters
 
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| Latent dim | 64 | R4.1 range: 64–128 |
-| Chunk size | 341 / 341 / 342 tokens | = 1024 total, equal split, no carryover |
-| z injection | soft prefix via inputs_embeds | Q1 decision |
-| Encoder architecture | MLP 1536→512→64 (×2 outputs) | μ and log_σ² |
-| Decoder architecture | MLP 64→512→1536 | training only |
-| Transition architecture | MLP 64→512→64 | input = z_h only (pure Markov) |
-| Outcome head | MLP 64→64→1 + sigmoid | Phase 0 only, discarded after |
-| Phase 0 data | Easier pretraining pool (TBD) | Must achieve pass@8 ≥ 20% with instruct model |
-| Phase 0 backbone | frozen (static hidden states saved to disk) | |
-| Phase 1 λ_t | 1.0 → 0.1 linear over steps 0-100, held at 0.1 | |
-| Phase 0 loss weights | λ_elbo=1.0, λ_trans=1.0, λ_out=1.0 | config knobs |
-| VAE LR | same as backbone (1e-6) | separate LR optional if needed |
+
+| Parameter                        | Value                                      | Notes                                                     |
+| -------------------------------- | ------------------------------------------ | --------------------------------------------------------- |
+| Latent dim                       | 64                                         | R4.1 range: 64–128                                        |
+| Chunk size                       | 341 / 341 / 342 tokens                     | = 1024 total, equal split, no carryover                   |
+| z injection                      | soft prefix via inputs_embeds              | Q1 decision                                               |
+| Encoder architecture             | MLP 1536→512→64 (×2 outputs)               | μ and log_σ²                                              |
+| Decoder architecture             | MLP 64→512→1536                            | training only                                             |
+| Transition architecture          | MLP 64→512→64                              | input = z_h only (pure Markov)                            |
+| Outcome head                     | MLP 64→64→1 + sigmoid                      | Phase 0 only, discarded after                             |
+| ZInjector init                   | `nn.init.normal_(std=0.01)`                | near-zero; prevents cold-start noise injection            |
+| Phase 0 data                     | L1–L5 MATH pool, 4974 problems             | `data/math_easy_pool.jsonl`                               |
+| Phase 0 max_steps                | 200                                        | 800 problem-encounters; matches Phase 1                   |
+| Phase 0 batch_size               | 4                                          |                                                           |
+| Phase 0 G (rollouts per problem) | 8                                          | variance in outcome labels; richer L_out supervision      |
+| Phase 0 generation               | live, online (z-injected, frozen backbone) | eliminates Phase 0→1 distribution mismatch                |
+| Phase 0 KL warmup                | kl_weight 0→1 over first 50% of steps      | prevents posterior collapse                               |
+| Phase 0 λ_trans                  | warmup schedule (same as Phase 1)          | avoids early over-constraint                              |
+| Phase 0 λ_out                    | 1.0                                        | config knob                                               |
+| Phase 0 λ_elbo                   | 1.0                                        | config knob                                               |
+| Phase 1 max_steps                | 200                                        | budget                                                    |
+| Phase 1 batch_size               | 4                                          | 800 problem-encounters; matches baseline gradient density |
+| Phase 1 G (rollouts per problem) | 8                                          | locked                                                    |
+| Phase 1 lr                       | 1e-6                                       | locked (all arms)                                         |
+| Phase 1 λ_t                      | warmup 0.1→0.5 over steps 0–100, held 0.5  | Markov constraint after z has structure                   |
+| Phase 1 λ_vae                    | 0.05                                       | VAE regularisation without drowning L_RL                  |
+| Backbone                         | Qwen/Qwen2.5-1.5B-Instruct                 | R5.3                                                      |
+| repr_h extraction                | forward hook on last layer, mean_pool      | avoids output_hidden_states memory overhead               |
+
 
 ---
 
@@ -417,245 +578,128 @@ TRL's single-sequence-per-rollout assumption. The latent arm uses a custom train
 in `src/training/grpo_latent.py`, following the same structural pattern as
 `src/training/grpo_token_markov.py`.
 
-Rollout phase: `@torch.no_grad()` for all generation. Hidden states extracted during
-rollout (also `no_grad`) are re-used as frozen `repr_h` tensors in the learning pass.
+**Phase 0 loop** (`pretrain_vae_online`): mirrors `train_latent()` in structure.
+Backbone frozen via `requires_grad_(False)` for parameter updates — but backbone
+operations remain in the computation graph so gradients flow from loss to ZInjector.
+No separate `generate_phase0_rollouts.py` invocation needed.
 
-Learning phase: backbone unfrozen (Phase 1). Re-run forward pass with grad to get
-log-probs for L_RL. `repr_h` tensors from rollout are used as static inputs to the
-encoder, transition model, and decoder — not recomputed via backbone forward pass
-in the learning phase.
+**Phase 1 rollout phase:** `@torch.no_grad()` for generation. Only `chunk_ids` and
+`reward` are stored per rollout. No repr_h, z_h, μ, log_σ², or log_π_old retained.
+GRPO advantages computed from group rewards (G=8) after collection.
 
-This avoids double-counting the backbone computation and keeps the learning pass clean:
-L_RL gradient flows through the token generation path; L_transition and L_VAE gradients
-flow through the VAE components using static `repr_h` as inputs.
+**Phase 1 training phase:** backbone unfrozen. The full 3-chunk pipeline is re-run
+with grad for each stored rollout (identical code path to Phase 0). repr_h and z_h are
+LIVE — no detached inputs. Because no weight update occurs between rollout and training
+step, IS = 1 exactly; no ε or importance-correction needed. All three losses reach
+backbone via live repr_h in the computation graph.
+
+**OOM handling:** adaptive batch halving on CUDA OOM — `_run_adaptive` helper halves
+the batch recursively until it fits or reaches size 1. Applied in both Phase 0 and
+Phase 1 rollout generation.
 
 ---
 
 ## Implementation Deliverables
 
 Ordered by dependency. Each step is a gate for the next.
-✅ = complete · 🔜 = next · ⬜ = pending
 
-| # | Deliverable | File | Status |
-|---|-------------|------|--------|
-| 1 | Phase 0 dataset: `data/math_easy_pool.jsonl` — L1–L5 from `EleutherAI/hendrycks_math` (v2: was L1-L3) | `scripts/prepare_easy_pool.py` | ⬜ re-run |
-| 2 | `VAEStateEncoder` — encoder, decoder, transition model; `compute_elbo` now accepts `kl_weight` | `src/models/vae_state_encoder.py` | ✅ |
-| 3 | `OutcomeHead` — 2-layer MLP on z_final, Phase 0 only | `src/models/vae_state_encoder.py` | ✅ |
-| 4 | Phase 0 rollout generation — `data/phase0_rollouts.pt` (re-run on v2 pool) | `scripts/generate_phase0_rollouts.py` | ⬜ re-run |
-| 5 | `pretrain_vae()` — Phase 0 training loop with KL annealing; checkpoint → `runs/latent_grpo/phase0_vae.pt` | `src/training/grpo_latent.py` | ✅ |
-| 6 | Smoke config — re-smoke after v2 code changes | `configs/train_latent_grpo_smoke.yaml` | ⬜ re-smoke |
-| 7 | **NFR6 gate** — UMAP of z_final on v2 Phase 0 checkpoint | `scripts/check_latent_structure.py` | ⬜ re-run |
-| 8 | `train_latent()` — Phase 1 custom GRPO loop (v2: gradient flow fixed, lambda_vae wired, batch_size=4) | `src/training/grpo_latent.py` | ✅ |
-| 8a | `generate_latent_traces()` — chunked inference engine: z injection per chunk via `inputs_embeds`, returns chunk_ids + repr_h + z_h + old_log_probs per rollout | `src/training/grpo_latent.py` | ✅ |
-| 8b | `latent_training_step()` — L_RL + λ_t × L_transition + λ_vae × L_VAE; L_RL now flows through encoder via fresh z | `src/training/grpo_latent.py` | ✅ |
-| 9 | `_generate_latent_eval()` + `latent_markov_pretrained` eval mode | `scripts/eval_passk.py` | ✅ |
-| 10 | Full Phase 1 config (200 steps, batch_size=4, A100) | `configs/train_latent_grpo.yaml` | ✅ |
-| 10a | **Controlled baseline eval** — `latent_grpo_pretrained` (Phase 0 VAE + pretrained backbone) | `scripts/eval_passk.py` | ⬜ pending Phase 0 v2 |
-| 11a | A100 Phase 1 training — 200 steps on `data/math_beyond_math_b_i_base.jsonl` | `configs/train_latent_grpo.yaml` | ⬜ pending Phase 0 v2 |
-| 11b | pass@k eval on MATH-B-I holdout | `scripts/eval_passk.py` | ⬜ pending Phase 1 v2 |
-| 12 | **E1 + E3 Markov diagnostics** on v2 checkpoint | `scripts/eval_markov_diagnostics.py` | ⬜ pending Phase 1 v2 |
 
----
+| #   | Deliverable                                                                                                       | File                                   | Status              |
+| --- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------- | ------------------- |
+| 1   | Phase 0 dataset: `data/math_easy_pool.jsonl` — L1–L5 (4974 problems)                                              | `scripts/prepare_easy_pool.py`         | ✅ reuse             |
+| 2   | `VAEStateEncoder` — encoder, decoder, transition; `compute_elbo(kl_weight)`                                       | `src/models/vae_state_encoder.py`      | ✅                   |
+| 3   | `OutcomeHead` — 2-layer MLP on z_final, Phase 0 only                                                              | `src/models/vae_state_encoder.py`      | ✅                   |
+| 4   | `ZInjector` — near-zero init (std=0.01)                                                                           | `src/models/vae_state_encoder.py`      | ✅                   |
+| 5   | `pretrain_vae_online()` — Phase 0 online loop: frozen backbone, live generation, VAE+ZInjector update             | `src/training/grpo_latent.py`          | ⬜ implement         |
+| 6   | `train_latent()` — Phase 1 custom GRPO loop                                                                       | `src/training/grpo_latent.py`          | ✅                   |
+| 7   | `generate_latent_traces()` — chunked inference engine with z injection, repr hook; stores chunk_ids + reward only | `src/training/grpo_latent.py`          | ⬜ update            |
+| 8   | `latent_training_step()` — re-runs full pipeline with grad; L_RL + λ_t·L_trans + λ_vae·L_VAE; IS = 1              | `src/training/grpo_latent.py`          | ⬜ update            |
+| 9   | Smoke config                                                                                                      | `configs/train_latent_grpo_smoke.yaml` | ⬜ re-smoke after #5 |
+| 10  | Full Phase 1 config (200 steps, batch_size=4)                                                                     | `configs/train_latent_grpo.yaml`       | ✅                   |
+| 11  | Latent eval modes in eval_passk.py (`latent_markov`, `latent_markov_pretrained`)                                  | `scripts/eval_passk.py`                | ✅                   |
+| 12  | **Phase 0 training run** → `runs/latent_grpo/phase0_vae.pt`                                                       | `scripts/train_latent.py`              | ⬜ pending #5        |
+| 13  | **NFR6 gate** — UMAP of z_final on Phase 0 checkpoint                                                             | `scripts/check_latent_structure.py`    | ⬜ pending #12       |
+| 14  | **Controlled latent baseline** eval: `latent_grpo_pretrained` pass@1024 ≥ 12.5%                                   | `scripts/eval_passk.py`                | ⬜ pending #12       |
+| 15  | **Phase 1 training** — 200 steps on MATH-B-I                                                                      | `configs/train_latent_grpo.yaml`       | ⬜ pending #14       |
+| 16  | **Phase 1 eval** — pass@k on MATH-B-I holdout                                                                     | `scripts/eval_passk.py`                | ⬜ pending #15       |
+| 17  | **E1 + E3 Markov diagnostics**                                                                                    | `scripts/eval_markov_diagnostics.py`   | ⬜ pending #15       |
 
-## NFR6 Gate Result — v1 (A100 run, 2026-05-09, superseded)
-
-> v1 used L1-L3 pool only (2974 problems, 38.6% reward rate). Superseded by v2 below.
 
 ---
 
-## NFR6 Gate Result — v2 (Phase 0 redesign, L1-L5 pool)
+## NFR6 Gate
 
-**Artifacts:**
-- Plot: `runs/latent_grpo/plots/latent_structure_umap.png`
-- Summary: `runs/latent_grpo/plots/nfr6_summary.json`
+**When to run:** after Phase 0 training completes (`runs/latent_grpo/phase0_vae.pt`).
 
-**Raw numbers:**
+**How:** `python scripts/check_latent_structure.py` — runs the encoder on the Phase 0
+pool, computes UMAP of z_final coloured by correct/incorrect trajectory.
 
-| Metric | Value |
-|--------|-------|
-| Total trajectories | 39,792 (4974 problems × G=8) |
-| Correct (reward=1) | 11,287 |
-| Incorrect (reward=0) | 28,505 |
-| Per-rollout reward rate | 28.4% |
+**Gate criteria:** structured manifold with visible outcome correlation (correct and
+incorrect trajectories should not be uniformly intermixed; some geometric separation
+or outcome-correlated structure should be visible). Does not require hard disjoint
+clusters — UMAP topology with outcome-correlated layout suffices.
 
-The lower reward rate vs v1 (28.4% vs 38.6%) is expected: the v2 pool includes L4-L5
-problems which are genuinely harder for the base model. The absolute correct count
-(11,287) is larger than v1 (9,189), giving the VAE more positive-outcome signal to
-anchor the latent space.
+**If gate fails:** diagnose before Phase 1. Likely causes: Phase 0 too short
+(increase `phase0.n_steps`), L_out too weak (increase `λ_out`), posterior collapse
+(extend KL warmup). Do not proceed to Phase 1 on a gate failure.
 
-**UMAP structure:**
-
-The v2 plot shows a rich serpentine/S-curve multi-branch manifold — more complex
-than v1's horseshoe, reflecting the broader difficulty range of the L1-L5 pool.
-Key observations:
-
-1. **Correct trajectories dominate the manifold interior.** Green (correct, 11k)
-   fills the dense core of every arm and loop despite red (incorrect, 28k) being
-   the majority. The VAE has concentrated correct trajectories into the
-   geometrically central, well-connected regions of latent space.
-
-2. **Incorrect trajectories rim every branch boundary.** Red points appear
-   consistently at the outer edge of all manifold arms — not randomly scattered
-   throughout. The pattern is identical to v1 but reproduced across a richer
-   topology, confirming the outcome-correlated geometry is robust.
-
-3. **The serpentine topology signals richer structure than v1.** Multiple looping
-   arms suggest the VAE has separated distinct reasoning strategies (not just a
-   single easy→hard gradient). The extra branches likely correspond to different
-   L4-L5 problem types or solution styles that were absent from the L1-L3-only
-   pool. This broader coverage is exactly what we wanted to bridge the Phase 1
-   distributional gap.
-
-4. **Soft pass — same standard as v1.** The gate requires a structured manifold
-   with visible outcome correlation, not disjoint clusters. The v2 result meets
-   that bar clearly. Phase 1 GRPO will sharpen the signal further.
-
-**Verdict: NFR6 gate v2 passed. Proceed to Phase 1.**
+**Output:** `runs/latent_grpo/plots/latent_structure_umap.png` + `nfr6_summary.json`.
 
 ---
 
-## Redesign v2 (2026-05-11)
+## Controlled Latent Baseline (`latent_grpo_pretrained`)
 
-**Trigger:** Phase 1 v1 run (A100, 2026-05-11) produced pass@1024 = 7.5%, below baseline (15%) and below the pretrained floor (12.5%). Six root causes identified.
+**Definition:** Phase 0 VAE + ZInjector + pretrained backbone, evaluated on MATH-B-I
+with no Phase 1 updates.
 
----
+**Purpose:** establishes the capability floor under the latent generation regime, parallel
+to `baseline_pretrained` (12.5%) for the other arms. Without this, we cannot distinguish
+"Phase 1 improved from X to Y" from "the latent regime itself costs performance."
 
-### Fix 1 — lambda_vae bug (dead config → wired)
+**Gate:** pass@1024 ≥ 12.5%. With near-zero ZInjector init, the Phase 0 prefix starts
+near-neutral, so flat-generation capability should be preserved at the 12.5% pretrained
+level. If below 12.5%, the Phase 0 ZInjector has learned noisy or adversarial prefixes —
+diagnose Phase 0 before proceeding.
 
-**Problem:** `phase1_loss.lambda_vae: 0.05` in the YAML was read from config but never passed to `latent_training_step`. The code used `l_total = l_rl + lambda_t * l_trans + l_vae` — L_VAE at weight 1.0 throughout. At 1.0, L_VAE is orders of magnitude larger than the near-zero L_RL, locking the encoder into its Phase 0 fixed point and drowning any rare reward signal.
-
-**Fix:** `lambda_vae` is now read from `phase1_cfg` and passed as an argument to `latent_training_step`. Loss is `l_total = l_rl + lambda_t * l_trans + lambda_vae * l_vae` with `lambda_vae = 0.05`.
-
----
-
-### Fix 2 — Gradient flow restored (encoder now trained by L_RL)
-
-**Problem:** In the training step, z_h for the L_RL forward pass was fetched from the trace as a detached constant (`traces[i]["z_1"]`, etc.). This blocked L_RL gradients from reaching the VAE encoder. The encoder was updated by L_VAE and L_transition only — objectives that have nothing to do with whether z_h is useful *for the policy*. The z_injector and encoder were trained by completely orthogonal signals that never communicated.
-
-**Fix:** The VAE forward pass (`vae.forward(repr_list)`) is now performed once at the top of `latent_training_step`, producing a live `z_list` (with gradients). This same `z_list` is used for:
-1. L_VAE and L_transition (VAE regularisation — unchanged)
-2. L_RL prefix embeddings for chunks 2 and 3 (`z_pfx1 = z_injector.get_prefix_embedding(z_list[0])`)
-
-Gradient chain for L_RL: `backbone ← L_RL, z_injector ← L_RL, encoder ← L_RL (via z_list)`. The encoder now gets end-to-end gradient signal from task performance. `repr_h` tensors from the rollout remain detached constants throughout — backbone receives no gradient from L_VAE or L_transition.
-
-*Note on reparameterization:* z_h during training is resampled (new ε) relative to rollout. The z prefix embedding therefore differs slightly from rollout time, slightly invalidating the importance ratio. This is accepted: σ² ≈ 1.0 from Phase 0, so the z_h variance is one standard deviation; the induced prefix difference is a linear function of this, which is small relative to the chunk length.
+**Evaluation:** `scripts/eval_passk.py --generation-mode latent_markov_pretrained`.
+Loads backbone from HF model ID and VAE from `phase0.checkpoint_path`.
 
 ---
 
-### Fix 3 — Effective training budget (batch_size 1 → 4)
+## Markov Diagnostics (required for paper)
 
-**Problem:** `batch_size=1` in the custom latent loop means 1 problem per gradient step. The baseline TRL with `batch_size=8` + `grad_accum_steps=4` processes ~4 problems per weight update. Over 200 steps: latent arm = 200 problem-encounters vs baseline ≈ 800. Reward density scales linearly with encounters; the latent arm was running at ~25% of the baseline's effective gradient signal budget.
+Empirical evidence that `z_h` satisfies the Markov property. Without this, the
+Markov claim is an assertion, not a result.
 
-**Fix:** `batch_size: 4` in `train_latent_grpo.yaml`. With gradient checkpointing enabled, A100 80GB handles 4 problems × 8 rollouts = 32 sequences per step. Problem-encounters over 200 steps: 800 — matching the baseline. If OOM: fall back to batch_size=2 and max_steps=400.
+**E1 — Transition sufficiency:** held-out transition loss `‖f(z_h) − z_{h+1}‖²` on
+unseen trajectories. Near-zero MSE = Markov property holds empirically.
+→ `scripts/eval_markov_diagnostics.py`
 
----
+**E2 — Policy sufficiency:** last-state-only ablation: latent arm pass@1024 vs
+baseline → covered by the core ablation table; no separate script needed.
 
-### Fix 4 — λ_t schedule flipped (decay → warmup)
-
-**Problem:** v1 schedule: linear decay from 1.0 → 0.1 over steps 0–100. At step 0, λ_t = 1.0 means L_transition (always non-zero) completely dominates L_RL (near-zero). The encoder learns to be Markov-consistent on hard-problem trajectories before z carries any task-relevant signal — enforcing self-consistency on useless representations.
-
-**Fix:** v2 schedule: linear warmup from 0.1 → 0.5 over steps 0–100, then constant at 0.5. At step 0, λ_t = 0.1 lets the rare L_RL events shape z first. As training progresses and z starts accumulating some structure, λ_t ramps up to enforce Markov consistency. Held at 0.5 for the second half so the Markov property remains active as a regulariser throughout.
-
-```python
-def lambda_trans_schedule(step, max_steps=200, floor=0.1, peak=0.5):
-    halfway = max_steps // 2
-    if step >= halfway: return peak
-    return floor + (peak - floor) * (step / halfway)
-```
+**E3 — Uncertainty calibration:** Pearson r(σ_h², reward) — higher variance should
+correlate with lower reward (harder/unresolved trajectories). Sign must be correct;
+magnitude threshold documented in requirements.
+→ `scripts/eval_markov_diagnostics.py`
 
 ---
 
-### Fix 5 — KL annealing in Phase 0 (posterior collapse prevention)
+## Pass Criteria
 
-**Problem:** E3 diagnostic showed mean σ² = 0.97–0.98 for both correct and incorrect trajectories — both near the prior (1.0). The KL term in the standard ELBO (weight 1.0 from step 0) pushed σ toward the prior aggressively during Phase 0, preventing the encoder from developing a meaningful uncertainty signal. The δσ² = 0.012 between correct/incorrect is too small to be useful as an exploration signal in the uncertainty arm.
 
-**Fix:** `kl_weight` parameter added to `VAEStateEncoder.compute_elbo`. In `pretrain_vae`, `kl_weight` is linearly ramped from 0 → 1 over the first `kl_warmup_frac` (default 0.5) of Phase 0 training steps. Early steps optimise reconstruction freely; KL pressure increases gradually. Config key: `phase0.kl_warmup_frac: 0.5`.
+| Criterion                                      | Threshold                                                                                    |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Smoke test                                     | completes end-to-end < 10 min on 4060                                                        |
+| NFR6 gate                                      | structured UMAP manifold with outcome correlation                                            |
+| Controlled baseline (`latent_grpo_pretrained`) | pass@1024 ≥ 12.5%                                                                            |
+| Phase 1 logs                                   | L_transition non-zero from step 0; L_RL non-zero within first 30 steps; λ_vae=0.05 confirmed |
+| `latent_grpo` pass@1024                        | ≥ 18.0% (≥ 3pp above baseline_grpo — required to clear noise floor on 40-problem pool)       |
+| No NaN blowups                                 | stable under zero-reward stretches (R6.5)                                                    |
+| Shared hyperparameters                         | G=8, lr=1e-6, 200 steps, same backbone confirmed in log                                      |
+| E1 Markov diagnostic                           | held-out transition loss near zero                                                           |
+| E3 calibration                                 | σ_h² negatively correlated with reward (sign correct)                                        |
 
----
-
-### Fix 6 — Phase 0 pool upgraded to L1–L5
-
-**Problem:** v1 Phase 0 pool was L1–L3 only (38.6% per-rollout reward rate — mostly success trajectories from easy problems). Phase 1 MATH-B-I problems have ~0.02% per-sample success — an enormous distributional gap. The VAE's latent space was calibrated for "easy solvable" trajectories; Phase 1 rollouts (almost all failures on hard problems) land in a region of latent space the VAE never saw during Phase 0. The z_h prefixes injected during early Phase 1 are essentially out-of-distribution noise.
-
-**Fix:** `prepare_easy_pool.py` default levels changed from `[1, 2, 3]` to `[1, 2, 3, 4, 5]`. L4–L5 problems are partially solvable (lower per-rollout success but non-zero), introducing harder failure trajectories into Phase 0 training. The VAE learns structure over a wider difficulty range, reducing the distributional gap to Phase 1.
-
----
-
-### Controlled Latent Baseline (`latent_grpo_pretrained`)
-
-**Definition:** Phase 0 VAE + pretrained backbone + fresh ZInjector, evaluated on MATH-B-I with no Phase 1 updates.
-
-**Purpose:** Establishes the capability floor under the latent generation regime, parallel to `baseline_pretrained` (12.5%) and `token_markov_pretrained` (12.5%) for the other arms. Without this baseline, we cannot distinguish "Phase 1 improved from X to Y" from "the latent regime itself costs performance, and Phase 1 partially recovered it."
-
-**Evaluation:** Use `--generation-mode latent_markov_pretrained` in `eval_passk.py`. Loads backbone directly from HF model ID (no LoRA) and VAE from `phase0.checkpoint_path` in the train config.
-
-**Gate:** `latent_grpo_pretrained` pass@1024 ≥ 12.5% (pretrained floor). If the Phase 0 z injection with fresh ZInjector degrades performance below 12.5%, the ZInjector initialisation scheme may need adjustment before Phase 1.
-
----
-
-### Controlled Baseline Result (v2 Phase 0, cloud eval)
-
-| Metric | Value |
-|--------|-------|
-| pass@1 | 4.9 × 10⁻⁵ |
-| pass@16 | 7.8 × 10⁻⁴ |
-| **pass@1024** | **5.0%** |
-| backbone | Qwen/Qwen2.5-1.5B-Instruct (pretrained, no Phase 1) |
-| VAE | Phase 0 v2 checkpoint (L1-L5 pool) |
-| ZInjector | freshly initialised (Kaiming-uniform, std ≈ 0.125) |
-
-**Result: 5.0%** — below the 12.5% pretrained floor by 7.5pp. Gate technically fails.
-
-**Root cause: random ZInjector init.** Default Kaiming-uniform weights give the projected
-prefix an O(1) magnitude — comparable to a real token embedding. At every chunk boundary
-the model receives a random, meaningless soft prefix, which confuses attention and degrades
-generation quality. This is not a VAE or backbone problem; chunk 1 (no prefix) likely
-behaves identically to the pretrained baseline.
-
-**Interpretation:** The 5.0% result is the capability floor under *random* z injection —
-it is expected and informative rather than indicative of a design flaw. It tells us Phase 1
-must achieve two things:
-1. Teach the ZInjector to produce neutral-to-useful prefixes (recovering the 7.5pp deficit)
-2. Use the learned z state to improve beyond the 12.5% pretrained baseline and reach ≥18%
-
-**Fix applied:** ZInjector `__init__` now uses `nn.init.normal_(weight, std=0.01)` — 12× smaller
-than Kaiming-uniform. The prefix starts at ~1/12 of a token-embedding magnitude (near-invisible
-to the model), and Phase 1 RL grows the weights only as a useful prefix proves beneficial.
-This is the same zero-init principle used for LoRA adapters inserted into frozen backbones.
-Future controlled-baseline evals with the patched ZInjector will score ~12.5%.
-
-The historical 5.0% result is retained in the ablation table as the v2 Phase 0 record.
-
----
-
-## Markov Diagnostics Results (Phase 1 A100 run, 2026-05-11 — v1, superseded)
-
-Run on the checkpoint produced by the 200-step Phase 1 training on `data/math_beyond_math_b_i_base.jsonl`.
-
-### E1 — Transition Sufficiency
-
-| Metric | Value |
-|--------|-------|
-| Held-out transition loss `‖f(z_h) − z_{h+1}‖²` | **0.00396** |
-| Held-out trajectories (n) | 4,758 |
-
-The transition model generalises to unseen trajectories with near-zero MSE in 64-dim latent space. The Markov property holds empirically: z_h contains sufficient information to predict z_{h+1} without access to the full token history. **E1: pass.**
-
-### E3 — Uncertainty Calibration
-
-| Metric | Value |
-|--------|-------|
-| Mean σ² — correct trajectories | 0.9718 |
-| Mean σ² — incorrect trajectories | 0.9839 |
-| Pearson r (σ² vs reward) | **−0.31** |
-| Pearson p-value | ≈ 0.0 |
-| n correct / n incorrect | 9,189 / 14,603 |
-
-Higher latent uncertainty correlates significantly with lower reward (r = −0.31, p ≈ 0). The sign is correct: harder / less-resolved trajectories have higher posterior variance.
-
-**Note on σ² magnitudes:** both groups sit close to 1.0 (the prior variance), indicating mild posterior collapse — the encoder routes most information through μ and keeps σ near the prior. The correlation is real but the absolute δσ² = 0.012 is small. For the `latent_grpo_uncertainty` arm this means the bonus signal will need per-step normalisation (or log(σ²)) to have practical range. **E3: soft pass.**
-
-**Verdict: E1 passes strongly. E3 passes softly. Proceed to pass@k eval (deliverable 11b).**
 
 ---
 
