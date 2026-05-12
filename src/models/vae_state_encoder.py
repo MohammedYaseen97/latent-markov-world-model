@@ -311,6 +311,14 @@ class ZInjector(nn.Module):
     ) -> None:
         super().__init__()
         self.proj = nn.Linear(latent_dim, hidden_dim, bias=False)
+        # Near-zero init: default Kaiming-uniform gives std ≈ 0.125, making the
+        # prefix embedding ~O(1) — same magnitude as a real token embedding —
+        # which injects random noise and degrades the pretrained model immediately.
+        # Starting at std=0.01 keeps the prefix ~12× smaller than a token embedding,
+        # making it effectively neutral at init.  Phase 1 RL will grow the weights
+        # only as far as a useful z prefix helps the policy (same principle as LoRA
+        # zero-init for new adapter parameters inserted into a frozen backbone).
+        nn.init.normal_(self.proj.weight, mean=0.0, std=0.01)
 
     def get_prefix_embedding(self, z: torch.Tensor) -> torch.Tensor:
         """Project z into a prefix embedding vector.
