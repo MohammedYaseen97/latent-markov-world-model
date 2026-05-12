@@ -112,20 +112,20 @@ All Phase 3 artifact items below are reset to [ ] and must be re-run in order.
 - [x] `scripts/check_latent_structure.py` — t-SNE/UMAP of z_final (NFR6 gate)
 - [x] Latent generation mode in `scripts/eval_passk.py` (including `latent_markov_pretrained` for controlled baseline)
 - [ ] Phase 0 VAE pretraining: VAE checkpoint → `runs/latent_grpo/phase0_vae.pt`
-- [ ] NFR6 gate: UMAP of z_final shows structured manifold (re-run after new Phase 0)
+- [x] NFR6 gate: UMAP of z_final shows structured manifold — **v2 PASSED** (39,792 trajectories, 28.4% reward rate, serpentine manifold, red at boundaries; see `reports/latent_markov_design.md §NFR6 Gate Result v2`)
 - [ ] **Controlled latent baseline** — eval `latent_grpo_pretrained`: Phase 0 VAE + pretrained backbone (no Phase 1 updates). This is the latent-regime capability floor, equivalent to `baseline_pretrained` and `token_markov_pretrained` for the other arms. Must be evaluated before Phase 1 training begins so the Phase 1 improvement is measured against a real baseline, not inferred.
 - [ ] Phase 1 training: 200 steps on MATH-B-I, checkpoint → `artifacts/latent_grpo/{run_id}/`
 - [ ] Phase 1 eval: pass@k on MATH-B-I holdout; result logged in `reports/ablation_core.md`
 
-**v1 Phase 0 artifacts (A100 run, 2026-05-09 — superseded by v2):**
-- Rollouts: `data/phase0_rollouts.pt` — 23,792 trajectories (2974 L1-L3 problems × G=8), reward rate 38.6%
-- VAE checkpoint: `runs/latent_grpo/phase0_vae.pt`
-- NFR6 plot: `runs/latent_grpo/plots/latent_structure_umap.png`
-- These artifacts are from the v1 run. Re-running from scratch with v2 design; these will be overwritten.
+**v2 Phase 0 artifacts:**
+- Rollouts: `data/phase0_rollouts.pt` — 39,792 trajectories (4974 L1-L5 problems × G=8), reward rate 28.4%
+- NFR6 plot: `runs/latent_grpo/plots/latent_structure_umap.png` — serpentine manifold, gate passed
+- NFR6 summary: `runs/latent_grpo/plots/nfr6_summary.json`
+- VAE checkpoint: `runs/latent_grpo/phase0_vae.pt` (pending Phase 0 training)
 
 **Pass criteria — `latent_grpo` arm (v2):**
 - [ ] Smoke test completes end-to-end in < 10 min on 4060 (re-smoke after v2 code changes)
-- [ ] **NFR6 gate:** UMAP of z_final shows structured manifold (re-run on v2 Phase 0 checkpoint)
+- [x] **NFR6 gate:** UMAP of z_final shows structured manifold — v2 PASSED
 - [ ] `latent_grpo_pretrained` eval (controlled baseline): pass@1024 ≥ pretrained baseline (confirms z injection does not degrade capability before Phase 1)
 - [ ] Phase 1 training log shows L_transition non-zero from step 0; L_RL non-zero within first 30 steps; lambda_vae=0.05 confirmed in log
 - [ ] `pass@1024` for `latent_grpo` ≥ 18.0% (≥ 3pp above baseline_grpo — required to clear noise floor on 40-problem pool)

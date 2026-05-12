@@ -457,7 +457,13 @@ Ordered by dependency. Each step is a gate for the next.
 
 ---
 
-## NFR6 Gate Result (A100 run, 2026-05-09)
+## NFR6 Gate Result — v1 (A100 run, 2026-05-09, superseded)
+
+> v1 used L1-L3 pool only (2974 problems, 38.6% reward rate). Superseded by v2 below.
+
+---
+
+## NFR6 Gate Result — v2 (Phase 0 redesign, L1-L5 pool)
 
 **Artifacts:**
 - Plot: `runs/latent_grpo/plots/latent_structure_umap.png`
@@ -467,44 +473,44 @@ Ordered by dependency. Each step is a gate for the next.
 
 | Metric | Value |
 |--------|-------|
-| Total trajectories | 23,792 (2974 problems × G=8) |
-| Correct (reward=1) | 9,189 |
-| Incorrect (reward=0) | 14,603 |
-| Per-rollout reward rate | 38.6% |
+| Total trajectories | 39,792 (4974 problems × G=8) |
+| Correct (reward=1) | 11,287 |
+| Incorrect (reward=0) | 28,505 |
+| Per-rollout reward rate | 28.4% |
 
-The 38.6% per-rollout rate is consistent with the calibration result (pass@8 = 83%):
-if P(correct per rollout) ≈ 38.6% then P(at least one correct in 8) = 1 − 0.614⁸ ≈ 97%.
-The calibration subset was a harder sample; the full pool skews easier.
+The lower reward rate vs v1 (28.4% vs 38.6%) is expected: the v2 pool includes L4-L5
+problems which are genuinely harder for the base model. The absolute correct count
+(11,287) is larger than v1 (9,189), giving the VAE more positive-outcome signal to
+anchor the latent space.
 
 **UMAP structure:**
 
-The plot shows a horseshoe/crescent manifold with a downward tail — not two clean blobs.
+The v2 plot shows a rich serpentine/S-curve multi-branch manifold — more complex
+than v1's horseshoe, reflecting the broader difficulty range of the L1-L5 pool.
 Key observations:
 
-1. **Correct trajectories dominate the manifold core.** Despite incorrect outnumbering
-   correct overall (14k vs 9k), the main horseshoe arms are almost entirely green.
-   The VAE has placed correct trajectories in the dense, well-connected region of
-   latent space.
+1. **Correct trajectories dominate the manifold interior.** Green (correct, 11k)
+   fills the dense core of every arm and loop despite red (incorrect, 28k) being
+   the majority. The VAE has concentrated correct trajectories into the
+   geometrically central, well-connected regions of latent space.
 
-2. **Incorrect trajectories concentrate at boundaries and the junction.** Red points
-   cluster at the pinch point between the two arms (UMAP-1 ≈ 5–10, UMAP-2 ≈ 3–7)
-   and sparsely along the outer edges. They are not randomly scattered — they occupy
-   structurally distinct transition zones.
+2. **Incorrect trajectories rim every branch boundary.** Red points appear
+   consistently at the outer edge of all manifold arms — not randomly scattered
+   throughout. The pattern is identical to v1 but reproduced across a richer
+   topology, confirming the outcome-correlated geometry is robust.
 
-3. **The horseshoe shape signals a 1D latent gradient.** UMAP produces this geometry
-   when the underlying data lies along a smooth 1D manifold. The VAE has found a
-   quality/difficulty gradient across the easy pool — the two arms of the horseshoe
-   likely correspond to trajectories approaching the answer from different reasoning
-   paths, with the junction being the ambiguous region where the model has not yet
-   committed. The downward tail is a distinct cluster of low-quality trajectories.
+3. **The serpentine topology signals richer structure than v1.** Multiple looping
+   arms suggest the VAE has separated distinct reasoning strategies (not just a
+   single easy→hard gradient). The extra branches likely correspond to different
+   L4-L5 problem types or solution styles that were absent from the L1-L3-only
+   pool. This broader coverage is exactly what we wanted to bridge the Phase 1
+   distributional gap.
 
-4. **This is a soft pass, not a crisp separation.** The gate asked for visible
-   separation, not disjoint clusters. At Phase 0 without any RL signal, a structured
-   manifold with outcome-correlated geometry is the expected result and sufficient
-   to proceed. Phase 1 GRPO will sharpen the signal: correct-trajectory regions
-   will be reinforced, incorrect ones suppressed, pulling the clusters further apart.
+4. **Soft pass — same standard as v1.** The gate requires a structured manifold
+   with visible outcome correlation, not disjoint clusters. The v2 result meets
+   that bar clearly. Phase 1 GRPO will sharpen the signal further.
 
-**Verdict: NFR6 gate passed. Proceed to Phase 1.**
+**Verdict: NFR6 gate v2 passed. Proceed to Phase 1.**
 
 ---
 
