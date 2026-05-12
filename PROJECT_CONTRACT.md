@@ -95,11 +95,10 @@ Before treating the core table as final:
 **Deliverables — `latent_grpo` arm:**
 - [x] Phase 0 dataset: `data/math_easy_pool.jsonl` — L1–L5, 4974 problems (reusable)
 - [x] `src/models/vae_state_encoder.py` — `VAEStateEncoder` (encoder, decoder, transition) + `OutcomeHead`; `ZInjector` with near-zero init (std=0.01); `compute_elbo(kl_weight)`
-- [ ] `src/training/grpo_latent.py` — Phase 1 training loop (`train_latent` ✅); `generate_latent_traces` and `latent_training_step` need update: stores chunk_ids + reward only (no repr_h/z_h/log_π_old), full pipeline re-run with grad (IS = 1, no ε-correction); KL warmup, λ_t warmup, λ_vae=0.05, batch_size=4
-- [x] `configs/train_latent_grpo.yaml` — full Phase 1 config (200 steps, batch_size=4, λ_vae=0.05, kl_warmup_frac=0.5)
+- [x] `src/training/grpo_latent.py` — `pretrain_vae_online` (Phase 0: frozen backbone, online generation, VAE+ZInjector+OutcomeHead update); `generate_latent_traces` (stores chunk_ids+reward only); `latent_training_step` (full live pipeline re-run, IS=1, no ε-correction); `train_latent` (loads ZInjector from Phase 0 ckpt, unfrozen backbone GRPO)
+- [x] `configs/train_latent_grpo.yaml` — updated for v3: Phase 0 online (200 steps, batch_size=4, G=8), Phase 1 (200 steps, batch_size=4, λ_vae=0.05, kl_warmup_frac=0.5)
 - [x] `scripts/check_latent_structure.py` — UMAP of z_final (NFR6 gate)
 - [x] Latent eval modes in `scripts/eval_passk.py` (`latent_markov`, `latent_markov_pretrained`)
-- [ ] `pretrain_vae_online()` in `src/training/grpo_latent.py` — Phase 0 online loop: frozen backbone, live 3-chunk generation, VAE + ZInjector update
 - [ ] Smoke test re-run after `pretrain_vae_online()` implementation (`configs/train_latent_grpo_smoke.yaml`)
 - [ ] Phase 0 training: `runs/latent_grpo/phase0_vae.pt`
 - [ ] NFR6 gate: UMAP of z_final on Phase 0 checkpoint

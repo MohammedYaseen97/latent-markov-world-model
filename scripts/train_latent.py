@@ -14,7 +14,7 @@ Usage:
         --config configs/train_latent_grpo.yaml \
         --phase 0
 
-    # Phase 1 — joint RL (not yet implemented):
+    # Phase 1 — joint RL:
     python scripts/train_latent.py \
         --config configs/train_latent_grpo.yaml \
         --phase 1
@@ -34,7 +34,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.utils.config_loader import load_yaml_with_extends
 from src.utils.seeding import set_seed
-from src.training.grpo_latent import pretrain_vae, train_latent
+from src.training.grpo_latent import pretrain_vae_online, train_latent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,7 +89,7 @@ def main() -> None:
     }, indent=2))
 
     if args.phase == 0:
-        pretrain_vae(config, run_dir)
+        pretrain_vae_online(config, run_dir)
     else:
         train_latent(config, run_dir)
 

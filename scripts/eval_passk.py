@@ -760,6 +760,8 @@ def _estimate_pass_at_k_metrics_latent_pretrained(
     vae.eval()
 
     z_injector = ZInjector(latent_dim=latent_dim, hidden_dim=hidden_dim).to(device)
+    if "z_injector" in ckpt:
+        z_injector.load_state_dict(ckpt["z_injector"])
     z_injector.eval()
 
     n_per_problem   = int(eval_cfg.get("latent_eval_n_per_problem", 8))

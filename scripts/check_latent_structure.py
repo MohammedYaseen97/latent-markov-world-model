@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint-path",
         type=Path,
         required=True,
-        help="Path to phase0_vae.pt produced by pretrain_vae().",
+        help="Path to phase0_vae.pt produced by pretrain_vae_online().",
     )
     p.add_argument(
         "--output-dir",
