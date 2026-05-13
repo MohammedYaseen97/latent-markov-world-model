@@ -100,8 +100,8 @@ Before treating the core table as final:
 - [x] `scripts/run_nfr6_gate.py` — UMAP of z_final (NFR6 gate, v3-correct: full trained pipeline)
 - [x] Latent eval modes in `scripts/eval_passk.py` (`latent_markov`, `latent_markov_pretrained`)
 - [ ] Smoke test re-run after `pretrain_vae_online()` implementation (`configs/train_latent_grpo_smoke.yaml`)
-- [ ] Phase 0 training: `runs/latent_grpo/phase0_vae.pt`
-- [ ] NFR6 gate: UMAP of z_final on Phase 0 checkpoint
+- [x] Phase 0 training: `runs/latent_grpo/phase0_vae.pt` — 200 steps, final L_recon=17.1, L_out=0.529, L_trans=2.04
+- [x] NFR6 gate: UMAP of z_final on Phase 0 checkpoint — **PASSED** (see result below)
 - [ ] Controlled latent baseline eval (`latent_grpo_pretrained`): pass@1024 ≥ 12.5%
 - [ ] Phase 1 training: 200 steps on MATH-B-I → `artifacts/latent_grpo/{run_id}/`
 - [ ] Phase 1 eval: pass@k logged in `reports/ablation_core.md`
@@ -109,7 +109,7 @@ Before treating the core table as final:
 
 **Pass criteria:**
 - [ ] Smoke test < 10 min on 4060
-- [ ] NFR6 gate: structured UMAP manifold with outcome-correlated geometry
+- [x] NFR6 gate: structured UMAP manifold with outcome-correlated geometry — **PASSED** 2026-05-14: clear diagonal manifold, green concentration on right cluster, 290/1600 correct (18.1% reward rate)
 - [ ] `latent_grpo_pretrained` pass@1024 ≥ 12.5% (near-zero ZInjector init must preserve pretrained capability)
 - [ ] Phase 1 log: L_transition non-zero from step 0; L_RL non-zero within first 30 steps; λ_vae=0.05 confirmed
 - [ ] `latent_grpo` pass@1024 ≥ 18.0% (≥ 3pp above baseline_grpo)

@@ -709,8 +709,7 @@ def _estimate_pass_at_k_metrics_latent_pretrained(
     the other arms.
 
     The backbone is identified from train_cfg["primary"]["huggingface_repo_id"].
-    The Phase 0 VAE is loaded from train_cfg["phase0"]["checkpoint_path"].
-    ZInjector weights are randomly initialised (not trained by Phase 1).
+    The Phase 0 VAE and ZInjector are loaded from train_cfg["phase0"]["checkpoint_path"].
 
     Args:
         problems:  list of problem dicts from the eval JSONL pool.

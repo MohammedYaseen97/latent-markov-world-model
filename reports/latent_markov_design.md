@@ -500,9 +500,9 @@ learned it from pretraining — not raw token statistics, but also not provably
 representations during training:
 
 1. **L_outcome (Phase 0):** directly rewards z_final for retaining information predictive
-  of correct vs incorrect trajectories on easier math problems.
+   of correct vs incorrect trajectories on easier math problems.
 2. **L_transition (both phases):** forces z_h to retain information predictive of z_{h+1},
-  which rewards trajectory-structure information over surface syntax.
+   which rewards trajectory-structure information over surface syntax.
 3. **L_RL (Phase 1, sparse):** when it fires, rewards z_h values associated with
   successful reasoning paths.
 
@@ -619,15 +619,15 @@ Ordered by dependency. Each step is a gate for the next.
 | 2   | `VAEStateEncoder` — encoder, decoder, transition; `compute_elbo(kl_weight)`                                       | `src/models/vae_state_encoder.py`      | ✅                   |
 | 3   | `OutcomeHead` — 2-layer MLP on z_final, Phase 0 only                                                              | `src/models/vae_state_encoder.py`      | ✅                   |
 | 4   | `ZInjector` — near-zero init (std=0.01)                                                                           | `src/models/vae_state_encoder.py`      | ✅                   |
-| 5   | `pretrain_vae_online()` — Phase 0 online loop: frozen backbone, live generation, VAE+ZInjector update             | `src/training/grpo_latent.py`          | ⬜ implement         |
+| 5   | `pretrain_vae_online()` — Phase 0 online loop: frozen backbone, live generation, VAE+ZInjector update             | `src/training/grpo_latent.py`          | ✅                   |
 | 6   | `train_latent()` — Phase 1 custom GRPO loop                                                                       | `src/training/grpo_latent.py`          | ✅                   |
-| 7   | `generate_latent_traces()` — chunked inference engine with z injection, repr hook; stores chunk_ids + reward only | `src/training/grpo_latent.py`          | ⬜ update            |
-| 8   | `latent_training_step()` — re-runs full pipeline with grad; L_RL + λ_t·L_trans + λ_vae·L_VAE; IS = 1              | `src/training/grpo_latent.py`          | ⬜ update            |
+| 7   | `generate_latent_traces()` — chunked inference engine with z injection, repr hook; stores chunk_ids + reward only | `src/training/grpo_latent.py`          | ✅                   |
+| 8   | `latent_training_step()` — re-runs full pipeline with grad; L_RL + λ_t·L_trans + λ_vae·L_VAE; IS = 1              | `src/training/grpo_latent.py`          | ✅                   |
 | 9   | Smoke config                                                                                                      | `configs/train_latent_grpo_smoke.yaml` | ⬜ re-smoke after #5 |
 | 10  | Full Phase 1 config (200 steps, batch_size=4)                                                                     | `configs/train_latent_grpo.yaml`       | ✅                   |
 | 11  | Latent eval modes in eval_passk.py (`latent_markov`, `latent_markov_pretrained`)                                  | `scripts/eval_passk.py`                | ✅                   |
-| 12  | **Phase 0 training run** → `runs/latent_grpo/phase0_vae.pt`                                                       | `scripts/train_latent.py`              | ⬜ pending #5        |
-| 13  | **NFR6 gate** — UMAP of z_final on Phase 0 checkpoint                                                             | `scripts/run_nfr6_gate.py`             | ⬜ pending #12       |
+| 12  | **Phase 0 training run** → `runs/latent_grpo/phase0_vae.pt`                                                       | `scripts/train_latent.py`              | ✅ 200 steps done    |
+| 13  | **NFR6 gate** — UMAP of z_final on Phase 0 checkpoint                                                             | `scripts/run_nfr6_gate.py`             | ✅ **PASSED**        |
 | 14  | **Controlled latent baseline** eval: `latent_grpo_pretrained` pass@1024 ≥ 12.5%                                   | `scripts/eval_passk.py`                | ⬜ pending #12       |
 | 15  | **Phase 1 training** — 200 steps on MATH-B-I                                                                      | `configs/train_latent_grpo.yaml`       | ⬜ pending #14       |
 | 16  | **Phase 1 eval** — pass@k on MATH-B-I holdout                                                                     | `scripts/eval_passk.py`                | ⬜ pending #15       |
@@ -657,6 +657,30 @@ clusters — UMAP topology with outcome-correlated layout suffices.
 (extend KL warmup). Do not proceed to Phase 1 on a gate failure.
 
 **Output:** `runs/latent_grpo/plots/latent_structure_umap.png` + `nfr6_summary.json`.
+
+### NFR6 Result — Phase 0 run (2026-05-14) ✅ PASSED
+
+```
+n_correct:   290
+n_incorrect: 1310
+reward_rate: 18.1%   (290 / 1600 trajectories; 200 problems × 8 rollouts)
+method:      UMAP
+```
+
+**Interpretation:** The UMAP reveals a clear diagonal manifold (smooth band from
+(0, 12) to (14, 4) in 2-D projection) — the VAE has organised backbone hidden
+states into a geometrically coherent low-dimensional structure after only 200
+frozen-backbone steps.  Correct trajectories (green) are not uniformly scattered:
+they concentrate noticeably in the right-side cluster (~UMAP-1: 11–15,
+UMAP-2: 4–9), producing visible outcome-correlated spatial structure.
+
+The separation is weak but real, consistent with the trainer-state diagnostics
+(L_out: 0.644 → 0.529 over 200 steps, down from random BCE of 0.693).  Perfect
+disjoint clustering is not expected at Phase 0 with a frozen backbone — Phase 1
+joint RL training is where this structure should deepen as the backbone and VAE
+co-adapt under L_RL.
+
+**Gate verdict:** manifold is structured and outcome-correlated — proceed to Phase 1.
 
 ---
 
