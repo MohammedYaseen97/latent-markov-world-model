@@ -54,6 +54,7 @@ from src.training.grpo_latent import (
     OutcomeHead,
     N_CHUNKS,
 )
+from src.utils.config_loader import load_yaml_with_extends
 
 
 # ---------------------------------------------------------------------------
@@ -110,32 +111,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Config loading (mirrors train_latent.py logic — handles extends)
-# ---------------------------------------------------------------------------
-
-def _load_config(path: Path) -> dict[str, Any]:
-    import yaml
-
-    def _load_yaml(p: Path) -> dict:
-        with p.open(encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-
-    def _deep_merge(base: dict, override: dict) -> dict:
-        out = dict(base)
-        for k, v in override.items():
-            if k in out and isinstance(out[k], dict) and isinstance(v, dict):
-                out[k] = _deep_merge(out[k], v)
-            else:
-                out[k] = v
-        return out
-
-    cfg = _load_yaml(path)
-    if "extends" in cfg:
-        parent_path = path.parent / cfg.pop("extends")
-        parent = _load_yaml(parent_path)
-        cfg = _deep_merge(parent, cfg)
-    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +346,7 @@ def plot_and_save(
 
 def main() -> None:
     args   = parse_args()
-    config = _load_config(args.config)
+    config = load_yaml_with_extends(args.config.resolve(), root=REPO_ROOT)
 
     nfr6_cfg   = config.get("nfr6", {})
     output_dir = args.output_dir or Path(nfr6_cfg.get("output_dir", "runs/latent_grpo/plots"))
