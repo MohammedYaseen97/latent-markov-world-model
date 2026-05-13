@@ -53,10 +53,11 @@ phase0:
   save_steps: 10
 
 # ---------------------------------------------------------------------------
-# NFR6 diagnostic (check_latent_structure.py)
+# NFR6 diagnostic — run_nfr6_gate.py
+#   python scripts/run_nfr6_gate.py --config configs/train_latent_grpo_smoke.yaml \
+#       --n-problems 10 --n-rollouts 2
 # ---------------------------------------------------------------------------
 nfr6:
-  checkpoint_path: "runs/latent_grpo_smoke/phase0_vae.pt"
   output_dir: "runs/latent_grpo_smoke/plots"
   method: "tsne"
 

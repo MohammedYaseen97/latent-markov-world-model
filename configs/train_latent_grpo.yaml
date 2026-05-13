@@ -9,17 +9,30 @@
 # Inherits shared training knobs (lr, G, backbone, dtype) from
 # train_baseline_grpo.yaml. Only latent-specific fields are set here.
 #
-# Usage:
-#   # 0. Prepare easy pool (one-time, pulls from HuggingFace)
+# Usage (run in order):
+#   # 0. Prepare easy pool (one-time)
 #   python scripts/prepare_easy_pool.py
 #
 #   # 1. Phase 0 — online VAE pretraining (A100, ~4-5 h for 200 steps)
-#   python scripts/train_latent.py \
-#       --config configs/train_latent_grpo.yaml --phase 0
+#   python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 0
 #
-#   # 2. Phase 1 — joint RL (only after Phase 0 completes)
-#   python scripts/train_latent.py \
-#       --config configs/train_latent_grpo.yaml --phase 1
+#   # 2. NFR6 gate — MUST pass before Phase 1 (full pipeline inference, ~10 min)
+#   python scripts/run_nfr6_gate.py --config configs/train_latent_grpo.yaml \
+#       --n-problems 200 --n-rollouts 2
+#
+#   # 3. Controlled latent baseline eval (pretrained backbone + Phase 0 VAE, ~2-3 h)
+#   python scripts/eval_passk.py --generation-mode latent_markov_pretrained \
+#       --train-config configs/train_latent_grpo.yaml --arm latent_grpo_pretrained \
+#       --output runs/latent_grpo/eval_pretrained.json
+#
+#   # 4. Phase 1 — joint RL (A100, ~5-6 h for 200 steps)
+#   python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 1
+#
+#   # 5. Phase 1 eval (find run_id from Phase 1 log output)
+#   PHASE1_CKPT=$(ls -td artifacts/latent_grpo/*/phase1/final | head -1)
+#   python scripts/eval_passk.py --generation-mode latent_markov \
+#       --train-config configs/train_latent_grpo.yaml --checkpoint "$PHASE1_CKPT" \
+#       --arm latent_grpo --output runs/latent_grpo/eval_phase1.json
 
 extends: "configs/train_baseline_grpo.yaml"
 
@@ -107,9 +120,15 @@ phase1_loss:
   lambda_vae: 0.05          # L_VAE is scaled by this throughout Phase 1
 
 # ---------------------------------------------------------------------------
-# NFR6 diagnostic (check_latent_structure.py)
+# NFR6 diagnostic — run_nfr6_gate.py (v3-correct gate)
+#
+# Uses the FULL trained pipeline (backbone + trained ZInjector + trained VAE)
+# so that repr_h values come from the same z-injected distribution the encoder
+# was trained on.  DO NOT use generate_phase0_rollouts.py (base backbone only).
+#
+#   python scripts/run_nfr6_gate.py --config configs/train_latent_grpo.yaml \
+#       --n-problems 200 --n-rollouts 2
 # ---------------------------------------------------------------------------
 nfr6:
-  checkpoint_path: "runs/latent_grpo/phase0_vae.pt"
   output_dir: "runs/latent_grpo/plots"
   method: "umap"            # umap preferred on large datasets (faster than tsne)
