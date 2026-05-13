@@ -377,7 +377,13 @@ L_out     =  BCE(outcome_head(z_final), r)
 L_phase0  =  L_ELBO  +  λ_trans · L_trans  +  λ_out · L_out
 ```
 
-Default weights: `λ_trans = 1.0`, `λ_out = 1.0`. Specified in config.
+Default weights: `λ_trans_peak = 3.0`, `λ_out = 5.0`. Specified in config.
+
+Calibration rationale (observed L_ELBO ≈ 20 on the easy pool):
+- λ_trans_peak=3.0 gives L_trans ~22% of gradient budget (previously 0.5 gave ~4%,
+  leaving the transition model completely flat over 200 steps in the first cloud run).
+- λ_out=5.0 gives L_out ~9% of gradient budget (previously 1.0 gave ~2%, insufficient
+  to teach z_3 to encode outcome quality before Phase 1).
 
 **KL annealing:** `kl_weight` ramps linearly from 0 → 1 over the first `kl_warmup_frac`
 (default 0.5) of Phase 0 steps. Without annealing, the KL term from step 0 drives σ²
@@ -426,24 +432,27 @@ L_phase1     =  L_RL  +  λ_t × L_transition  +  λ_vae × L_VAE
 **λ_t schedule (transition loss weight):**
 
 ```python
-def lambda_trans_schedule(step, max_steps=200, floor=0.1, peak=0.5):
+def lambda_trans_schedule(step, max_steps=200, floor=0.1, peak=1.0):
     halfway = max_steps // 2
     if step >= halfway: return peak
     return floor + (peak - floor) * (step / halfway)
 ```
 
-Warmup 0.1 → 0.5 over steps 0–100, then constant at 0.5.
+Warmup 0.1 → 1.0 over steps 0–100, then constant at 1.0.
 
 Rationale: At step 0, L_RL is near-zero (sparse reward, hard problems). Starting
 λ_t = 0.1 lets the rare early reward events shape z before the Markov consistency
-constraint locks in structure. As z accumulates signal, λ_t ramps to enforce Markov
-consistency. Held at 0.5 for the second half so L_transition remains an active
-regulariser throughout. Starting at the old high value (1.0) would force Markov
-self-consistency on useless early representations.
+constraint locks in structure. Phase 1 peak is 1.0 (not 3.0) because L_RL must be
+the primary driver in Phase 1: with L_RL ≈ 1–3 and L_trans ≈ 2 at peak=1.0,
+L_RL gets ~40–50% of gradient budget. Phase 0 uses peak=3.0 to aggressively train
+the transition model from scratch (see Phase 0 section).
 
-**λ_vae = 0.05.** L_VAE at weight 1.0 is orders of magnitude larger than near-zero
-L_RL, which would lock the encoder into its Phase 0 fixed point and drown any sparse
-reward signal. 0.05 keeps VAE regularisation active without dominating.
+**λ_vae = 0.05.** L_VAE at weight 1.0 is much larger than L_RL early in Phase 1
+(sparse reward → L_RL near zero), which would lock the encoder into its Phase 0 fixed
+point and drown any sparse reward signal. 0.05 keeps VAE regularisation active without
+dominating. Approximate Phase 1 loss budget at peak (L_RL ≈ 2, L_trans ≈ 2, L_vae ≈ 1):
+L_RL 40%, L_trans 40%, L_vae 20%. L_RL is the primary driver; L_trans maintains Markov
+structure; L_vae anchors the encoder.
 
 **Phase 1 is structurally identical to Phase 0** except: (a) the backbone is unfrozen,
 (b) L_RL replaces L_out, (c) G=8 rollouts are collected per problem before the training
@@ -555,15 +564,15 @@ and the NFR6 t-SNE gate.
 | Phase 0 G (rollouts per problem) | 8                                          | variance in outcome labels; richer L_out supervision      |
 | Phase 0 generation               | live, online (z-injected, frozen backbone) | eliminates Phase 0→1 distribution mismatch                |
 | Phase 0 KL warmup                | kl_weight 0→1 over first 50% of steps      | prevents posterior collapse                               |
-| Phase 0 λ_trans                  | warmup schedule (same as Phase 1)          | avoids early over-constraint                              |
-| Phase 0 λ_out                    | 1.0                                        | config knob                                               |
+| Phase 0 λ_trans_peak             | 3.0 (warmup 0.1→3.0 over first 100 steps) | ~22% of gradient budget; calibrated from observed L_ELBO ≈ 20 |
+| Phase 0 λ_out                    | 5.0                                        | ~9% of gradient budget; 1.0 gave only 2% (insufficient)  |
 | Phase 0 λ_elbo                   | 1.0                                        | config knob                                               |
 | Phase 1 max_steps                | 200                                        | budget                                                    |
 | Phase 1 batch_size               | 4                                          | 800 problem-encounters; matches baseline gradient density |
 | Phase 1 G (rollouts per problem) | 8                                          | locked                                                    |
 | Phase 1 lr                       | 1e-6                                       | locked (all arms)                                         |
-| Phase 1 λ_t                      | warmup 0.1→0.5 over steps 0–100, held 0.5  | Markov constraint after z has structure                   |
-| Phase 1 λ_vae                    | 0.05                                       | VAE regularisation without drowning L_RL                  |
+| Phase 1 λ_t                      | warmup 0.1→1.0 over steps 0–100, held 1.0  | L_trans gets ~40% budget; L_RL still primary at ~40%      |
+| Phase 1 λ_vae                    | 0.05                                       | VAE anchor; ~20% budget; prevents encoder drift           |
 | Backbone                         | Qwen/Qwen2.5-1.5B-Instruct                 | R5.3                                                      |
 | repr_h extraction                | forward hook on last layer, mean_pool      | avoids output_hidden_states memory overhead               |
 
