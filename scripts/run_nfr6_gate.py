@@ -87,11 +87,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--batch-size",
         type=int,
-        default=4,
+        default=32,
         help=(
-            "Problems per inference batch (default: 4). "
-            "Effective sequence batch = batch-size × n-rollouts. "
-            "Must match Phase 0 training batch_size to avoid OOM."
+            "Max sequences per CUDA call (default: 32). "
+            "Problems per generate_latent_traces call = batch-size // n-rollouts "
+            "(minimum 1), so the CUDA batch is always ≤ batch-size regardless of "
+            "how many rollouts you request."
         ),
     )
     p.add_argument(
@@ -213,11 +214,13 @@ def collect_z_finals(
     z_finals_list: list[torch.Tensor] = []
     labels_list:   list[int]          = []
 
-    n_problems  = len(problems)
-    n_batches   = (n_problems + batch_size - 1) // batch_size
+    # batch_size is a SEQUENCE budget; convert to problems per call.
+    problems_per_call = max(1, batch_size // n_rollouts)
+    n_problems        = len(problems)
+    n_batches         = (n_problems + problems_per_call - 1) // problems_per_call
 
     for batch_idx in range(n_batches):
-        batch_probs = problems[batch_idx * batch_size:(batch_idx + 1) * batch_size]
+        batch_probs = problems[batch_idx * problems_per_call:(batch_idx + 1) * problems_per_call]
 
         # ── Step 1: inference rollout (no_grad internally) ────────────────
         traces = generate_latent_traces(
