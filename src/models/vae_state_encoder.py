@@ -194,36 +194,49 @@ class VAEStateEncoder(nn.Module):
         mu_list:     list[torch.Tensor],
         logvar_list: list[torch.Tensor],
         kl_weight:   float = 1.0,
-    ) -> torch.Tensor:
+        return_decomposed: bool = False,
+    ) -> "torch.Tensor | tuple[torch.Tensor, float, float]":
         """Compute the ELBO loss summed over all N_CHUNKS chunks.
 
         L_ELBO = Σ_h [ MSE(decode(z_h), repr_h) + kl_weight × KL(N(μ_h, σ_h²) ∥ N(0, I)) ]
 
-        kl_weight supports KL annealing: start near 0 during early Phase 0 steps so the
-        encoder develops structure freely, then ramp to 1.0 to enforce the prior.  Prevents
-        the posterior collapse observed in the first run (σ² ≈ 1.0 for all trajectories).
+        Normalization convention (important for interpreting logged values):
+          rec_loss — F.mse_loss: mean over (batch × hidden_dim).  O(0.001–0.5).
+          kl_loss  — sum over latent_dim, mean over batch.  O(1–10 per chunk).
+        The KL term is ~latent_dim× larger per unit than rec because it sums over dims.
+        kl_weight annealing therefore has amplified effect on the total loss scale.
 
         KL for a diagonal Gaussian (per sample, summed over latent dims):
             KL = -0.5 * Σ_j (1 + log σ²_j - μ_j² - σ_j²)
 
         Args:
-            repr_list:   original repr_h tensors. List of N_CHUNKS (batch, hidden_dim).
-            z_list:      sampled latents.    List of N_CHUNKS (batch, latent_dim).
-            mu_list:     posterior means.    List of N_CHUNKS (batch, latent_dim).
-            logvar_list: posterior log σ².   List of N_CHUNKS (batch, latent_dim).
-            kl_weight:   weight applied to the KL term only (default 1.0 = standard ELBO).
+            repr_list:        original repr_h tensors. List of N_CHUNKS (batch, hidden_dim).
+            z_list:           sampled latents.    List of N_CHUNKS (batch, latent_dim).
+            mu_list:          posterior means.    List of N_CHUNKS (batch, latent_dim).
+            logvar_list:      posterior log σ².   List of N_CHUNKS (batch, latent_dim).
+            kl_weight:        weight applied to the KL term only (default 1.0 = standard ELBO).
+            return_decomposed: if True, also return (recon_total, kl_total) as Python floats
+                               for logging.  Does not affect the backward-able tensor.
 
         Returns:
-            Scalar tensor — reconstruction + weighted KL, averaged over batch, summed over chunks.
+            loss — scalar tensor (reconstruction + weighted KL, summed over chunks).
+            If return_decomposed=True: (loss, recon_total: float, kl_total: float).
         """
         assert len(repr_list) == len(z_list) == len(mu_list) == len(logvar_list), \
             "All lists must have the same length"
         loss = 0
+        recon_total = 0.0
+        kl_total    = 0.0
         for i in range(len(repr_list)):
             rec_loss = F.mse_loss(self.decode(z_list[i]), repr_list[i])
             kl_loss  = -0.5 * (1 + logvar_list[i] - mu_list[i] ** 2
                                 - logvar_list[i].exp()).sum(dim=-1).mean()
             loss += rec_loss + kl_weight * kl_loss
+            if return_decomposed:
+                recon_total += rec_loss.detach().item()
+                kl_total    += kl_loss.detach().item()
+        if return_decomposed:
+            return loss, recon_total, kl_total
         return loss
 
     def compute_transition_loss(

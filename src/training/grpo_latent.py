@@ -70,17 +70,22 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def lambda_trans_schedule(
-    step: int, max_steps: int = 200, floor: float = 0.1, peak: float = 0.5
+    step: int, max_steps: int = 200, floor: float = 0.1, peak: float = 3.0
 ) -> float:
     """Return the transition loss weight λ_t for the current training step.
 
     Schedule: linear warmup floor → peak over steps 0 … max_steps//2,
     then constant at peak.
 
-    Rationale: at step 0 L_RL is near-zero (sparse reward, hard problems).
+    Rationale: at step 0 L_RL (Phase 1) or L_out (Phase 0) is near-zero.
     Starting at floor=0.1 lets early reward events shape z before the Markov
-    consistency constraint locks structure in. Held at peak=0.5 for the second
-    half so L_transition stays active throughout.
+    constraint locks structure in.  Held at peak for the second half.
+
+    Peak default of 3.0 is calibrated so that L_trans contributes ~20% of the
+    total loss signal when L_ELBO ≈ 20 (observed Phase 0 scale with the 1536-dim
+    ELBO summed over 3 chunks).  The original peak of 0.5 gave L_trans only ~4%
+    of the gradient budget, leaving the transition model with insufficient signal.
+    Both phases share this schedule; the peak is overridable via config.
     """
     halfway = max_steps // 2
     if step >= halfway:
@@ -612,7 +617,7 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
         batch_size                   — problems per step (default: 4)
         num_generations              — G rollouts per problem (default: 8)
         learning_rate                — AdamW lr for VAE/ZInj/OutcomeHead (default: 3e-4)
-        lambda_elbo, lambda_trans, lambda_out — loss weights (defaults: 1.0)
+        lambda_elbo, lambda_trans_peak, lambda_out — loss weights / schedule peak
         kl_warmup_frac               — KL annealing fraction (default: 0.5)
         temperature, top_p           — sampling params (from training.*)
         chunk_tokens                 — tokens per chunk (from latent_markov.*)
@@ -632,10 +637,10 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
     batch_size    = int(phase0_cfg.get("batch_size",        4))
     G             = int(phase0_cfg.get("num_generations",   8))
     lr            = float(phase0_cfg.get("learning_rate",  3e-4))
-    lambda_elbo   = float(phase0_cfg.get("lambda_elbo",    1.0))
-    lambda_trans  = float(phase0_cfg.get("lambda_trans",   1.0))
-    lambda_out    = float(phase0_cfg.get("lambda_out",     1.0))
-    kl_warmup_frac = float(phase0_cfg.get("kl_warmup_frac", 0.5))
+    lambda_elbo        = float(phase0_cfg.get("lambda_elbo",        1.0))
+    lambda_trans_peak  = float(phase0_cfg.get("lambda_trans_peak",  3.0))
+    lambda_out         = float(phase0_cfg.get("lambda_out",         1.0))
+    kl_warmup_frac     = float(phase0_cfg.get("kl_warmup_frac",     0.5))
     temperature   = float(training_cfg.get("temperature",  1.0))
     top_p         = float(training_cfg.get("top_p",        1.0))
     chunk_tokens  = int(latent_cfg.get("chunk_tokens",     341))
@@ -713,7 +718,7 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
 
     for global_step in range(n_steps):
         kl_weight = min(1.0, global_step / kl_warmup_steps)
-        lambda_t  = lambda_trans_schedule(global_step, n_steps)
+        lambda_t  = lambda_trans_schedule(global_step, n_steps, peak=lambda_trans_peak)
 
         # Sample batch_size problems (reshuffle when pool exhausted).
         while len(pool_order) < batch_size:
@@ -748,10 +753,11 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
             dtype=torch.float32, device=device,
         ).unsqueeze(-1)                                      # (B×G, 1)
 
-        l_elbo  = vae.compute_elbo(
+        l_elbo, l_recon, l_kl = vae.compute_elbo(
             pipe["repr_list"], pipe["z_list"],
             pipe["mu_list"],   pipe["logvar_list"],
             kl_weight=kl_weight,
+            return_decomposed=True,
         )
         l_trans = vae.compute_transition_loss(pipe["z_list"])
         l_out   = F.binary_cross_entropy(
@@ -768,8 +774,10 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
         model.zero_grad(set_to_none=True)
 
         # ── Logging ───────────────────────────────────────────────────────
-        for k, v in (("loss", total), ("elbo", l_elbo), ("trans", l_trans), ("out", l_out)):
-            pending[k] = pending.get(k, 0.0) + v.detach().item()
+        for k, v in (("loss", total.detach().item()), ("elbo", l_elbo.detach().item()),
+                     ("recon", l_recon), ("kl", l_kl),
+                     ("trans", l_trans.detach().item()), ("out", l_out.detach().item())):
+            pending[k] = pending.get(k, 0.0) + v
         reward_rate = sum(t["reward"] for t in traces) / len(traces)
         pending["reward_rate"] = pending.get("reward_rate", 0.0) + reward_rate
 
@@ -780,15 +788,16 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
                 "kl_weight":  round(kl_weight, 4),
                 "lambda_t":   round(lambda_t, 4),
                 **{k: pending.get(k, 0.0) / n
-                   for k in ("loss", "elbo", "trans", "out", "reward_rate")},
+                   for k in ("loss", "elbo", "recon", "kl", "trans", "out", "reward_rate")},
             }
             log_history.append(entry)
             pending = {}
             logger.info(
                 "step %d | kl_w=%.3f λ_t=%.2f | loss=%.4f elbo=%.4f "
-                "trans=%.4f out=%.4f | reward=%.1f%%",
+                "(recon=%.4f kl=%.4f) trans=%.4f out=%.4f | reward=%.1f%%",
                 entry["step"], entry["kl_weight"], entry["lambda_t"],
-                entry["loss"], entry["elbo"], entry["trans"], entry["out"],
+                entry["loss"], entry["elbo"], entry["recon"], entry["kl"],
+                entry["trans"], entry["out"],
                 entry["reward_rate"] * 100,
             )
 
@@ -929,7 +938,7 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
         training.*             — seed, learning_rate, num_generations,
                                  batch_size, max_steps, temperature, top_p,
                                  gradient_checkpointing, logging_steps, save_steps
-        phase1_loss.*          — lambda_vae
+        phase1_loss.*          — lambda_vae, lambda_trans_peak
         evaluation.path        — MATH-B-I JSONL pool for RL training
     """
     primary      = config["primary"]
@@ -938,7 +947,8 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     phase0_cfg   = config["phase0"]
     phase1_cfg   = config.get("phase1_loss", {})
 
-    lambda_vae   = float(phase1_cfg.get("lambda_vae", 0.05))
+    lambda_vae        = float(phase1_cfg.get("lambda_vae",        0.05))
+    lambda_trans_peak = float(phase1_cfg.get("lambda_trans_peak", 3.0))
 
     model_id     = primary["huggingface_repo_id"]
     revision     = primary.get("revision", "main")
@@ -1057,7 +1067,7 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     step_bar = tqdm(total=max_steps, desc="phase1", unit="step", dynamic_ncols=True)
 
     for global_step in range(max_steps):
-        lambda_t = lambda_trans_schedule(global_step, max_steps)
+        lambda_t = lambda_trans_schedule(global_step, max_steps, peak=lambda_trans_peak)
 
         # Sample batch_size problems (reshuffle when pool exhausted).
         while len(pool_order) < batch_size:

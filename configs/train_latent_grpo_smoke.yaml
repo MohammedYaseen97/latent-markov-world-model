@@ -46,8 +46,8 @@ phase0:
   learning_rate: 3.0e-4
   kl_warmup_frac: 0.5
   lambda_elbo: 1.0
-  lambda_trans: 1.0
-  lambda_out: 1.0
+  lambda_trans_peak: 3.0
+  lambda_out: 5.0
 
   logging_steps: 1
   save_steps: 10
@@ -80,3 +80,8 @@ training:
 
 evaluation:
   path: "data/math_beyond_smoke.jsonl"
+
+# Phase 1 loss weights (smoke: same as full except no lambda_vae override needed).
+phase1_loss:
+  lambda_trans_peak: 1.0   # maintain Markov; lower than Phase 0 so L_RL dominates
+  lambda_vae: 0.05

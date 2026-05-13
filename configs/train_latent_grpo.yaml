@@ -57,10 +57,23 @@ phase0:
   # Phase 0 steps. Prevents posterior collapse (σ² ≈ prior) seen in v1.
   kl_warmup_frac: 0.5
 
-  # Loss weights. Balanced by default; tune only if NFR6 diagnostic shows poor separation.
+  # Loss weights.
+  # lambda_trans_peak: peak weight for L_trans reached at step n_steps/2.
+  #   Calibrated so L_trans ≈ 22% of gradient budget when L_ELBO ≈ 20.
+  #   (peak × 2.0 / (20 + peak × 2.0 + lambda_out × 0.55) ≈ 0.22 → peak ≈ 3.0)
+  #   The original peak=0.5 gave L_trans only ~4%, leaving the transition model flat.
+  # lambda_out: upscaled from 1.0 → 5.0 so L_out earns ~10% gradient budget.
+  #   L_out BCE magnitude ≈ 0.55 at 15% reward rate. Without scaling, L_out earns only
+  #   ~2% budget after raising lambda_trans_peak, which is insufficient to teach z_3
+  #   to encode outcome quality — the only feature L_RL will exploit in Phase 1.
+  #   Approximate Phase 0 loss budget (all at peak, step ≥ 100):
+  #     L_ELBO  × 1.0 ≈ 20   →  65%   reconstruction + KL
+  #     L_trans × 3.0 ≈  6   →  19%   Markov pressure
+  #     L_out   × 5.0 ≈  2.75 → 9%   outcome quality signal
+  #     (remaining ~7% = variance in ELBO across steps)
   lambda_elbo: 1.0
-  lambda_trans: 1.0
-  lambda_out: 1.0
+  lambda_trans_peak: 3.0
+  lambda_out: 5.0
 
   logging_steps: 10
   save_steps: 50
@@ -80,13 +93,18 @@ training:
   batch_size: 4
   gradient_checkpointing: true
 
-# Phase 1 loss weights. Both are now wired in the code (v1 had lambda_vae as dead config).
+# Phase 1 loss weights.
 # λ_vae = 0.05: soft VAE anchor. Prevents encoder drift without dominating L_RL.
-# λ_trans: controlled by lambda_trans_schedule() warmup (0.1 → 0.5 over 200 steps).
-#           The value here is documentation; the schedule function is authoritative.
+# λ_trans_peak = 1.0: LOWER than Phase 0 intentionally.
+#   Phase 0 aggressively trained the transition model (peak=3.0, contributing ~22% of gradient).
+#   Phase 1 only needs to maintain Markov structure while L_RL drives task learning.
+#   Approximate Phase 1 loss budget (L_RL≈2, L_trans≈2, L_vae≈1):
+#     L_RL          × 1.0  ≈ 2   →  40%   ← primary objective
+#     L_trans       × 1.0  ≈ 2   →  40%   ← Markov maintenance
+#     L_vae         × 0.05 ≈ 1   →  20%   ← anchor
 phase1_loss:
-  lambda_trans: 0.5   # peak value reached by lambda_trans_schedule at step 100
-  lambda_vae: 0.05    # wired — L_VAE is scaled by this throughout Phase 1
+  lambda_trans_peak: 1.0   # peak of lambda_trans_schedule warmup (0.1 → 1.0 over 100 steps)
+  lambda_vae: 0.05          # L_VAE is scaled by this throughout Phase 1
 
 # ---------------------------------------------------------------------------
 # NFR6 diagnostic (check_latent_structure.py)
