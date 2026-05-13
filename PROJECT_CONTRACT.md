@@ -97,7 +97,7 @@ Before treating the core table as final:
 - [x] `src/models/vae_state_encoder.py` — `VAEStateEncoder` (encoder, decoder, transition) + `OutcomeHead`; `ZInjector` with near-zero init (std=0.01); `compute_elbo(kl_weight)`
 - [x] `src/training/grpo_latent.py` — `pretrain_vae_online` (Phase 0: frozen backbone, online generation, VAE+ZInjector+OutcomeHead update); `generate_latent_traces` (stores chunk_ids+reward only); `latent_training_step` (full live pipeline re-run, IS=1, no ε-correction); `train_latent` (loads ZInjector from Phase 0 ckpt, unfrozen backbone GRPO)
 - [x] `configs/train_latent_grpo.yaml` — updated for v3: Phase 0 online (200 steps, batch_size=4, G=8), Phase 1 (200 steps, batch_size=4, λ_vae=0.05, kl_warmup_frac=0.5)
-- [x] `scripts/check_latent_structure.py` — UMAP of z_final (NFR6 gate)
+- [x] `scripts/run_nfr6_gate.py` — UMAP of z_final (NFR6 gate, v3-correct: full trained pipeline)
 - [x] Latent eval modes in `scripts/eval_passk.py` (`latent_markov`, `latent_markov_pretrained`)
 - [ ] Smoke test re-run after `pretrain_vae_online()` implementation (`configs/train_latent_grpo_smoke.yaml`)
 - [ ] Phase 0 training: `runs/latent_grpo/phase0_vae.pt`

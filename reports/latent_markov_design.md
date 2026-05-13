@@ -627,7 +627,7 @@ Ordered by dependency. Each step is a gate for the next.
 | 10  | Full Phase 1 config (200 steps, batch_size=4)                                                                     | `configs/train_latent_grpo.yaml`       | ✅                   |
 | 11  | Latent eval modes in eval_passk.py (`latent_markov`, `latent_markov_pretrained`)                                  | `scripts/eval_passk.py`                | ✅                   |
 | 12  | **Phase 0 training run** → `runs/latent_grpo/phase0_vae.pt`                                                       | `scripts/train_latent.py`              | ⬜ pending #5        |
-| 13  | **NFR6 gate** — UMAP of z_final on Phase 0 checkpoint                                                             | `scripts/check_latent_structure.py`    | ⬜ pending #12       |
+| 13  | **NFR6 gate** — UMAP of z_final on Phase 0 checkpoint                                                             | `scripts/run_nfr6_gate.py`             | ⬜ pending #12       |
 | 14  | **Controlled latent baseline** eval: `latent_grpo_pretrained` pass@1024 ≥ 12.5%                                   | `scripts/eval_passk.py`                | ⬜ pending #12       |
 | 15  | **Phase 1 training** — 200 steps on MATH-B-I                                                                      | `configs/train_latent_grpo.yaml`       | ⬜ pending #14       |
 | 16  | **Phase 1 eval** — pass@k on MATH-B-I holdout                                                                     | `scripts/eval_passk.py`                | ⬜ pending #15       |
@@ -640,8 +640,12 @@ Ordered by dependency. Each step is a gate for the next.
 
 **When to run:** after Phase 0 training completes (`runs/latent_grpo/phase0_vae.pt`).
 
-**How:** `python scripts/check_latent_structure.py` — runs the encoder on the Phase 0
-pool, computes UMAP of z_final coloured by correct/incorrect trajectory.
+**How:** `python scripts/run_nfr6_gate.py --config configs/train_latent_grpo.yaml --n-problems 200 --n-rollouts 8`
+
+Runs the **full trained Phase 0 pipeline** (backbone + trained ZInjector + trained VAE)
+to collect z_3 for each trajectory — the same z-injected distribution the encoder was
+trained on. Computes UMAP of z_final coloured by correct/incorrect trajectory.
+Using the base backbone without z injection would give repr_h from the wrong distribution.
 
 **Gate criteria:** structured manifold with visible outcome correlation (correct and
 incorrect trajectories should not be uniformly intermixed; some geometric separation
