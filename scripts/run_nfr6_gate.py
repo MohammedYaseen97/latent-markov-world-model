@@ -87,8 +87,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--batch-size",
         type=int,
-        default=16,
-        help="Problems per inference batch (default: 16). Reduce if OOM.",
+        default=4,
+        help=(
+            "Problems per inference batch (default: 4). "
+            "Effective sequence batch = batch-size × n-rollouts. "
+            "Must match Phase 0 training batch_size to avoid OOM."
+        ),
     )
     p.add_argument(
         "--pool-path",
