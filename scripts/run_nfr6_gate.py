@@ -81,14 +81,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--n-rollouts",
         type=int,
-        default=2,
-        help="Rollouts per problem (default: 2). Total trajectories = n-problems × n-rollouts.",
+        default=8,
+        help="Rollouts per problem (default: 8). Total trajectories = n-problems × n-rollouts.",
     )
     p.add_argument(
         "--batch-size",
         type=int,
         default=16,
         help="Problems per inference batch (default: 16). Reduce if OOM.",
+    )
+    p.add_argument(
+        "--pool-path",
+        type=Path,
+        default=None,
+        help=(
+            "Override the pool JSONL used for inference "
+            "(default: phase0.pool_path from config). "
+            "Pass a held-out file (e.g. data/math_beyond_math_b_i.jsonl) for "
+            "a fully disjoint diagnostic."
+        ),
     )
     p.add_argument(
         "--output-dir",
@@ -361,8 +372,8 @@ def main() -> None:
         config, device,
     )
 
-    # ── Load easy pool ────────────────────────────────────────────────────
-    pool_path = Path(config["phase0"]["pool_path"])
+    # ── Load pool (CLI override takes precedence over config) ─────────────
+    pool_path = args.pool_path or Path(config["phase0"]["pool_path"])
     print(f"Loading pool from {pool_path} …", flush=True)
     problems: list[dict] = []
     with pool_path.open(encoding="utf-8") as f:
@@ -375,7 +386,11 @@ def main() -> None:
     # Sample n_problems (0 = all).
     if args.n_problems > 0 and args.n_problems < len(problems):
         problems = random.sample(problems, args.n_problems)
-        print(f"  Sampled {len(problems)} problems (seed={args.seed})", flush=True)
+        print(
+            f"  Sampled {len(problems)} problems (seed={args.seed}) — "
+            f"note: Phase 0 saw ~16% of the easy pool; this sample is ~84% held-out",
+            flush=True,
+        )
 
     n_total = len(problems) * args.n_rollouts
     print(
