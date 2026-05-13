@@ -255,11 +255,10 @@ def collect_z_finals(
             z_finals_list.append(z_3[i])
             labels_list.append(int(traj["reward"]))
 
-        n_done    = min((batch_idx + 1) * batch_size, n_problems)
         n_correct = sum(labels_list)
         print(
             f"  batch {batch_idx + 1}/{n_batches}  "
-            f"({n_done * n_rollouts} trajectories, "
+            f"({len(labels_list)} / {n_problems * n_rollouts} trajectories, "
             f"reward rate {n_correct / len(labels_list):.1%})",
             flush=True,
         )
