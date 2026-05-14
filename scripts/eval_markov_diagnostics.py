@@ -327,7 +327,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Load config
     # ------------------------------------------------------------------
-    config = load_yaml_with_extends(args.config)
+    config = load_yaml_with_extends(args.config.resolve(), root=REPO_ROOT)
     primary_cfg  = config["primary"]
     latent_cfg   = config["latent_markov"]
     phase0_cfg   = config["phase0"]
