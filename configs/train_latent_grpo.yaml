@@ -33,6 +33,13 @@
 #   python scripts/eval_passk.py --generation-mode latent_markov \
 #       --train-config configs/train_latent_grpo.yaml --checkpoint "$PHASE1_CKPT" \
 #       --arm latent_grpo --output runs/latent_grpo/eval_phase1.json
+#
+#   # 6. E1 + E3 Markov diagnostics (post-Phase-1, ~10-20 min on A100)
+#   python scripts/eval_markov_diagnostics.py \
+#       --checkpoint "$PHASE1_CKPT" \
+#       --config configs/train_latent_grpo.yaml \
+#       --n-problems 200 --n-rollouts 4 \
+#       --output-dir runs/latent_grpo/diagnostics
 
 extends: "configs/train_baseline_grpo.yaml"
 
