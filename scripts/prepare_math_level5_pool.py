@@ -114,14 +114,19 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-def build_prompt(problem_text: str, tokenizer: AutoTokenizer) -> list[int]:
+def build_prompt_str(problem_text: str, tokenizer: AutoTokenizer) -> str:
+    """Return the chat-formatted prompt string (for vLLM or HF tokenisation)."""
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": problem_text},
     ]
-    text = tokenizer.apply_chat_template(
+    return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
+
+
+def build_prompt(problem_text: str, tokenizer: AutoTokenizer) -> list[int]:
+    text = build_prompt_str(problem_text, tokenizer)
     return tokenizer(text, return_tensors="pt").input_ids[0].tolist()
 
 
@@ -188,6 +193,63 @@ def score_problem(
     return n_correct
 
 
+def score_all_problems_vllm(
+    problems: list[dict],
+    tokenizer: AutoTokenizer,
+    model_id: str,
+    model_revision: str,
+    n_samples: int,
+    max_new_tokens: int,
+    temperature: float,
+    gpu_memory_utilization: float,
+    max_model_len: int,
+    seed: int,
+) -> list[int]:
+    """Score all problems in one vLLM call — uses continuous batching to saturate GPU.
+
+    Returns a list of n_correct (int) per problem, same order as `problems`.
+    Each prompt gets n_samples completions; vLLM handles scheduling internally.
+    """
+    from vllm import LLM, SamplingParams  # imported lazily — not required for HF path
+
+    logger.info(
+        "vLLM: loading %s @ %s  gpu_mem=%.2f  max_model_len=%d",
+        model_id, model_revision, gpu_memory_utilization, max_model_len,
+    )
+    llm = LLM(
+        model=model_id,
+        revision=model_revision,
+        dtype="bfloat16",
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
+        seed=seed,
+    )
+
+    prompts = [build_prompt_str(p["prompt"], tokenizer) for p in problems]
+    sampling_params = SamplingParams(
+        n=n_samples,
+        temperature=temperature,
+        top_p=1.0,
+        max_tokens=max_new_tokens,
+    )
+
+    logger.info(
+        "vLLM: generating %d problems × %d samples = %d completions ...",
+        len(prompts), n_samples, len(prompts) * n_samples,
+    )
+    outputs = llm.generate(prompts, sampling_params)
+
+    results: list[int] = []
+    for prob, output in zip(problems, outputs):
+        n_correct = 0
+        for completion in output.outputs:
+            pred = extract_answer(completion.text)
+            if pred is not None and answers_equivalent(pred, prob["ground_truth"]):
+                n_correct += 1
+        results.append(n_correct)
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -237,6 +299,20 @@ def parse_args() -> argparse.Namespace:
         "--splits", nargs="+", default=["train", "test"],
         help="HF splits to pull from (default: train test).",
     )
+
+    # vLLM settings (production — saturates GPU via continuous batching)
+    p.add_argument(
+        "--use-vllm", action=argparse.BooleanOptionalAction, default=True,
+        help="Use vLLM for scoring (default: true). Pass --no-use-vllm for HF fallback.",
+    )
+    p.add_argument(
+        "--vllm-gpu-memory-utilization", type=float, default=0.90,
+        help="Fraction of GPU memory given to vLLM KV cache (default: 0.90).",
+    )
+    p.add_argument(
+        "--vllm-max-model-len", type=int, default=2048,
+        help="vLLM max sequence length (prompt + completion, default: 2048).",
+    )
     return p.parse_args()
 
 
@@ -246,27 +322,32 @@ def main() -> None:
     torch.cuda.manual_seed_all(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Device: %s", device)
+    logger.info("Device: %s  use_vllm=%s", device, args.use_vllm)
 
     # ------------------------------------------------------------------
-    # Load pretrained model
+    # Tokenizer — always needed (for prompt formatting and HF-path scoring)
+    # Model     — only loaded for HF path; vLLM loads its own copy internally
     # ------------------------------------------------------------------
-    logger.info("Loading %s @ %s  attn=%s ...", args.model_id, args.model_revision, _DEFAULT_ATTN_IMPL)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        revision=args.model_revision,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        attn_implementation=_DEFAULT_ATTN_IMPL,
-    )
+    logger.info("Loading tokenizer %s @ %s ...", args.model_id, args.model_revision)
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_id, revision=args.model_revision,
         trust_remote_code=True, padding_side="left",
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model.eval()
-    logger.info("  model loaded")
+
+    model = None
+    if not args.use_vllm:
+        logger.info("Loading HF model %s @ %s  attn=%s ...", args.model_id, args.model_revision, _DEFAULT_ATTN_IMPL)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            revision=args.model_revision,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation=_DEFAULT_ATTN_IMPL,
+        )
+        model.eval()
+        logger.info("  HF model loaded")
 
     # ------------------------------------------------------------------
     # Load Level 5 problems from all configs
@@ -317,21 +398,38 @@ def main() -> None:
         "Filtering: keeping problems where pass@%d = 0 (pretrained model) ...",
         args.n_samples,
     )
-    hard_problems: list[dict] = []
-    n_solved = 0
 
-    for prob in tqdm(deduped, desc="scoring", unit="prob"):
-        n_correct = score_problem(
-            model=model,
+    if args.use_vllm:
+        n_correct_list = score_all_problems_vllm(
+            problems=deduped,
             tokenizer=tokenizer,
-            problem_text=prob["prompt"],
-            ground_truth=prob["ground_truth"],
+            model_id=args.model_id,
+            model_revision=args.model_revision,
             n_samples=args.n_samples,
-            batch_size=args.batch_size,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
-            device=device,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            max_model_len=args.vllm_max_model_len,
+            seed=args.seed,
         )
+    else:
+        n_correct_list = []
+        for prob in tqdm(deduped, desc="scoring", unit="prob"):
+            n_correct_list.append(score_problem(
+                model=model,
+                tokenizer=tokenizer,
+                problem_text=prob["prompt"],
+                ground_truth=prob["ground_truth"],
+                n_samples=args.n_samples,
+                batch_size=args.batch_size,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                device=device,
+            ))
+
+    hard_problems: list[dict] = []
+    n_solved = 0
+    for prob, n_correct in zip(deduped, n_correct_list):
         if n_correct == 0:
             hard_problems.append(prob)
         else:
@@ -379,6 +477,7 @@ def main() -> None:
         "filter_model_revision":    args.model_revision,
         "filter_n_samples":         args.n_samples,
         "filter_criterion":         "pass@n_samples == 0",
+        "filter_backend":           "vllm" if args.use_vllm else "hf_generate",
         "seed":                     args.seed,
         "raw_level5_count":         len(deduped),
         "solvable_excluded":        n_solved,
