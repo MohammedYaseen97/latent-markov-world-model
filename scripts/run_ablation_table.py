@@ -34,7 +34,7 @@ ARMS: list[str] = [
     "latent_grpo_uncertainty",
 ]
 
-METRICS: list[str] = ["pass@1", "pass@16", "pass@1024"]
+METRICS: list[str] = ["pass@1", "pass@16", "pass@128"]
 
 
 def _latest_eval(arm_dir: Path) -> dict | None:
@@ -99,14 +99,14 @@ def write_md(rows: list[dict], path: Path) -> None:
         f"*Generated {generated_at} by `scripts/run_ablation_table.py` from `artifacts/`.*  ",
         "*Never hand-typed — re-run to refresh.*",
         "",
-        "## MATH-B-I base pool",
+        "## MATH Level 5 hard pool (v2)",
         "",
-        "| arm | pass@1 | pass@16 | pass@1024 | run |",
+        "| arm | pass@1 | pass@16 | pass@128 | run |",
         "|-----|--------|---------|-----------|-----|",
     ]
     for r in rows:
         lines.append(
-            f"| `{r['arm']}` | {r['pass@1']} | {r['pass@16']} | {r['pass@1024']} | {r['run_id']} |"
+            f"| `{r['arm']}` | {r['pass@1']} | {r['pass@16']} | {r['pass@128']} | {r['run_id']} |"
         )
     lines += [
         "",
@@ -142,8 +142,8 @@ def main() -> None:
 
     # Print the markdown table to stdout for quick inspection
     for row in rows:
-        status = "✓" if row["pass@1024"] != "—" else "·"
-        print(f"  {status}  {row['arm']:30s}  pass@1024={row['pass@1024']:>8}  run={row['run_id']}")
+        status = "✓" if row["pass@128"] != "—" else "·"
+        print(f"  {status}  {row['arm']:30s}  pass@128={row['pass@128']:>8}  run={row['run_id']}")
 
     print(f"\nWrote {csv_path.relative_to(REPO_ROOT)}")
     print(f"Wrote {md_path.relative_to(REPO_ROOT)}")

@@ -1,6 +1,9 @@
-# Latent + uncertainty arm — VAE latent Markov state + KL variance exploration bonus.
+# Latent + uncertainty arm — deterministic latent Markov state + KL variance exploration bonus.
 # Inherits all shared training knobs from train_baseline_grpo.yaml.
 # Only method-specific fields are set here.
+#
+# STATUS: stub — not yet implemented. Begins after latent_grpo arm is complete.
+# See src/training/reward_bonus.py for the uncertainty bonus stub.
 
 extends: "configs/train_baseline_grpo.yaml"
 

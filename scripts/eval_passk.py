@@ -7,7 +7,7 @@ metrics file. Core sampling and grading logic lives in ``src/eval/metrics.py``.
 Two generation modes are supported (--generation-mode):
 
   baseline      Single flat sequence per sample, up to max_new_tokens. Supports vLLM
-                (recommended for pass@1024) and HF generate (smoke / fallback).
+                (recommended for pass@128) and HF generate (smoke / fallback).
 
   token_markov  Delethink chunked generation — matches the regime the arm was trained
                 in. Context is reset at each chunk boundary; only the carryover window
@@ -15,7 +15,7 @@ Two generation modes are supported (--generation-mode):
                 Supports vLLM (production, use_vllm: true in eval config) and HF
                 sequential (smoke fallback). vLLM path uses multi-round batched
                 generation; wall-clock ≈ baseline (round 1 identical; rounds 2+ are
-                fast). Full pass@1024 on A100 in ~30-45 min.
+                fast). Full pass@128 on RTX Pro 6000 in ~5-10 min.
 
 See ``configs/eval_math_beyond.yaml`` and ``PROJECT_CONTRACT.md`` (Phase 2).
 """
@@ -248,8 +248,8 @@ def _estimate_pass_at_k_metrics(
 
     Two generation backends are supported, selected by ``eval_cfg["use_vllm"]``:
 
-    - **vLLM** (production, A100): generates all problems × n_samples in one call.
-      Orders of magnitude faster for pass@1024; recommended for any run where max(ks) > 16.
+    - **vLLM** (production): generates all problems × n_samples in one call.
+      Orders of magnitude faster for pass@128; recommended for any run where max(ks) > 16.
 
     - **HF generate** (smoke / fallback): loops per problem, generating completions in
       chunks of ``gen_batch_size``. Works on any GPU without vLLM installed.
@@ -735,7 +735,7 @@ def _estimate_pass_at_k_metrics_latent_pretrained(
     top_p        = float(eval_cfg.get("top_p", 1.0))
     n_samples    = max(ks)
 
-    vae0_path    = Path(phase0_cfg.get("checkpoint_path", "runs/latent_grpo/phase0_vae.pt"))
+    vae0_path    = Path(phase0_cfg.get("checkpoint_path", "runs/latent_grpo/phase0_encoder.pt"))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1076,7 +1076,7 @@ def main() -> None:
     if not checkpoint:
         raise ValueError("No --checkpoint and no primary.huggingface_repo_id in base_model config.")
 
-    metrics_keys = eval_cfg.get("metrics") or ["pass@1", "pass@16", "pass@1024"]
+    metrics_keys = eval_cfg.get("metrics") or ["pass@1", "pass@16", "pass@128"]
     ks = []
     for m in metrics_keys:
         if m.startswith("pass@"):

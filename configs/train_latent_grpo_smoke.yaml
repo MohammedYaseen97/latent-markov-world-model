@@ -26,63 +26,58 @@ experiment:
 # Latent arm architecture
 # ---------------------------------------------------------------------------
 latent_markov:
-  latent_dim: 64           # z_h dimension (design decision Q1)
-  hidden_dim: 1536         # Qwen2.5-1.5B last-layer hidden size
-  n_chunks: 3              # fixed: chunks per rollout
-  chunk_tokens: 341        # tokens per chunk for Phase 1 (341×3 = 1023 ≈ 1024)
+  latent_dim: 64
+  hidden_dim: 1536
+  n_chunks: 3
+  chunk_tokens: 341
 
 # ---------------------------------------------------------------------------
-# Phase 0 — Online VAE pretraining (smoke)
+# Phase 0 — Online encoder pretraining (smoke)
 # ---------------------------------------------------------------------------
 phase0:
   pool_path: "data/math_easy_pool.jsonl"
-  checkpoint_path: "runs/latent_grpo_smoke/phase0_vae.pt"
+  checkpoint_path: "runs/latent_grpo_smoke/phase0_encoder.pt"
 
-  # Smoke: 2 steps — 2 problems × 2 rollouts = 4 on-policy trajectories/step
   n_steps: 2
   batch_size: 2
-  num_generations: 2        # G=2 minimum to get reward variance
+  num_generations: 2
 
   learning_rate: 3.0e-4
-  kl_warmup_frac: 0.5
-  lambda_elbo: 1.0
   lambda_trans_peak: 3.0
   lambda_out: 5.0
+  lambda_calib: 1.0
 
   logging_steps: 1
   save_steps: 10
 
 # ---------------------------------------------------------------------------
-# NFR6 diagnostic — run_nfr6_gate.py
-#   python scripts/run_nfr6_gate.py --config configs/train_latent_grpo_smoke.yaml \
-#       --n-problems 10 --n-rollouts 2
+# NFR6 diagnostic
 # ---------------------------------------------------------------------------
 nfr6:
   output_dir: "runs/latent_grpo_smoke/plots"
   method: "tsne"
 
 # ---------------------------------------------------------------------------
-# Phase 1 (not active in smoke; included for config completeness)
+# Phase 1 (smoke)
 # ---------------------------------------------------------------------------
 training:
   seed: 42
-  learning_rate: 1.0e-6    # matches all other arms (train_baseline_grpo.yaml)
-  num_generations: 2        # G=2 for smoke
-  batch_size: 2             # problems per step
+  learning_rate: 1.0e-6
+  num_generations: 2
+  batch_size: 2
   grad_accum_steps: 1
   max_completion_length: 1024
   temperature: 1.0
   top_p: 1.0
   max_steps: 2
   num_epochs: 1
-  gradient_checkpointing: true   # required to fit 1.5B + QLoRA on 8 GB
+  gradient_checkpointing: true
   logging_steps: 1
   save_steps: 5
 
 evaluation:
-  path: "data/math_beyond_smoke.jsonl"
+  path: "data/math_level5_hard_pool.jsonl"
 
-# Phase 1 loss weights (smoke: same as full except no lambda_vae override needed).
 phase1_loss:
-  lambda_trans_peak: 1.0   # maintain Markov; lower than Phase 0 so L_RL dominates
-  lambda_vae: 0.05
+  lambda_trans_peak: 0.3
+  lambda_calib: 0.5

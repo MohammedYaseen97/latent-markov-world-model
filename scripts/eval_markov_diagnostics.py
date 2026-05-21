@@ -26,7 +26,7 @@ E3 — Uncertainty calibration
 
 E2 note:
     E2 (policy sufficiency) is covered by the ablation table — compare latent_grpo
-    pass@1024 vs baseline_grpo pass@1024 in reports/ablation_core.md.  No script needed.
+    pass@128 vs baseline_grpo pass@128 in reports/ablation_core.md.  No script needed.
 
 Usage
 ─────
@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         "--phase0-only",
         action="store_true",
         help=(
-            "Load Phase 0 checkpoint (phase0_vae.pt) from --checkpoint dir instead "
+            "Load Phase 0 checkpoint (phase0_encoder.pt) from --checkpoint dir instead "
             "of a Phase 1 checkpoint.  The pretrained backbone is loaded from HF."
         ),
     )
@@ -375,7 +375,7 @@ def main() -> None:
     # Load VAE + ZInjector
     # ------------------------------------------------------------------
     if args.phase0_only:
-        vae_pt = args.checkpoint / "phase0_vae.pt"
+        vae_pt = args.checkpoint / "phase0_encoder.pt"
     else:
         vae_pt = args.checkpoint / "phase1_latent.pt"
 

@@ -5,9 +5,9 @@
 | | |
 |---|---|
 | **Question** | Does a **learned latent state** (VAE on trajectories, optional uncertainty bonus) beat **history-as-state GRPO** and a **Yuan-style token-Markov** comparator on hard math? |
-| **Benchmark** | MATH-Beyond **MATH-B-I base** pool (pinned Hub row; see `reports/DATA_PROTOCOL.md`) |
+| **Benchmark** | MATH Level 5 hard pool (~350 problems, pass@128=0 filter; see `reports/DATA_PROTOCOL.md`) |
 | **Arms** | (1) baseline GRPO (2) token-Markov GRPO (3) latent GRPO (4) latent + uncertainty |
-| **Headline metric** | `pass@1024` on all arms; also `pass@1`, `pass@16` |
+| **Headline metric** | `pass@128` on all arms; also `pass@1`, `pass@16` |
 | **Gates** | Phase order and checklist → **`PROJECT_CONTRACT.md`** (authoritative) |
 
 ---
@@ -86,7 +86,7 @@ Three things that make this new together:
 ## What Success Looks Like
 
 **Minimum viable result (must have):**
-- All four arms trained and evaluated; **`pass@1024`** reported for each (plus `pass@1` / `pass@16`)
+- All four arms trained and evaluated; **`pass@128`** reported for each (plus `pass@1` / `pass@16`)
 - Latent arm(s) beat **history baseline** and you characterize vs **token-Markov** (win, tie, or loss — honest)
 - Same benchmark and matched budgets/decoding across arms (per `PROJECT_CONTRACT.md`)
 
@@ -103,7 +103,7 @@ Three things that make this new together:
 
 ## Benchmark Choice
 
-**Primary:** MATH-Beyond **MATH-B-I (base models)** pool from Mayilvahanan et al. — rows where every listed **base** Hub model scored **pass@1024 = 0** on the pinned snapshot (counts: `data/benchmark_manifest.json`; see `reports/DATA_PROTOCOL.md`). That rule fixes **which problems** are in the gauntlet using a **published, reproducible** difficulty filter — it does **not** mean “frozen instruct can never solve them.” We still train **instruct** checkpoints for rollout quality; the **science** is **four-way comparison on the same fixed list** under **pass@1024** (hard at scale even when some items move). A fuller defence of “still hard / still meaningful with instruct” is in **`reports/DATA_PROTOCOL.md`** (*Is this still “hard” if we train instruct weights?*).
+**Primary:** MATH Level 5 hard pool (~350 problems). Definition and build procedure in `reports/DATA_PROTOCOL.md`. Filter: pretrained model (`Qwen/Qwen2.5-1.5B-Instruct`) scores `pass@128 = 0`. The science is a **four-way comparison on this fixed list** under `pass@128`. The pool is model-specific but fully reproducible given a fixed checkpoint and seed (documented in `data/level5_pool_manifest.json`).
 
 **Secondary (if time):** ProntoQA or a logic puzzle suite — cleaner structure, faster iteration, good for sanity checking latent geometry.
 
@@ -115,11 +115,11 @@ Three things that make this new together:
 
 | Component | Choice | Reason |
 |---|---|---|
-| Policy backbone | **Instruct** weights: `Qwen/Qwen2.5-1.5B-Instruct` (primary), `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` (fallback); see `configs/base_model.yaml`. MATH-B-I **pool** uses Hub *base* columns only to pick problems — not the checkpoint you train. |
+| Policy backbone | **Instruct** weights: `Qwen/Qwen2.5-1.5B-Instruct` (primary), `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` (fallback); see `configs/base_model.yaml`. Level 5 hard pool; training uses instruct weights for rollout quality. |
 | Training framework | TRL (simpler) or veRL (more flexible) | Start with TRL, switch if you need more control |
 | VAE | Custom PyTorch, ~200 lines | Input: trajectory hidden states. Output: latent z, mean μ, variance σ² |
 | RL algorithm | GRPO | Standard, well-understood, your existing knowledge |
-| Benchmark | MATH-Beyond | Documented ceiling, verifiable rewards |
+| Benchmark | MATH Level 5 hard pool | Documented difficulty ceiling, verifiable rewards |
 | Dev machine | RTX 4060 (local) | Architecture dev, tiny model sanity checks |
 | Training machine | A100 80GB (RunPod/Lambda) | Full training runs, ~$150 total budget |
 

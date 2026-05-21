@@ -2,25 +2,34 @@
 
 **Authoritative protocol:** [`reports/DATA_PROTOCOL.md`](../reports/DATA_PROTOCOL.md)
 
-## Generate artifacts
+## Generate pools
 
 ```bash
-python scripts/prepare_data.py --output-dir data
+# Easy pool (Phase 0 encoder pretraining, Level 1-4 only)
+python scripts/prepare_easy_pool.py --levels 1 2 3 4
+
+# Level 5 hard pool (training + eval for all arms, ~2h)
+python scripts/prepare_math_level5_pool.py \
+    --model-id Qwen/Qwen2.5-1.5B-Instruct \
+    --output data/math_level5_hard_pool.jsonl
 ```
 
-Requires pinned Hub revision (`configs/math_beyond_hf_revision.txt`) and the **`datasets` / `huggingface_hub` versions** in `requirements.txt` (also recorded under `reproducibility.library_versions_at_build` in `benchmark_manifest.json`).
-
-## Files (after running the script)
+## Files (after running the scripts)
 
 | File | Role |
 |------|------|
-| `math_beyond_math_b_i_base.jsonl` | **Primary** eval pool — paper MATH-B-I (Base Models, pass@1024). |
-| `math_beyond_hf_strict_all_models.jsonl` | **Secondary** — all 21 Hub models unsolved (stricter; usually 13 rows). |
-| `math_beyond_full_181.jsonl` | Full `test` split (181 rows). |
-| `benchmark_manifest.json` | Revision, definitions, row counts, SHA-256. |
+| `math_level5_hard_pool.jsonl` | **Primary** training + eval pool — MATH Level 5, pass@128=0 filter. |
+| `math_easy_pool.jsonl` | Phase 0 encoder pretraining pool — MATH Level 1–4. |
+| `level5_pool_manifest.json` | Revision, model used for filtering, row counts, SHA-256. |
+| `easy_pool_manifest.json` | Revision, levels, row counts, SHA-256. |
 
 ## JSONL schema
 
-- `problem_id`, `source_index`, `prompt`, `ground_truth`; optional `data_source`, `topic`, `difficulty`.
+- `problem_id`, `source_index`, `prompt`, `ground_truth`, `data_source`, `topic`, `difficulty`, `source_level`
 
-Large JSONLs are gitignored; commit **`benchmark_manifest.json`** after a pinned run if you want CI/docs to reference exact hashes.
+Large JSONLs are gitignored; commit manifest files after a pinned run to record hashes.
+
+## Mutual exclusivity
+
+Easy pool uses Level 1–4 only. Hard pool uses Level 5 only. Intersection = ∅.
+Verified by `source_level` field in both manifest files.

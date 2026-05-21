@@ -203,14 +203,13 @@ because of R1-style CoT pretraining). We use Qwen2.5-1.5B-Instruct, which has no
 such prior. Our m=256 window is also 8-16× smaller than the paper's 2K-4K, which
 limits carryover richness.
 
-**Observed result (final, 200-step run):**
+**v2 run status:** pending — Level 5 hard pool not yet built. See `reports/ablation_core.md` for results table.
 
-- `token_markov_pretrained` (no GRPO): `pass@1024 = 12.5%` — equal to `baseline_pretrained`
-  (12.5%). Delethink's context reset + carryover does **not** hurt the model at inference
-  time. Capability is fully preserved under the Markovian constraint before training.
-- `token_markov_grpo` checkpoint-200: `pass@1024 ≈ 12.5%`. SHA256 of checkpoint-200
-  equals SHA256 of pretrained weights — **zero weight updates** across all 200 steps.
-  Baseline improved to 15.0% over the same 200 steps.
+**Observed pattern from v1 (MATH-B-I pool, 40 problems, pass@1024):** controlled pretrained
+eval showed capability fully preserved under the Markovian constraint before training.
+GRPO training produced zero weight updates for all 200 steps (SHA256 checkpoint = pretrained
+weights) due to extreme reward sparsity under the Delethink regime. This structural behaviour
+is expected to recur on the v2 Level 5 pool unless the model is significantly stronger.
 
 **Why zero gradient:** GRPO loss = `ppo_term + kl_coef × kl_term`. Per-sample success
 under Delethink is ≈ 0.015% → `P(≥1 correct | G=8) ≈ 0.12%` → ≈ 0.15 expected reward

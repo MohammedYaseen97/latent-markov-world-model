@@ -32,4 +32,4 @@ token_markov:
   iteration_cap: 2               # 2 chunks: 96 + 32 = 128 total tokens (smoke)
 
 evaluation:
-  path: "data/math_beyond_smoke.jsonl"
+  path: "data/math_level5_hard_pool.jsonl"

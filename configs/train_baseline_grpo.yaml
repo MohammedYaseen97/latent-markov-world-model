@@ -11,11 +11,14 @@ training:
   # Learning rate: Yuan appendix reference (1e-6); same across all arms per contract.
   learning_rate: 1.0e-6
 
-  # Generation group: 8 completions per prompt per step.
-  # TRL constraint: batch_size % num_generations == 0, so batch_size must be a multiple of 8.
-  num_generations: 8
-  batch_size: 8             # per_device_train_batch_size; 1 unique prompt per generation pass
-  grad_accum_steps: 4       # effective prompt batch = 4 per weight update
+  # Generation group: 128 completions per prompt — matches eval pass@128 scale.
+  # TRL constraint: batch_size % num_generations == 0.
+  # batch_size = 128 here means 1 unique problem per TRL mini-batch (128 rollouts per problem).
+  # grad_accum_steps = 4 → 4 unique problems per optimizer update (same as before).
+  # "batch_size" as problems-per-update is unchanged; only TRL's sequence-level knob changes.
+  num_generations: 128
+  batch_size: 128           # per_device_train_batch_size = 1 problem × 128 rollouts
+  grad_accum_steps: 4       # effective problem batch = 4 per weight update
 
   # Completion budget: 1024 tokens gives enough room for chain-of-thought + \boxed{answer}.
   max_completion_length: 1024
@@ -25,19 +28,14 @@ training:
   top_p: 1.0
 
   # Training duration: 200 steps for all arms.
-  # Token-Markov's custom loop gives ceil(40/8) × 40 epochs = 200 steps exactly.
-  # Baseline TRL is capped at 200 via max_steps (without it TRL may count differently).
-  # 200 steps is the minimum defensible budget for GRPO on a sparse-reward benchmark:
-  # with P(pass@1) ≈ 10%, roughly half of steps carry zero gradient — 200 steps gives
-  # ~100 effective gradient updates. All future latent-Markov arms inherit this via
-  # the config extends chain, so the budget is fair across all four arms.
+  # All arms inherit this budget via the config extends chain for fair comparison.
   num_epochs: 40
   max_steps: 200
 
-  gradient_checkpointing: false   # A100 80 GB, 1.5B model — not needed
+  gradient_checkpointing: false   # RTX Pro 6000 Blackwell 96 GB, 1.5B model — not needed (B=128 seq per step)
   use_vllm: false
   logging_steps: 10
   save_steps: 200
 
 evaluation:
-  path: "data/math_beyond_math_b_i_base.jsonl"
+  path: "data/math_level5_hard_pool.jsonl"

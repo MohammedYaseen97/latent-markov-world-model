@@ -1,40 +1,56 @@
-# Latent Markov arm — full A100 profile  (v3 design).
+# Latent Markov arm — full RTX Pro 6000 Blackwell profile (v2 design).
 #
-# Phase 0: backbone FROZEN; VAE + ZInjector + OutcomeHead trained ONLINE.
-#   Each step: generate G=8 rollouts per problem → re-run with grad → update VAE/ZInj.
-#   200 steps × 4 problems × 8 rollouts = 6 400 on-policy trajectories.
-# Phase 1: backbone UNFROZEN; on-policy GRPO with live z injection on MATH-B-I.
-#   200 steps × 4 problems × 8 rollouts = 6 400 fresh rollouts.
+# Phase 0: backbone FROZEN; Encoder + ZInjector + OutcomeHead trained ONLINE.
+#   Each step: generate G=128 rollouts per problem → re-run with grad → update encoder/ZInj.
+#   400 steps × 4 problems × 128 rollouts = 204 800 on-policy trajectories.
+# Phase 1: backbone UNFROZEN; on-policy GRPO with live z injection on Level 5 hard pool.
+#   200 steps × 4 problems × 128 rollouts = 102 400 fresh rollouts.
+#
+# G=128 matches eval pass@128 scale. batch_size (problems per step) is unchanged at 4
+# because the latent custom loop uses batch_size = problems, not total sequences.
+#
+# Key v2 changes from v1:
+#   - VAE-ELBO removed; replaced by explicit calibration loss L_calib
+#   - z_h = μ_h (deterministic during training; no reparameterization noise)
+#   - Phase 0 extended to 400 steps (losses were still declining at 200)
+#   - Phase 1 λ_trans reduced to 0.3 (maintenance only; E1=0.015 shows transition trained)
+#   - Benchmark changed to MATH Level 5 hard pool (~350 problems)
+#   - Metric changed to pass@128
 #
 # Inherits shared training knobs (lr, G, backbone, dtype) from
 # train_baseline_grpo.yaml. Only latent-specific fields are set here.
 #
 # Usage (run in order):
-#   # 0. Prepare easy pool (one-time)
-#   python scripts/prepare_easy_pool.py
+#   # 0a. Rebuild easy pool (Level 1-4 only, no Level 5)
+#   python scripts/prepare_easy_pool.py --levels 1 2 3 4
 #
-#   # 1. Phase 0 — online VAE pretraining (A100, ~4-5 h for 200 steps)
+#   # 0b. Build Level 5 hard pool (one-time; ~2h on RTX Pro 6000)
+#   python scripts/prepare_math_level5_pool.py \
+#       --model-id Qwen/Qwen2.5-1.5B-Instruct \
+#       --output data/math_level5_hard_pool.jsonl
+#
+#   # 1. Phase 0 — online encoder pretraining (~4h for 400 steps)
 #   python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 0
 #
-#   # 2. NFR6 gate — MUST pass before Phase 1 (full pipeline inference, ~10 min)
+#   # 2. NFR6 gate — MUST pass before Phase 1 (~10 min)
 #   python scripts/run_nfr6_gate.py --config configs/train_latent_grpo.yaml \
 #       --n-problems 200 --n-rollouts 2
 #
-#   # 3. Controlled latent baseline eval (pretrained backbone + Phase 0 VAE, ~2-3 h)
+#   # 3. Controlled latent baseline eval (pretrained backbone + Phase 0 encoder)
 #   python scripts/eval_passk.py --generation-mode latent_markov_pretrained \
 #       --train-config configs/train_latent_grpo.yaml --arm latent_grpo_pretrained \
 #       --output runs/latent_grpo/eval_pretrained.json
 #
-#   # 4. Phase 1 — joint RL (A100, ~5-6 h for 200 steps)
+#   # 4. Phase 1 — joint RL (~2.5h for 200 steps)
 #   python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 1
 #
-#   # 5. Phase 1 eval (find run_id from Phase 1 log output)
+#   # 5. Phase 1 eval
 #   PHASE1_CKPT=$(ls -td artifacts/latent_grpo/*/phase1/final | head -1)
 #   python scripts/eval_passk.py --generation-mode latent_markov \
 #       --train-config configs/train_latent_grpo.yaml --checkpoint "$PHASE1_CKPT" \
 #       --arm latent_grpo --output runs/latent_grpo/eval_phase1.json
 #
-#   # 6. E1 + E3 Markov diagnostics (post-Phase-1, ~10-20 min on A100)
+#   # 6. E1 + E3 Markov diagnostics
 #   python scripts/eval_markov_diagnostics.py \
 #       --checkpoint "$PHASE1_CKPT" \
 #       --config configs/train_latent_grpo.yaml \
@@ -52,90 +68,69 @@ experiment:
 # Latent arm architecture (shared across Phase 0 and Phase 1)
 # ---------------------------------------------------------------------------
 latent_markov:
-  latent_dim: 64            # z_h dimension (design decision Q1)
+  latent_dim: 64            # z_h dimension
   hidden_dim: 1536          # Qwen2.5-1.5B last-layer hidden size
   n_chunks: 3               # fixed: chunks per rollout
   chunk_tokens: 341         # tokens per chunk (341 × 3 = 1023 ≈ 1024)
 
 # ---------------------------------------------------------------------------
-# Phase 0 — Online VAE pretraining on frozen backbone (v3)
+# Phase 0 — Online encoder pretraining on frozen backbone (v2)
 # ---------------------------------------------------------------------------
 phase0:
-  pool_path: "data/math_easy_pool.jsonl"   # easy MATH problems
-  checkpoint_path: "runs/latent_grpo/phase0_vae.pt"
+  pool_path: "data/math_easy_pool.jsonl"      # L1–L4 only (mutual exclusivity with L5 hard pool)
+  checkpoint_path: "runs/latent_grpo/phase0_encoder.pt"
 
-  # 200 steps × 4 problems × 8 rollouts = 6 400 on-policy trajectories.
-  # G=8 deliberate: within a step, some rollouts solve the problem and some fail,
-  # providing reward variance for the OutcomeHead gradient even on easy problems.
-  n_steps: 200
-  batch_size: 4             # problems per gradient step
-  num_generations: 8        # G rollouts per problem
+  # 400 steps × 4 problems × 128 rollouts = 204 800 on-policy trajectories.
+  # Extended from 200 (v1): losses were still declining at step 200.
+  # G=128 matches eval pass@128 scale. batch_size=4 is problems per step (independent of G).
+  n_steps: 400
+  batch_size: 4
+  num_generations: 128
 
-  learning_rate: 3.0e-4     # AdamW for VAE+ZInjector+OutcomeHead; not applied to backbone
+  learning_rate: 3.0e-4     # AdamW for Encoder+ZInjector+OutcomeHead; not applied to backbone
 
-  # KL annealing: ramp kl_weight from 0 → 1 over the first kl_warmup_frac of
-  # Phase 0 steps. Prevents posterior collapse (σ² ≈ prior) seen in v1.
-  kl_warmup_frac: 0.5
-
-  # Loss weights.
-  # lambda_trans_peak: peak weight for L_trans reached at step n_steps/2.
-  #   Calibrated so L_trans ≈ 22% of gradient budget when L_ELBO ≈ 20.
-  #   (peak × 2.0 / (20 + peak × 2.0 + lambda_out × 0.55) ≈ 0.22 → peak ≈ 3.0)
-  #   The original peak=0.5 gave L_trans only ~4%, leaving the transition model flat.
-  # lambda_out: upscaled from 1.0 → 5.0 so L_out earns ~10% gradient budget.
-  #   L_out BCE magnitude ≈ 0.55 at 15% reward rate. Without scaling, L_out earns only
-  #   ~2% budget after raising lambda_trans_peak, which is insufficient to teach z_3
-  #   to encode outcome quality — the only feature L_RL will exploit in Phase 1.
-  #   Approximate Phase 0 loss budget (all at peak, step ≥ 100):
-  #     L_ELBO  × 1.0 ≈ 20   →  65%   reconstruction + KL
-  #     L_trans × 3.0 ≈  6   →  19%   Markov pressure
-  #     L_out   × 5.0 ≈  2.75 → 9%   outcome quality signal
-  #     (remaining ~7% = variance in ELBO across steps)
-  lambda_elbo: 1.0
+  # Loss weights (v2 — no ELBO/KL).
+  # Approximate Phase 0 gradient budget at peak (step >= 200):
+  #   L_trans × 3.0  →  ~50%   primary: Markov structure
+  #   L_out   × 5.0  →  ~23%   outcome quality signal
+  #   L_calib × 1.0  →  ~10%   explicit σ² calibration
+  #   (remainder: variance across steps)
   lambda_trans_peak: 3.0
   lambda_out: 5.0
+  lambda_calib: 1.0
 
   logging_steps: 10
   save_steps: 50
 
 # ---------------------------------------------------------------------------
-# Phase 1 — joint GRPO on MATH-B-I (inherits baseline training block)
-# Overrides: seed to 11 (matches all latent arms), lambda weights added.
+# Phase 1 — joint GRPO on Level 5 hard pool (inherits baseline training block)
 # ---------------------------------------------------------------------------
 training:
   seed: 11
-  # batch_size here = problems per gradient step (× G=8 rollouts each).
-  # v1 used 1, giving only 200 problem-encounters over 200 steps vs the baseline's
-  # ~800 (4 grad-accum × 1 problem × 200 steps). v2 uses 4 to close that gap:
-  # 4 × 200 = 800 problem-encounters, matching the baseline's effective budget.
-  # Gradient checkpointing keeps activation memory manageable on A100 80 GB.
-  # If OOM occurs, fall back to batch_size=2 and double max_steps to 400.
   batch_size: 4
+  # gradient_checkpointing: KEEP true even on Blackwell 96 GB.
+  # _run_pipeline_with_grad processes all B×G = 4×128 = 512 sequences with_grad in one
+  # forward pass. Without GC: ~45 GB activations + ~22 GB peak logits + 18 GB optimizer
+  # ≈ 85 GB — uncomfortably close to the 96 GB limit. With GC: ~30 GB total — safe.
   gradient_checkpointing: true
 
-# Phase 1 loss weights.
-# λ_vae = 0.05: soft VAE anchor. Prevents encoder drift without dominating L_RL.
-# λ_trans_peak = 1.0: LOWER than Phase 0 intentionally.
-#   Phase 0 aggressively trained the transition model (peak=3.0, contributing ~22% of gradient).
-#   Phase 1 only needs to maintain Markov structure while L_RL drives task learning.
-#   Approximate Phase 1 loss budget (L_RL≈2, L_trans≈2, L_vae≈1):
-#     L_RL          × 1.0  ≈ 2   →  40%   ← primary objective
-#     L_trans       × 1.0  ≈ 2   →  40%   ← Markov maintenance
-#     L_vae         × 0.05 ≈ 1   →  20%   ← anchor
+# Phase 1 loss weights (v2).
+# λ_trans = 0.3: maintenance only — transition already well-trained in Phase 0
+#   (E1 diagnostic showed L_trans_held_out = 0.015 after Phase 0).
+#   Reduced from 1.0 (v1) to give L_RL more gradient budget headroom.
+# λ_calib = 0.5: lighter anchor — keeps σ² calibrated but does not dominate L_RL.
+#
+# Approximate Phase 1 gradient budget (L_RL≈2, L_trans≈0.6, L_calib≈0.55):
+#   L_RL          × 1.0  ≈ 2.0   →  ~65%   primary objective
+#   L_trans       × 0.3  ≈ 0.6   →  ~19%   Markov maintenance
+#   L_calib       × 0.5  ≈ 0.28  →  ~9%    uncertainty anchor
 phase1_loss:
-  lambda_trans_peak: 1.0   # peak of lambda_trans_schedule warmup (0.1 → 1.0 over 100 steps)
-  lambda_vae: 0.05          # L_VAE is scaled by this throughout Phase 1
+  lambda_trans_peak: 0.3
+  lambda_calib: 0.5
 
 # ---------------------------------------------------------------------------
-# NFR6 diagnostic — run_nfr6_gate.py (v3-correct gate)
-#
-# Uses the FULL trained pipeline (backbone + trained ZInjector + trained VAE)
-# so that repr_h values come from the same z-injected distribution the encoder
-# was trained on.  DO NOT use generate_phase0_rollouts.py (base backbone only).
-#
-#   python scripts/run_nfr6_gate.py --config configs/train_latent_grpo.yaml \
-#       --n-problems 200 --n-rollouts 2
+# NFR6 diagnostic — run_nfr6_gate.py
 # ---------------------------------------------------------------------------
 nfr6:
   output_dir: "runs/latent_grpo/plots"
-  method: "umap"            # umap preferred on large datasets (faster than tsne)
+  method: "umap"

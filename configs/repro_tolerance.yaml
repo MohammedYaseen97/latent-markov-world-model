@@ -2,7 +2,7 @@
 # This file defines acceptable run-to-run metric drift under same config/seed conditions.
 
 reproducibility:
-  policy_version: "v1"
+  policy_version: "v2"
   applies_to:
     - baseline_grpo
     - token_markov_grpo
@@ -18,18 +18,17 @@ reproducibility:
     same_decode_settings_required: true
 
   # Absolute tolerance thresholds for SAME-SEED reruns.
-  # pass@1024 is the primary claim metric, so it gets the strictest threshold.
+  # pass@128 is the primary claim metric.
   absolute_metric_tolerance:
     pass@1: 0.020
     pass@16: 0.015
-    pass@1024: 0.010
+    pass@128: 0.010
 
   # If metrics are reported in percentage points (0-100 scale), use these.
-  # Example: 0.010 probability == 1.0 percentage point.
   absolute_tolerance_percentage_points:
     pass@1: 2.0
     pass@16: 1.5
-    pass@1024: 1.0
+    pass@128: 1.0
 
   failure_policy:
     on_violation:

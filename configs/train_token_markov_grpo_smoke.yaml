@@ -43,4 +43,4 @@ token_markov:
   # context_reset) inherit from train_token_markov_grpo.yaml.
 
 evaluation:
-  path: "data/math_beyond_smoke.jsonl"
+  path: "data/math_level5_hard_pool.jsonl"

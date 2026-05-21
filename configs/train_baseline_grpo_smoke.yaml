@@ -34,4 +34,4 @@ training:
   save_steps: 5
 
 evaluation:
-  path: "data/math_beyond_smoke.jsonl"
+  path: "data/math_level5_hard_pool.jsonl"

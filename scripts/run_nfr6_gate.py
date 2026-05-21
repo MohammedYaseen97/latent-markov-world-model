@@ -148,7 +148,7 @@ def load_phase0_pipeline(
     revision    = primary_cfg.get("revision", "main")
     latent_dim  = int(latent_cfg.get("latent_dim", 64))
     hidden_dim  = int(latent_cfg.get("hidden_dim", 1536))
-    ckpt_path   = Path(phase0_cfg.get("checkpoint_path", "runs/latent_grpo/phase0_vae.pt"))
+    ckpt_path   = Path(phase0_cfg.get("checkpoint_path", "runs/latent_grpo/phase0_encoder.pt"))
 
     print(f"Loading backbone {model_id} @ {revision} …", flush=True)
     model = AutoModelForCausalLM.from_pretrained(

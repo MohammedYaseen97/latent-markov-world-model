@@ -6,9 +6,9 @@ accelerate==1.13.0
 trl==1.0.0
 peft==0.18.1
 bitsandbytes==0.49.2   # 4-bit quantization for smoke runs on 8 GB GPU
-vllm==0.11.0           # fast inference for pass@1024 eval
+vllm==0.11.0           # fast inference for pass@128 eval
 
-# Pinned for byte-stable Hub downloads + Arrow/cache behavior alongside configs/math_beyond_hf_revision.txt
+# Pinned for byte-stable Hub downloads + Arrow/cache behavior.
 datasets==4.8.4
 huggingface_hub==1.10.1
 

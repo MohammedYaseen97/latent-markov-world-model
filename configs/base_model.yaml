@@ -1,8 +1,7 @@
 # Checkpoints for RL / eval (all four arms use the same primary, or the same fallback if you switch).
 #
-# MATH-B-I row list comes from Hub *base* model pass@1024 columns (see reports/DATA_PROTOCOL.md).
-# That only defines WHICH problems are in the pool — not which Hugging Face checkpoint you must
-# train. We use instruction-tuned weights for trainable rollouts; document in any writeup.
+# All four arms run on the Level 5 hard pool (see reports/DATA_PROTOCOL.md).
+# We use instruction-tuned weights for trainable rollouts; document in any writeup.
 
 primary:
   huggingface_repo_id: "Qwen/Qwen2.5-1.5B-Instruct"
@@ -11,6 +10,10 @@ primary:
   # Pinned commit — ensures identical weights across all runs regardless of Hub updates.
   # Refresh with: python -c "from huggingface_hub import model_info; print(model_info('Qwen/Qwen2.5-1.5B-Instruct').sha)"
   revision: "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
+  # PyTorch 2.8 SDPA dispatches to Flash Attention kernels on Blackwell natively.
+  # No separate flash-attn package needed. Reduces O(S²) attention matrix materialization
+  # and gives ~30% faster attention vs eager. Compatible with gradient checkpointing.
+  attn_implementation: "sdpa"
 
 # Same convention: instruct-style distill so behavior matches primary track (chat, follows prompts).
 fallback:
