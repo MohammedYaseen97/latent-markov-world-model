@@ -24,13 +24,13 @@ Schema (one JSON object per line):
   source_level : 5 (for manifest mutual exclusivity check)
 
 Usage:
-    python scripts/prepare_math_level5_pool.py \\
-        --model-id Qwen/Qwen2.5-1.5B-Instruct \\
-        --output data/math_level5_hard_pool.jsonl
+    # Model ID and revision are read from configs/base_model.yaml automatically.
+    python scripts/prepare_math_level5_pool.py
 
-    # With custom n_samples and batch size:
+    # With explicit overrides:
     python scripts/prepare_math_level5_pool.py \\
         --model-id Qwen/Qwen2.5-1.5B-Instruct \\
+        --model-revision 989aa7980e4cf806f80c7fef2b1adb7bc71aa306 \\
         --n-samples 128 \\
         --batch-size 16 \\
         --output data/math_level5_hard_pool.jsonl
@@ -46,12 +46,21 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import torch
+import yaml
 from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+
+# Read pinned model ID + revision from base_model.yaml — single source of truth.
+_base_cfg = yaml.safe_load((REPO_ROOT / "configs" / "base_model.yaml").read_text())
+_PRIMARY   = _base_cfg["primary"]
+_DEFAULT_MODEL_ID       = _PRIMARY["huggingface_repo_id"]
+_DEFAULT_MODEL_REVISION = _PRIMARY["revision"]
+_DEFAULT_ATTN_IMPL      = _PRIMARY.get("attn_implementation", "sdpa")
+
 from src.training.grpo_baseline import (
     SYSTEM_PROMPT,
     _extract_boxed as extract_boxed,
@@ -189,12 +198,12 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
-        "--model-id", type=str, default="Qwen/Qwen2.5-1.5B-Instruct",
-        help="HF model ID for pass@128 filtering.",
+        "--model-id", type=str, default=_DEFAULT_MODEL_ID,
+        help="HF model ID for pass@128 filtering (default: from configs/base_model.yaml).",
     )
     p.add_argument(
-        "--model-revision", type=str, default=None,
-        help="HF model revision (default: latest).",
+        "--model-revision", type=str, default=_DEFAULT_MODEL_REVISION,
+        help="HF model revision SHA (default: pinned commit from configs/base_model.yaml).",
     )
     p.add_argument(
         "--n-samples", type=int, default=128,
@@ -242,15 +251,17 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Load pretrained model
     # ------------------------------------------------------------------
-    logger.info("Loading %s ...", args.model_id)
-    kwargs: dict = {"torch_dtype": torch.bfloat16, "device_map": "auto"}
-    if args.model_revision:
-        kwargs["revision"] = args.model_revision
-
-    model     = AutoModelForCausalLM.from_pretrained(args.model_id, **kwargs)
+    logger.info("Loading %s @ %s  attn=%s ...", args.model_id, args.model_revision, _DEFAULT_ATTN_IMPL)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_id,
+        revision=args.model_revision,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation=_DEFAULT_ATTN_IMPL,
+    )
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_id, trust_remote_code=True, padding_side="left",
-        **({"revision": args.model_revision} if args.model_revision else {}),
+        args.model_id, revision=args.model_revision,
+        trust_remote_code=True, padding_side="left",
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
