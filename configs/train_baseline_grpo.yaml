@@ -41,7 +41,12 @@ training:
   # means MLP activations are ~50 GB at B=32 without GC (28 layers × 32×1524×8960×2 bytes).
   # With GC: recomputes MLP on backward, keeping only layer inputs in memory (~4 GB).
   gradient_checkpointing: true
-  use_vllm: false
+  use_vllm: true
+  # Colocate mode (TRL default): vLLM runs on the same GPU as training.
+  # 0.50 × 96 GB = 48 GB for vLLM KV cache; training needs ~22 GB → ~70 GB total, no sleep mode.
+  # TRL passes seed=<training.seed> to vLLM SamplingParams automatically → reproducible.
+  vllm_gpu_memory_utilization: 0.50
+  vllm_max_model_len: 2048  # prompt (~300 tok) + max_completion_length (1024) + headroom
   logging_steps: 10
   save_steps: 200
 

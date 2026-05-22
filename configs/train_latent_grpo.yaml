@@ -110,6 +110,12 @@ phase0:
 training:
   seed: 11
   batch_size: 1
+  # vLLM cannot be used: the 3-chunk loop in grpo_latent.py injects z_h embeddings as
+  # input prefix between chunks. vLLM has no hook for this mid-generation state injection.
+  # The custom loop uses HF model.generate() per chunk. Explicitly override to false.
+  use_vllm: false
+  vllm_gpu_memory_utilization: ~
+  vllm_max_model_len: ~
   # gradient_checkpointing: REQUIRED — logits bottleneck from 151,936-token vocab.
   # Even at B×G = 1×128 = 128 seqs: logits 21 GB + model 3 GB + optimizer 18 GB = 42 GB.
   # Without GC, MLP activations (28 layers × 128 × 541 tok × 8960 intermediate × 2B)

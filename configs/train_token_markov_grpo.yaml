@@ -36,3 +36,12 @@ token_markov:
   context_reset: true              # Old chunk tokens are DELETED. Next chunk context = query + carryover.
                                    # Implemented via custom training loop in grpo_token_markov.py —
                                    # NOT TRL's GRPOTrainer (which assumes one continuous sequence per rollout).
+
+# vLLM cannot be used here: token-markov generation is multi-round with per-chunk context
+# resets — vLLM generates a single flat sequence and has no hook for context reset between
+# chunks. The custom loop uses HF model.generate() per chunk. Explicitly override to false
+# so this arm does not inherit use_vllm=true from train_baseline_grpo.yaml.
+training:
+  use_vllm: false
+  vllm_gpu_memory_utilization: ~
+  vllm_max_model_len: ~
