@@ -46,7 +46,7 @@ training:
   # 0.50 × 96 GB = 48 GB for vLLM KV cache; training needs ~22 GB → ~70 GB total, no sleep mode.
   # TRL passes seed=<training.seed> to vLLM SamplingParams automatically → reproducible.
   vllm_gpu_memory_utilization: 0.50
-  vllm_max_model_len: 2048  # prompt (~300 tok) + max_completion_length (1024) + headroom
+  vllm_max_model_len: 2048  # maps to GRPOConfig.vllm_max_model_length; prompt (~300 tok) + max_completion_length (1024) + headroom
   logging_steps: 10
   save_steps: 200
 
