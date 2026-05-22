@@ -225,7 +225,7 @@ def train_baseline(config: dict[str, Any], run_dir: Path) -> None:
             "vllm_gpu_memory_utilization", 0.50
         )
         if training.get("vllm_max_model_len"):
-            grpo_kwargs["vllm_max_model_len"] = training["vllm_max_model_len"]
+            grpo_kwargs["vllm_max_model_length"] = training["vllm_max_model_len"]
 
     args = GRPOConfig(
         output_dir=str(run_dir),
