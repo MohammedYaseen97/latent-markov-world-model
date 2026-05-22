@@ -12,17 +12,18 @@ training:
   learning_rate: 1.0e-6
 
   # Generation group: 128 completions per prompt — matches eval pass@128 scale.
-  # TRL constraint: num_generations % batch_size == 0 (128 % 32 == 0 ✓).
+  # TRL constraint: num_generations % batch_size == 0 (128 % 8 == 0 ✓).
   #
-  # batch_size=32 chosen to fit Qwen2.5's 151,936-token vocabulary:
-  #   logits tensor = 32 × 1524tok × 151,936vocab × 2B ≈ 14 GB (safe on 96 GB)
-  #   batch_size=128 gives 55 GB logits alone — OOM after adding model+optimizer.
+  # batch_size=8: Qwen2.5's 151,936-token vocab + Level 5 prompt lengths (~2048 tok total):
+  #   logits tensor = 8 × 2048tok × 151,936vocab × 2B ≈ 5 GB (safe)
+  #   batch_size=32 → ~20 GB logits; with MLP activations still live → 65+ GB → OOM
+  #   batch_size=8 → even without working gradient_checkpointing: ~37 GB total → fits
   #
-  # grad_accum_steps=16 preserves the same effective problem batch:
-  #   32 seqs × 16 steps = 512 seqs = 128 rollouts × 4 problems per optimizer update.
+  # grad_accum_steps=64 preserves the original effective problem batch:
+  #   8 seqs × 64 steps = 512 seqs = 128 rollouts × 4 problems per optimizer update.
   num_generations: 128
-  batch_size: 32            # per_device_train_batch_size; 4 steps = 1 problem's rollouts
-  grad_accum_steps: 16      # effective problem batch = 4 per weight update
+  batch_size: 8             # per_device_train_batch_size; 16 steps = 1 problem's rollouts
+  grad_accum_steps: 64      # effective problem batch = 4 per weight update
 
   # Completion budget: 1024 tokens gives enough room for chain-of-thought + \boxed{answer}.
   max_completion_length: 1024
