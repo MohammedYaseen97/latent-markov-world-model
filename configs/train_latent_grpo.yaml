@@ -2,12 +2,14 @@
 #
 # Phase 0: backbone FROZEN; Encoder + ZInjector + OutcomeHead trained ONLINE.
 #   Each step: generate G=128 rollouts per problem → re-run with grad → update encoder/ZInj.
-#   400 steps × 4 problems × 128 rollouts = 204 800 on-policy trajectories.
+#   400 steps × 1 problem × 128 rollouts = 51 200 on-policy trajectories.
 # Phase 1: backbone UNFROZEN; on-policy GRPO with live z injection on Level 5 hard pool.
-#   200 steps × 4 problems × 128 rollouts = 102 400 fresh rollouts.
+#   200 steps × 1 problem × 128 rollouts = 25 600 fresh rollouts.
 #
-# G=128 matches eval pass@128 scale. batch_size (problems per step) is unchanged at 4
-# because the latent custom loop uses batch_size = problems, not total sequences.
+# batch_size=1 (not 4): Qwen2.5's 151,936-token vocabulary makes the logits tensor
+# the VRAM bottleneck in _run_pipeline_with_grad. At B×G sequences and ~541 tok/chunk:
+#   B=4 problems → 512 seqs × 541 tok × 151,936 vocab × 2B = 84 GB logits alone → OOM
+#   B=1 problem  → 128 seqs × 541 tok × 151,936 vocab × 2B = 21 GB logits → fits
 #
 # Key v2 changes from v1:
 #   - VAE-ELBO removed; replaced by explicit calibration loss L_calib
@@ -80,11 +82,11 @@ phase0:
   pool_path: "data/math_easy_pool.jsonl"      # L1–L4 only (mutual exclusivity with L5 hard pool)
   checkpoint_path: "runs/latent_grpo/phase0_encoder.pt"
 
-  # 400 steps × 4 problems × 128 rollouts = 204 800 on-policy trajectories.
+  # 400 steps × 1 problem × 128 rollouts = 51 200 on-policy trajectories.
   # Extended from 200 (v1): losses were still declining at step 200.
-  # G=128 matches eval pass@128 scale. batch_size=4 is problems per step (independent of G).
+  # batch_size=1: logits bottleneck — see header comment.
   n_steps: 400
-  batch_size: 4
+  batch_size: 1
   num_generations: 128
 
   learning_rate: 3.0e-4     # AdamW for Encoder+ZInjector+OutcomeHead; not applied to backbone
@@ -107,11 +109,12 @@ phase0:
 # ---------------------------------------------------------------------------
 training:
   seed: 11
-  batch_size: 4
-  # gradient_checkpointing: KEEP true even on Blackwell 96 GB.
-  # _run_pipeline_with_grad processes all B×G = 4×128 = 512 sequences with_grad in one
-  # forward pass. Without GC: ~45 GB activations + ~22 GB peak logits + 18 GB optimizer
-  # ≈ 85 GB — uncomfortably close to the 96 GB limit. With GC: ~30 GB total — safe.
+  batch_size: 1
+  # gradient_checkpointing: REQUIRED — logits bottleneck from 151,936-token vocab.
+  # Even at B×G = 1×128 = 128 seqs: logits 21 GB + model 3 GB + optimizer 18 GB = 42 GB.
+  # Without GC, MLP activations (28 layers × 128 × 541 tok × 8960 intermediate × 2B)
+  # add another ~35 GB → 77 GB total → uncomfortably close to 96 GB limit.
+  # With GC: only layer inputs stored (~2 GB), total ≈ ~44 GB → safe.
   gradient_checkpointing: true
 
 # Phase 1 loss weights (v2).

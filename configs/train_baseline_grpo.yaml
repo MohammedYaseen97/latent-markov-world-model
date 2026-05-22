@@ -12,13 +12,17 @@ training:
   learning_rate: 1.0e-6
 
   # Generation group: 128 completions per prompt — matches eval pass@128 scale.
-  # TRL constraint: batch_size % num_generations == 0.
-  # batch_size = 128 here means 1 unique problem per TRL mini-batch (128 rollouts per problem).
-  # grad_accum_steps = 4 → 4 unique problems per optimizer update (same as before).
-  # "batch_size" as problems-per-update is unchanged; only TRL's sequence-level knob changes.
+  # TRL constraint: num_generations % batch_size == 0 (128 % 32 == 0 ✓).
+  #
+  # batch_size=32 chosen to fit Qwen2.5's 151,936-token vocabulary:
+  #   logits tensor = 32 × 1524tok × 151,936vocab × 2B ≈ 14 GB (safe on 96 GB)
+  #   batch_size=128 gives 55 GB logits alone — OOM after adding model+optimizer.
+  #
+  # grad_accum_steps=16 preserves the same effective problem batch:
+  #   32 seqs × 16 steps = 512 seqs = 128 rollouts × 4 problems per optimizer update.
   num_generations: 128
-  batch_size: 128           # per_device_train_batch_size = 1 problem × 128 rollouts
-  grad_accum_steps: 4       # effective problem batch = 4 per weight update
+  batch_size: 32            # per_device_train_batch_size; 4 steps = 1 problem's rollouts
+  grad_accum_steps: 16      # effective problem batch = 4 per weight update
 
   # Completion budget: 1024 tokens gives enough room for chain-of-thought + \boxed{answer}.
   max_completion_length: 1024
@@ -32,7 +36,10 @@ training:
   num_epochs: 40
   max_steps: 200
 
-  gradient_checkpointing: false   # RTX Pro 6000 Blackwell 96 GB, 1.5B model — not needed (B=128 seq per step)
+  # gradient_checkpointing REQUIRED even on 96 GB: Qwen2.5-1.5B's intermediate_size=8960
+  # means MLP activations are ~50 GB at B=32 without GC (28 layers × 32×1524×8960×2 bytes).
+  # With GC: recomputes MLP on backward, keeping only layer inputs in memory (~4 GB).
+  gradient_checkpointing: true
   use_vllm: false
   logging_steps: 10
   save_steps: 200
