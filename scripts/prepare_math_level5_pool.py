@@ -482,7 +482,7 @@ def main() -> None:
         "raw_level5_count":         len(deduped),
         "solvable_excluded":        n_solved,
         "row_count":                len(final_records),
-        "output_path":              str(args.output.relative_to(REPO_ROOT)),
+        "output_path":              str(args.output.resolve().relative_to(REPO_ROOT)),
         "sha256":                   sha,
         "library_versions_at_build": pinned_library_versions(),
         "mutual_exclusivity_note":  "Level 5 only; easy pool uses Level 1-4 only. Intersection = empty.",
