@@ -190,11 +190,13 @@ def train_baseline(config: dict[str, Any], run_dir: Path) -> None:
             lora_dropout=0.05,
         )
     else:
+        attn_impl = primary.get("attn_implementation", "sdpa")
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             revision=revision,
-            dtype=dtype,
+            torch_dtype=dtype,
             device_map="auto",
+            attn_implementation=attn_impl,
         )
         peft_config = None
 
@@ -219,7 +221,11 @@ def train_baseline(config: dict[str, Any], run_dir: Path) -> None:
 
     grpo_kwargs: dict[str, Any] = {}
     if training["use_vllm"]:
-        grpo_kwargs["vllm_gpu_memory_utilization"] = 0.3
+        grpo_kwargs["vllm_gpu_memory_utilization"] = training.get(
+            "vllm_gpu_memory_utilization", 0.50
+        )
+        if training.get("vllm_max_model_len"):
+            grpo_kwargs["vllm_max_model_len"] = training["vllm_max_model_len"]
 
     args = GRPOConfig(
         output_dir=str(run_dir),
