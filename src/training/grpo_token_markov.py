@@ -734,7 +734,8 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
 
             batch = problems[batch_start : batch_start + batch_sz]
             optimizer.zero_grad()
-            accum_loss = None
+            accum_loss_val: float = 0.0   # scalar accumulator for logging
+            step_has_grad: bool   = False
             step_rewards: list[float] = []      # all rewards across all problems in step
             step_tokens = 0
 
@@ -783,8 +784,15 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
                     # is active during the policy gradient forward pass.
                     model.train()
 
-                    # --- Compute loss over all traces with non-zero advantage ---
-                    batch_loss = None
+                    # --- Compute loss per trace, backward immediately ---
+                    # compute_trace_loss processes one trace = one sequence at a
+                    # time, so the per-trace computation graph is small (~180 MB
+                    # per trace × vocab=151,936).  Calling backward() immediately
+                    # after each trace releases that graph before the next trace
+                    # is processed.  Without this, all G=128 graphs are live
+                    # simultaneously (~23 GB held before the single backward call).
+                    # Advantages are pre-computed over the full group, so GRPO
+                    # correctness is unchanged — this is pure engineering.
                     for trace, adv in zip(traces, advantages):
                         if not trace.chunks or adv == 0.0:
                             continue
@@ -795,17 +803,15 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
                         )
                         if loss is None:
                             continue
-                        batch_loss = loss if batch_loss is None else batch_loss + loss
-
-                    if batch_loss is not None:
-                        scaled = batch_loss / (G * grad_accum)
-                        accum_loss = scaled if accum_loss is None else accum_loss + scaled
+                        scaled = loss / (G * grad_accum)
+                        scaled.backward()   # release this trace's graph immediately
+                        step_has_grad = True
+                        accum_loss_val += scaled.item()
                     model.eval()  # back to eval for next problem's generation
 
-            # Backward + optimizer step.
+            # Optimizer step — backward already done per-trace above.
             grad_norm = 0.0
-            if accum_loss is not None and accum_loss.requires_grad:
-                accum_loss.backward()
+            if step_has_grad:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
                 optimizer.step()
 
@@ -814,7 +820,7 @@ def train_token_markov(config: dict[str, Any], run_dir: Path) -> None:
 
             mean_reward = sum(step_rewards) / len(step_rewards) if step_rewards else 0.0
             reward_std = float(torch.tensor(step_rewards).std().item()) if step_rewards else 0.0
-            loss_val = accum_loss.item() if accum_loss is not None else 0.0
+            loss_val = accum_loss_val
             frac_zero_std = 1.0 if reward_std == 0.0 else 0.0
 
             # Accumulate into pending log window.

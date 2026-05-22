@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random as _random
 from pathlib import Path
 from typing import Any
@@ -150,19 +151,35 @@ def _fwd_with_hidden(
     input_ids: torch.Tensor | None = None,
     inputs_embeds: torch.Tensor | None = None,
     attention_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Model forward that returns (logits, last_hidden_states).
+    need_logits: bool = True,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
+    """Model forward that returns (logits | None, last_hidden_states).
 
-    Uses a hook on the final layer norm — efficient in both no_grad (generation)
-    and with_grad (training) contexts.  Handles PEFT wrapping:
+    When need_logits=False (Phase 0 — no L_RL), calls model.model(...) directly,
+    completely bypassing lm_head.  For B=128 seqs × vocab=151,936 this skips a
+    ~26 GB peak allocation per chunk (3 chunks → ~79 GB saved over one step).
 
+    When need_logits=True (Phase 1 — L_RL needs log π), uses a hook on the final
+    layer norm to capture hidden states while the full model forward runs.
+
+    Handles PEFT wrapping (hook path only):
       Non-PEFT: model.model → Qwen2Model          → .norm
       PEFT:     model.model → Qwen2ForCausalLM    → .model.norm
 
     Returns:
-        logits:      (B, seq_len, vocab_size)
-        last_hidden: (B, seq_len, hidden_dim)   — output of final layer norm
+        logits:      (B, seq_len, vocab_size)  or None when need_logits=False
+        last_hidden: (B, seq_len, hidden_dim)  — output of final layer norm
     """
+    if not need_logits:
+        # Call the base transformer directly — lm_head is never invoked.
+        # model.model is Qwen2Model which returns last_hidden_state directly.
+        out = model.model(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+        return None, out.last_hidden_state
+
     cap = _HiddenCapture()
     inner = model.model
     if hasattr(inner, "norm"):
@@ -439,6 +456,8 @@ def _run_pipeline_with_grad(
     z_injector: ZInjector,
     traces: list[dict],
     device: torch.device,
+    *,
+    compute_log_pi: bool = True,
 ) -> dict[str, Any]:
     """Re-run the full 3-chunk pipeline WITH gradient for all traces.
 
@@ -450,18 +469,21 @@ def _run_pipeline_with_grad(
     Chunk 3: right-padded [prefix_2|chunk2|chunk3] → repr_3 LIVE → z_3
 
     log_π per chunk: gathered from logits at the causal-LM shifted positions.
+    When compute_log_pi=False (Phase 0), lm_head is bypassed entirely — saves
+    ~26 GB per chunk (B=128 × seq≈683 × vocab=151,936 × 2 B).
 
     Args:
         model, vae, z_injector: all in training mode.
         traces: output of generate_latent_traces() for this step.
         device: CUDA device.
+        compute_log_pi: set False for Phase 0 (L_RL not used; logits not needed).
 
     Returns dict with:
         "repr_list"    : list[3 × Tensor (B, hidden)]  — LIVE
         "z_list"       : list[3 × Tensor (B, latent)]  — LIVE
         "mu_list"      : list[3 × Tensor (B, latent)]  — LIVE
         "logvar_list"  : list[3 × Tensor (B, latent)]  — LIVE
-        "log_pi_chunks": list[3 × list[B × Tensor(chunk_len,)]]  per-token log-prob
+        "log_pi_chunks": list[3 × list[B × Tensor(chunk_len,)]]  — empty when compute_log_pi=False
     """
     pad_id      = 0  # pad value for token-id inputs; actual vocab doesn't matter
     embed_layer = model.get_input_embeddings()
@@ -488,7 +510,9 @@ def _run_pipeline_with_grad(
     for i, seq in enumerate(full_seqs1):
         L = seq.shape[0]; fi1[i, :L] = seq; fa1[i, :L] = 1
 
-    logits1, hidden1 = _fwd_with_hidden(model, input_ids=fi1, attention_mask=fa1)
+    logits1, hidden1 = _fwd_with_hidden(
+        model, input_ids=fi1, attention_mask=fa1, need_logits=compute_log_pi
+    )
     del fi1, fa1
 
     repr_1_batch = torch.stack([
@@ -498,12 +522,13 @@ def _run_pipeline_with_grad(
     del hidden1
 
     log_pi_1: list[torch.Tensor] = []
-    for i in range(B):
-        pl = prompt_lengths[i]; rl = c1_lens[i]
-        sl = logits1[i, pl - 1:pl + rl - 1, :]              # (rl, vocab) — causal shift
-        c1 = chunk1_ids_list[i].to(device)
-        lp = sl.gather(1, c1.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
-        log_pi_1.append(lp)
+    if compute_log_pi:
+        for i in range(B):
+            pl = prompt_lengths[i]; rl = c1_lens[i]
+            sl = logits1[i, pl - 1:pl + rl - 1, :]          # (rl, vocab) — causal shift
+            c1 = chunk1_ids_list[i].to(device)
+            lp = sl.gather(1, c1.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
+            log_pi_1.append(lp)
     del logits1
 
     mu_1, logvar_1 = vae.encode(repr_1_batch)
@@ -521,7 +546,9 @@ def _run_pipeline_with_grad(
         fe2[i, 1 + L1:tot, :] = embed_layer(chunk2_ids_list[i].to(device))
         fa2[i, :tot] = 1
 
-    logits2, hidden2 = _fwd_with_hidden(model, inputs_embeds=fe2, attention_mask=fa2)
+    logits2, hidden2 = _fwd_with_hidden(
+        model, inputs_embeds=fe2, attention_mask=fa2, need_logits=compute_log_pi
+    )
     del fe2, fa2
 
     repr_2_batch = torch.stack([
@@ -531,12 +558,13 @@ def _run_pipeline_with_grad(
     del hidden2
 
     log_pi_2: list[torch.Tensor] = []
-    for i in range(B):
-        L1 = c1_lens[i]; L2 = c2_lens[i]
-        sl = logits2[i, L1:L1 + L2, :]                      # causal: pos L1 predicts c2[0]
-        c2 = chunk2_ids_list[i].to(device)
-        lp = sl.gather(1, c2.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
-        log_pi_2.append(lp)
+    if compute_log_pi:
+        for i in range(B):
+            L1 = c1_lens[i]; L2 = c2_lens[i]
+            sl = logits2[i, L1:L1 + L2, :]                  # causal: pos L1 predicts c2[0]
+            c2 = chunk2_ids_list[i].to(device)
+            lp = sl.gather(1, c2.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
+            log_pi_2.append(lp)
     del logits2
 
     mu_2, logvar_2 = vae.encode(repr_2_batch)
@@ -554,7 +582,9 @@ def _run_pipeline_with_grad(
         fe3[i, 1 + L2:tot, :] = embed_layer(chunk3_ids_list[i].to(device))
         fa3[i, :tot] = 1
 
-    logits3, hidden3 = _fwd_with_hidden(model, inputs_embeds=fe3, attention_mask=fa3)
+    logits3, hidden3 = _fwd_with_hidden(
+        model, inputs_embeds=fe3, attention_mask=fa3, need_logits=compute_log_pi
+    )
     del fe3, fa3
 
     repr_3_batch = torch.stack([
@@ -564,12 +594,13 @@ def _run_pipeline_with_grad(
     del hidden3
 
     log_pi_3: list[torch.Tensor] = []
-    for i in range(B):
-        L2 = c2_lens[i]; L3 = c3_lens[i]
-        sl = logits3[i, L2:L2 + L3, :]
-        c3 = chunk3_ids_list[i].to(device)
-        lp = sl.gather(1, c3.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
-        log_pi_3.append(lp)
+    if compute_log_pi:
+        for i in range(B):
+            L2 = c2_lens[i]; L3 = c3_lens[i]
+            sl = logits3[i, L2:L2 + L3, :]
+            c3 = chunk3_ids_list[i].to(device)
+            lp = sl.gather(1, c3.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
+            log_pi_3.append(lp)
     del logits3
 
     mu_3, logvar_3 = vae.encode(repr_3_batch)
@@ -619,10 +650,11 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
     revision  = primary.get("revision", "main")
     dtype     = getattr(torch, primary.get("dtype", "bfloat16"))
 
-    n_steps       = int(phase0_cfg.get("n_steps",         400))
-    batch_size    = int(phase0_cfg.get("batch_size",        4))
-    G             = int(phase0_cfg.get("num_generations", 128))
-    lr            = float(phase0_cfg.get("learning_rate",  3e-4))
+    n_steps          = int(phase0_cfg.get("n_steps",           400))
+    batch_size       = int(phase0_cfg.get("batch_size",          4))
+    G                = int(phase0_cfg.get("num_generations",   128))
+    micro_batch_size = int(phase0_cfg.get("micro_batch_size",   32))
+    lr               = float(phase0_cfg.get("learning_rate",  3e-4))
     lambda_trans_peak  = float(phase0_cfg.get("lambda_trans_peak",  3.0))
     lambda_out         = float(phase0_cfg.get("lambda_out",         5.0))
     lambda_calib       = float(phase0_cfg.get("lambda_calib",       1.0))
@@ -731,24 +763,46 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
         model.zero_grad(set_to_none=True)
         optimizer.zero_grad()
 
-        pipe = _run_pipeline_with_grad(model, vae, z_injector, traces, device)
+        # Micro-batch loop: split B×G traces into chunks of micro_batch_size.
+        # Each chunk's loss is scaled by 1/n_micro and backward() is called
+        # immediately, releasing that chunk's computation graph before the
+        # next chunk is processed.  Mathematically identical to one full-batch
+        # backward: L_trans / L_out / L_calib are all mean-reduced within each
+        # micro-batch, and averaging over n_micro micro-batches preserves the
+        # same mean.  Advantages are not used in Phase 0 (no L_RL), so there is
+        # no group-normalization dependency across micro-batches.
+        n_total = len(traces)
+        n_micro = math.ceil(n_total / micro_batch_size)
+        l_trans_acc = l_out_acc = l_calib_acc = total_acc = 0.0
 
-        rewards_t = torch.tensor(
-            [float(t["reward"]) for t in traces],
-            dtype=torch.float32, device=device,
-        ).unsqueeze(-1)                                      # (B×G, 1)
+        for mb_start in range(0, n_total, micro_batch_size):
+            mb_traces  = traces[mb_start : mb_start + micro_batch_size]
+            rewards_mb = torch.tensor(
+                [float(t["reward"]) for t in mb_traces],
+                dtype=torch.float32, device=device,
+            ).unsqueeze(-1)                                  # (mb, 1)
 
-        l_trans = vae.compute_transition_loss(pipe["z_list"])
-        l_out   = F.binary_cross_entropy(
-            outcome_head(pipe["z_list"][-1]), rewards_t
-        )
-        l_calib = vae.compute_calibration_loss(pipe["logvar_list"], rewards_t)
+            # Phase 0: no L_RL → lm_head bypassed → saves ~26 GB per chunk.
+            pipe = _run_pipeline_with_grad(
+                model, vae, z_injector, mb_traces, device, compute_log_pi=False
+            )
 
-        total: torch.Tensor = (
-            lambda_t * l_trans + lambda_out * l_out + lambda_calib * l_calib
-        )
+            l_trans = vae.compute_transition_loss(pipe["z_list"])
+            l_out   = F.binary_cross_entropy(
+                outcome_head(pipe["z_list"][-1]), rewards_mb
+            )
+            l_calib = vae.compute_calibration_loss(pipe["logvar_list"], rewards_mb)
 
-        total.backward()
+            total_mb: torch.Tensor = (
+                lambda_t * l_trans + lambda_out * l_out + lambda_calib * l_calib
+            ) / n_micro
+            total_mb.backward()  # release this micro-batch's computation graph
+
+            l_trans_acc += l_trans.detach().item() / n_micro
+            l_out_acc   += l_out.detach().item()   / n_micro
+            l_calib_acc += l_calib.detach().item() / n_micro
+            total_acc   += total_mb.detach().item()
+
         torch.nn.utils.clip_grad_norm_(vae_params, max_norm=1.0)
         optimizer.step()
         # Backbone grads accumulated during backward — zero now to prevent
@@ -756,10 +810,10 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
         model.zero_grad(set_to_none=True)
 
         # ── Logging ───────────────────────────────────────────────────────
-        for k, v in (("loss",  total.detach().item()),
-                     ("trans", l_trans.detach().item()),
-                     ("out",   l_out.detach().item()),
-                     ("calib", l_calib.detach().item())):
+        for k, v in (("loss",  total_acc),
+                     ("trans", l_trans_acc),
+                     ("out",   l_out_acc),
+                     ("calib", l_calib_acc)):
             pending[k] = pending.get(k, 0.0) + v
         reward_rate = sum(t["reward"] for t in traces) / len(traces)
         pending["reward_rate"] = pending.get("reward_rate", 0.0) + reward_rate
@@ -788,8 +842,8 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
             )
 
         step_bar.set_postfix(
-            loss=f"{total.item():.4f}",
-            calib=f"{l_calib.item():.4f}",
+            loss=f"{total_acc:.4f}",
+            calib=f"{l_calib_acc:.4f}",
             rwd=f"{reward_rate:.0%}",
         )
         step_bar.update(1)
@@ -937,12 +991,13 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     dtype        = getattr(torch, primary.get("dtype", "bfloat16"))
     is_smoke     = (config.get("experiment") or {}).get("profile") == "smoke"
 
-    seed         = int(training_cfg.get("seed", 42))
-    lr_backbone  = float(training_cfg.get("learning_rate", 1e-6))
-    lr_vae       = 3e-4        # VAE/ZInjector trained at Phase 0 rate throughout
-    G            = int(training_cfg.get("num_generations", 128))
-    batch_size   = int(training_cfg.get("batch_size",       4))
-    max_steps    = int(training_cfg.get("max_steps",       200))
+    seed             = int(training_cfg.get("seed", 42))
+    lr_backbone      = float(training_cfg.get("learning_rate", 1e-6))
+    lr_vae           = 3e-4    # VAE/ZInjector trained at Phase 0 rate throughout
+    G                = int(training_cfg.get("num_generations",   128))
+    batch_size       = int(training_cfg.get("batch_size",          4))
+    micro_batch_size = int(training_cfg.get("micro_batch_size",   32))
+    max_steps        = int(training_cfg.get("max_steps",         200))
     temperature  = float(training_cfg.get("temperature",   1.0))
     top_p        = float(training_cfg.get("top_p",         1.0))
     log_steps    = int(training_cfg.get("logging_steps",   10))
@@ -1081,22 +1136,41 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
         # ── Training step (with gradient) ─────────────────────────────────
         optimizer.zero_grad()
 
-        metrics = latent_training_step(
-            model=model, vae=vae, z_injector=z_injector,
-            traces=traces, advantages=advantages,
-            lambda_t=lambda_t, lambda_calib=lambda_calib,
-            device=device,
-        )
+        # Micro-batch loop over the B×G traces.
+        # Advantages are pre-computed over the FULL group (above) → GRPO
+        # group normalization is correct regardless of how we partition the
+        # backward passes.  Scaling each micro-batch's loss by 1/n_micro and
+        # calling backward() immediately is mathematically identical to one
+        # full-batch backward.
+        n_total_p1 = len(traces)
+        n_micro_p1 = math.ceil(n_total_p1 / micro_batch_size)
+        metrics_acc: dict[str, float] = {
+            "total": 0.0, "l_rl": 0.0, "l_calib": 0.0, "l_trans": 0.0
+        }
 
-        loss: torch.Tensor = metrics["total"]
-        loss.backward()
+        for mb_start in range(0, n_total_p1, micro_batch_size):
+            mb_traces = traces    [mb_start : mb_start + micro_batch_size]
+            mb_adv    = advantages[mb_start : mb_start + micro_batch_size]
+
+            metrics_mb = latent_training_step(
+                model=model, vae=vae, z_injector=z_injector,
+                traces=mb_traces, advantages=mb_adv,
+                lambda_t=lambda_t, lambda_calib=lambda_calib,
+                device=device,
+            )
+
+            (metrics_mb["total"] / n_micro_p1).backward()  # release graph immediately
+
+            for k in ("total", "l_rl", "l_calib", "l_trans"):
+                metrics_acc[k] += metrics_mb[k].item() / n_micro_p1
+
         all_params = list(model.parameters()) + vae_params
         torch.nn.utils.clip_grad_norm_(all_params, grad_clip)
         optimizer.step()
 
         # ── Logging ───────────────────────────────────────────────────────
         for k in ("total", "l_rl", "l_calib", "l_trans"):
-            pending[k] = pending.get(k, 0.0) + metrics[k].item()
+            pending[k] = pending.get(k, 0.0) + metrics_acc[k]
         pending["reward_rate"] = (
             pending.get("reward_rate", 0.0) + sum(rewards) / len(rewards)
         )
@@ -1128,9 +1202,9 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
             )
 
         step_bar.set_postfix(
-            loss=f"{loss.item():.4f}",
-            rl=f"{metrics['l_rl'].item():.4f}",
-            calib=f"{metrics['l_calib'].item():.4f}",
+            loss=f"{metrics_acc['total']:.4f}",
+            rl=f"{metrics_acc['l_rl']:.4f}",
+            calib=f"{metrics_acc['l_calib']:.4f}",
         )
         step_bar.update(1)
 
