@@ -93,15 +93,16 @@ phase0:
   # See header comment for full generation strategy rationale.
   n_steps: 400
   num_generations: 128       # rollouts per problem, total across Phase 0 (not per step)
-  # micro_batch_size = seqs_per_step = 128: process all 128 sequences in one
-  # forward/backward pass (no micro-batching).  Safe because:
-  #   - lm_head bypassed (need_logits=False) → no logits tensor at all
-  #   - GC disabled (see below) → all activations stored; backward is 2-3× faster
-  #   - Total activation memory: ~35 GB → fits in 96 GB with headroom
-  #   - 128×342 tokens per forward fully saturates the RTX Pro 6000
-  # Mathematically identical to micro_batch_size=32 (n_micro=1, divide-by-1).
-  # Also improves pos_weight stability (computed from all 128 samples, not 32).
-  micro_batch_size: 128
+  # micro_batch_size=64: two 64-seq micro-batches per step.
+  # _run_pipeline_with_grad holds 3 forward passes' activations simultaneously
+  # (passes for chunk1/chunk2/chunk3 are all alive until loss.backward()).
+  # Peak activation memory per micro-batch (N=64):
+  #   Pass 1 (seq≈541): ~30 GB   Pass 2+3 (seq≈342): ~16 GB each
+  #   Total: ~62 GB + 3 GB weights = ~65 GB  ← fits in 96 GB
+  # N=128 would need ~130 GB (OOM); N=64 is the sweet spot.
+  # With GC disabled (see below), backward has no recomputation overhead,
+  # so 2× micro-batches of fast backward ≈ faster than 1× GC-heavy backward.
+  micro_batch_size: 64
 
   learning_rate: 3.0e-4     # AdamW for Encoder+ZInjector+OutcomeHead; not applied to backbone
 
@@ -119,10 +120,9 @@ phase0:
   lambda_out: 5.0
   lambda_calib: 1.0
 
-  # Gradient checkpointing is NOT needed in Phase 0: lm_head is bypassed
-  # (no logits), Markov context = 342 tokens, and activation memory fits
-  # comfortably within 96 GB (~35 GB without GC).  Disabling GC also keeps
-  # model.config.use_cache=True, so model.generate() uses the KV cache.
+  # With micro_batch_size=64, activation memory without GC is ~65 GB (fits).
+  # Disabling GC removes the layer-recomputation overhead on the backward pass
+  # (backward is 2-3× faster; generate() uses KV cache regardless of this flag).
   gradient_checkpointing: false
 
   logging_steps: 10
