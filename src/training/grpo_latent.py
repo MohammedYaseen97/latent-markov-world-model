@@ -236,9 +236,11 @@ def generate_latent_traces(
                  forward([prompt|chunk1]) → repr_1 → z_1 → prefix_1
         Chunk 2: generate([prefix_1|chunk1]) → chunk2_ids        (crutch: chunk1 kept for generation quality)
                  forward([prefix_1|chunk2])       → repr_2 → z_2 → prefix_2  (strict Markov)
-        Chunk 3: generate([prefix_2|chunk2]) → chunk3_ids
+        Chunk 3: generate([prefix_2|chunk2]) → chunk3_ids        (crutch: chunk2 kept for generation quality)
                  grade(chunk1+chunk2+chunk3) → reward
-        (No chunk-3 forward pass — z_3 not needed for prefix injection.)
+        (No chunk-3 repr forward here — z_3 not needed for prefix injection;
+         repr_3 → z_3 is computed in _run_pipeline_with_grad with strict Markov
+         context [prefix_2|chunk3].)
 
     Args:
         model:       backbone in eval mode.
@@ -645,8 +647,7 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
         model_id / revision / dtype  — backbone (from "primary")
         pool_path                    — data/math_easy_pool.jsonl (L1–L4)
         n_steps                      — training steps (default: 400)
-        batch_size                   — problems per step (default: 4)
-        num_generations              — G rollouts per problem (default: 128)
+        num_generations              — G total rollouts per problem across Phase 0 (default: 128)
         learning_rate                — AdamW lr for Encoder/ZInj/OutcomeHead (default: 3e-4)
         lambda_trans_peak, lambda_trans_warmup_steps — λ_t schedule (peak and initial zero phase)
         lambda_out, lambda_calib — loss weights
@@ -664,10 +665,10 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
     revision  = primary.get("revision", "main")
     dtype     = getattr(torch, primary.get("dtype", "bfloat16"))
 
-    n_steps          = int(phase0_cfg.get("n_steps",           400))
-    batch_size       = int(phase0_cfg.get("batch_size",          4))
-    G                = int(phase0_cfg.get("num_generations",   128))
-    micro_batch_size = int(phase0_cfg.get("micro_batch_size",   32))
+    n_steps          = int(phase0_cfg.get("n_steps",          400))
+    G                = int(phase0_cfg.get("num_generations",  128))  # total rollouts per problem
+    micro_batch_size = int(phase0_cfg.get("micro_batch_size",  32))
+    seqs_per_step    = G                                              # 128 seqs/step (memory budget)
     lr               = float(phase0_cfg.get("learning_rate",  3e-4))
     lambda_trans_peak        = float(phase0_cfg.get("lambda_trans_peak",        3.0))
     lambda_trans_warmup_steps = int(phase0_cfg.get("lambda_trans_warmup_steps", 50))
@@ -743,9 +744,29 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "resolved_config.json").write_text(json.dumps(config, indent=2))
 
+    # ------------------------------------------------------------------
+    # Pre-shuffled assignment list
+    # n_problems = n_steps × seqs_per_step / G = n_steps (when seqs_per_step = G).
+    # Each of the n_steps problems gets exactly G rollout slots spread across
+    # all 400 training steps, giving ~110 unique problems per step (maximum
+    # diversity for L_out) while every problem accumulates G total rollouts
+    # (consistent with the pass@128 evaluation metric).
+    # ------------------------------------------------------------------
+    n_problems = min(n_steps, len(problems))
+    sampled_problems = _random.sample(problems, n_problems)
+    flat_assignments: list[dict] = [
+        p for p in sampled_problems for _ in range(G)
+    ]
+    _random.shuffle(flat_assignments)
+    logger.info(
+        "Phase 0 assignment: %d problems × %d rollouts = %d total "
+        "(~%.0f unique problems/step)",
+        n_problems, G, len(flat_assignments),
+        n_problems * (1 - (1 - 1 / n_problems) ** seqs_per_step),
+    )
+
     log_history: list[dict] = []
     pending:     dict[str, float] = {}
-    pool_order:  list[int] = []
 
     step_bar = tqdm(total=n_steps, desc="phase0", unit="step", dynamic_ncols=True)
 
@@ -761,20 +782,22 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
             effective_max  = n_steps    - lambda_trans_warmup_steps
             lambda_t = lambda_trans_schedule(effective_step, effective_max, peak=lambda_trans_peak)
 
-        # Sample batch_size problems (reshuffle when pool exhausted).
-        while len(pool_order) < batch_size:
-            order = list(range(len(problems)))
-            _random.shuffle(order)
-            pool_order.extend(order)
-        step_problems = [problems[pool_order.pop(0)] for _ in range(batch_size)]
+        # Slice this step's seqs_per_step problem-assignments from the flat list.
+        # Each entry is a problem dict; duplicates of the same problem within a
+        # step are rare (~1%) and harmless (they count as independent rollouts).
+        step_start   = global_step * seqs_per_step
+        step_problems = flat_assignments[step_start : step_start + seqs_per_step]
 
         # ── Rollout collection (no gradient) ──────────────────────────────
         with torch.no_grad():
             model.eval(); vae.eval(); z_injector.eval()
+            # n_rollouts=1: one rollout per slot.  B = seqs_per_step = 128 simultaneous
+            # sequences — same memory budget as before; contents are now ~110 distinct
+            # problems rather than 1 problem × 128.
             traces = generate_latent_traces(
                 model=model, tokenizer=tokenizer,
                 vae=vae, z_injector=z_injector,
-                problems=step_problems, n_rollouts=G,
+                problems=step_problems, n_rollouts=1,
                 chunk_tokens=chunk_tokens,
                 temperature=temperature, top_p=top_p,
                 device=device,
@@ -782,10 +805,9 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
 
         model.train(); vae.train(); z_injector.train(); outcome_head.train()
 
-        # Interleave: generate_latent_traces returns traces in problem-contiguous
-        # order [p0×G, p1×G, …].  Shuffling before the micro-batch loop ensures
-        # each micro-batch contains traces from all B problems rather than a
-        # single problem, giving L_out cross-problem gradient signal per micro-step.
+        # Shuffle traces to avoid any ordering artifacts within the step before
+        # micro-batching (flat_assignments is pre-shuffled across steps; this
+        # ensures uniform mixing within each step's micro-batches as well).
         _random.shuffle(traces)
 
         # ── Training step (with gradient) ─────────────────────────────────

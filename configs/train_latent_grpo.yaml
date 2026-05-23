@@ -1,24 +1,21 @@
 # Latent Markov arm — full RTX Pro 6000 Blackwell profile (v2 design).
 #
 # Phase 0: backbone FROZEN; Encoder + ZInjector + OutcomeHead trained ONLINE.
-#   Each step: generate G=128 rollouts × B=4 problems → 512 traces → update encoder/ZInj.
-#   400 steps × 4 problems × 128 rollouts = 204 800 on-policy trajectories.
+#   400 steps × 128 sequences/step = 51 200 on-policy trajectories.
+#   400 problems sampled from the easy pool, each given exactly G=128 rollouts.
+#   Sequences are spread across steps via pre-shuffled assignment (see below).
 # Phase 1: backbone UNFROZEN; on-policy GRPO with live z injection on Level 5 hard pool.
 #   200 steps × 1 problem × 128 rollouts = 25 600 fresh rollouts.
 #
-# Phase 0 uses B=4, G=128 (original design-doc value, now restored):
-#   Phase 0 losses (L_trans, L_out, L_calib) are all per-trace mean-reduced — no group
-#   normalization, zero mathematical dependency between traces from different problems.
-#   G=128 is kept at 128 to match the standard across all arms (uniform with eval and
-#   Phase 1 training) and to ensure each problem has sufficient rollouts for a
-#   reasonable positive-sample rate (128 × ~20% ≈ 25 correct rollouts per problem).
-#   B=4 gives L_out gradient from 4 different problems per gradient update → outcome
-#   head learns general correctness features rather than problem-specific ones.
-#
-#   The logits-bottleneck concern that originally forced B=1 is gone:
-#   Phase 0 uses need_logits=False (lm_head bypassed) so no logits tensor is materialized.
-#   Peak VRAM during generation: KV cache (512 seqs, GQA kv_heads=2) ≈ 8 GB + weights
-#   3 GB ≈ 11 GB total. Training micro-batches (32 × 342 tok) are trivially light.
+# Phase 0 generation strategy ("pre-shuffled assignment"):
+#   n_problems = n_steps × seqs_per_step / G = 400 × 128 / 128 = 400 problems.
+#   Build flat list: 400 problems × 128 rollout-slots = 51 200 entries.  Shuffle.
+#   Each step takes a window of 128 entries → ~110 unique problems per step,
+#   each contributing ~1-2 rollout slots.  Generate with n_rollouts=1 per slot.
+#   Effect: (1) every problem gets exactly G=128 rollouts (uniform with eval),
+#           (2) every gradient step sees ~110 diverse problems (L_out generalizes),
+#           (3) same memory as before (128 simultaneous sequences per step).
+#   "batch_size" is no longer a meaningful concept for Phase 0; removed from config.
 #
 # Key v2 changes from v1:
 #   - VAE-ELBO removed; replaced by explicit calibration loss L_calib
@@ -91,21 +88,17 @@ phase0:
   pool_path: "data/math_easy_pool.jsonl"      # L1–L4 only (mutual exclusivity with L5 hard pool)
   checkpoint_path: "runs/latent_grpo/phase0_encoder.pt"
 
-  # 400 steps × 4 problems × 128 rollouts = 204 800 on-policy trajectories.
+  # 400 steps × 128 sequences/step = 51 200 on-policy trajectories.
   # Extended from 200 (v1): losses were still declining at step 200.
-  # batch_size=4, num_generations=128: see header comment for full rationale.
+  # See header comment for full generation strategy rationale.
   n_steps: 400
-  batch_size: 4
-  num_generations: 128
-  # micro_batch_size: how many of the B×G=512 traces are processed per
-  # forward/backward call.  Reduces peak VRAM without affecting the math
-  # (L_trans/L_out/L_calib are mean-reduced; scaling by 1/n_micro preserves
-  # the mean).  32 → 16 forward passes of 32 seqs × 342 tok (strict Markov ctx) each:
-  #   hidden states 32×342×1536×2 = 0.034 GB  (trivially light)
+  num_generations: 128       # rollouts per problem, total across Phase 0 (not per step)
+  # micro_batch_size: how many of the 128 sequences/step are processed per
+  # forward/backward call.  32 → 4 passes of 32 seqs × 342 tok (Markov context):
+  #   hidden states 32×342×1536×2 = 0.034 GB  (vs 0.14 GB for all 128)
   #   lm_head bypassed in Phase 0 → no logits cost.
-  # Traces are shuffled before micro-batching (see grpo_latent.py) so each
-  # micro-batch of 32 contains ~8 traces from each of the 4 problems — L_out
-  # gets cross-problem gradient signal at every micro-step, not just per optimizer step.
+  # Each micro-batch of 32 sees ~27 unique problems (from ~110/step total),
+  # giving strong cross-problem gradient signal to L_out on every backward call.
   micro_batch_size: 32
 
   learning_rate: 3.0e-4     # AdamW for Encoder+ZInjector+OutcomeHead; not applied to backbone
