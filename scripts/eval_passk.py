@@ -407,6 +407,8 @@ def _estimate_pass_at_k_metrics_latent(
         attn_implementation=attn_impl,
     )
     model.eval()
+    if eval_cfg.get("compile_model", True):
+        model = torch.compile(model, mode="reduce-overhead")
 
     # Try loading tokenizer from saved backbone; fall back to original model ID
     # for checkpoints saved before the tokenizer was included.
@@ -527,6 +529,8 @@ def _estimate_pass_at_k_metrics_latent_pretrained(
         device_map="auto", attn_implementation=attn_impl,
     )
     model.eval()
+    if eval_cfg.get("compile_model", True):
+        model = torch.compile(model, mode="reduce-overhead")
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_id, revision=revision, trust_remote_code=True, padding_side="left",

@@ -39,6 +39,12 @@ evaluation:
   # 128 concurrent sequences safe at 96 GB for 1.5B model.
   gen_batch_size: 128
 
+  # torch.compile for latent arm backbone (reduce-overhead mode).
+  # Fuses repeated generate() call kernels after a one-time warm-up cost (~2 min).
+  # Gives ~25-40% throughput improvement on sustained batched generation.
+  # Set false only for debugging (compile errors, profile runs).
+  compile_model: true
+
   # Latent arm eval (HF-only; no vLLM).
   # latent_eval_n_per_problem: rollouts generated per problem per call to
   #   _generate_latent_eval_batch.  ceil(128/8)=16 calls × P problems × N seq each.
