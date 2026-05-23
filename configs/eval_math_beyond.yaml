@@ -54,4 +54,4 @@ evaluation:
   # Gives ~2.5× speedup over P=32 by reducing generate_latent_traces calls from
   # 560 (16 iters × 35 batches) to 224 (16 iters × 14 batches).
   # If OOM occurs, drop to 64 (B=512, ~56 GB); for more headroom use expandable_segments.
-  latent_eval_problem_batch_size: 80
+  latent_eval_problem_batch_size: 64
