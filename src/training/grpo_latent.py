@@ -207,6 +207,7 @@ def _fwd_with_hidden(
 # Rollout generation — shared by Phase 0 and Phase 1
 # ---------------------------------------------------------------------------
 
+@torch.no_grad()
 def generate_latent_traces(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -222,7 +223,8 @@ def generate_latent_traces(
 ) -> list[dict]:
     """Generate G chunked rollouts per problem with z_h prefix injection.
 
-    Runs entirely under torch.no_grad().  Computes repr_h and z_h internally
+    Runs entirely under torch.no_grad() (enforced by decorator — callers do
+    not need their own context manager).  Computes repr_h and z_h internally
     to inject z prefixes between chunks, but does NOT store them in the
     returned traces.  Only chunk_ids, prompt_ids, and reward are stored.
 
@@ -320,7 +322,10 @@ def generate_latent_traces(
     for i, seq in enumerate(full_seqs1):
         L = seq.shape[0]; fi1[i, :L] = seq; fa1[i, :L] = 1
 
-    _, hidden1 = _fwd_with_hidden(model, input_ids=fi1, attention_mask=fa1)
+    # need_logits=False: logits are never used during generation — skipping lm_head
+    # saves the (B, seq, 151936) tensor (~6.6 GB at B=32) on every forward call.
+    _, hidden1 = _fwd_with_hidden(model, input_ids=fi1, attention_mask=fa1,
+                                  need_logits=False)
 
     repr_1_list: list[torch.Tensor] = []
     for i in range(B):
@@ -379,7 +384,8 @@ def generate_latent_traces(
         fe2[i, 1 + L1:tot, :] = embed_layer(chunk2_ids_list[i].to(device))
         fa2[i, :tot] = 1
 
-    _, hidden2 = _fwd_with_hidden(model, inputs_embeds=fe2, attention_mask=fa2)
+    _, hidden2 = _fwd_with_hidden(model, inputs_embeds=fe2, attention_mask=fa2,
+                                  need_logits=False)
 
     repr_2_list: list[torch.Tensor] = []
     for i in range(B):

@@ -150,9 +150,12 @@ def load_phase0_pipeline(
     hidden_dim  = int(latent_cfg.get("hidden_dim", 1536))
     ckpt_path   = Path(phase0_cfg.get("checkpoint_path", "runs/latent_grpo/phase0_encoder.pt"))
 
-    print(f"Loading backbone {model_id} @ {revision} …", flush=True)
+    attn_impl = primary_cfg.get("attn_implementation", "sdpa")
+    print(f"Loading backbone {model_id} @ {revision}  attn={attn_impl} …", flush=True)
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, revision=revision, dtype=torch.bfloat16, device_map="auto",
+        model_id, revision=revision,
+        torch_dtype=torch.bfloat16, device_map="auto",
+        attn_implementation=attn_impl,
     )
     model.eval()
 
@@ -236,10 +239,11 @@ def collect_z_finals(
             device=device,
         )
 
-        # ── Step 2: re-run with grad (under no_grad) to get z_3 ───────────
-        # _run_pipeline_with_grad re-runs the full pipeline from stored chunk_ids.
-        # Under torch.no_grad() this is pure inference — same z_h values as
-        # the rollout step since model/vae/z_injector are in eval mode.
+        # ── Step 2: re-run (no_grad) to extract z_3 ─────────────────────
+        # compute_log_pi=False: NFR6 only needs z_list[2]; bypassing lm_head
+        # saves the (B, seq, 151936) logits tensor (~6.6 GB at B=32 per chunk).
+        # generate_latent_traces is already decorated @torch.no_grad(), and
+        # this call is also wrapped below — no autograd graph is ever created.
         with torch.no_grad():
             pipe = _run_pipeline_with_grad(
                 model=model,
@@ -247,6 +251,7 @@ def collect_z_finals(
                 z_injector=z_injector,
                 traces=traces,
                 device=device,
+                compute_log_pi=False,
             )
 
         z_3 = pipe["z_list"][2].detach().cpu()  # (B, latent_dim)
