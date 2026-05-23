@@ -5,7 +5,7 @@
 #   400 problems sampled from the easy pool, each given exactly G=128 rollouts.
 #   Sequences are spread across steps via pre-shuffled assignment (see below).
 # Phase 1: backbone UNFROZEN; on-policy GRPO with live z injection on Level 5 hard pool.
-#   200 steps × 1 problem × 128 rollouts = 25 600 fresh rollouts.
+#   200 steps × 4 problems × 128 rollouts = 102 400 fresh rollouts.
 #
 # Phase 0 generation strategy ("pre-shuffled assignment"):
 #   n_problems = n_steps × seqs_per_step / G = 400 × 128 / 128 = 400 problems.
@@ -125,12 +125,18 @@ phase0:
 # ---------------------------------------------------------------------------
 training:
   seed: 11
-  batch_size: 1
-  # micro_batch_size: how many of the B×G=128 traces are run per forward/backward
-  # in Phase 1.  Advantages are pre-computed over the full group, so splitting the
-  # backward does NOT change GRPO correctness — it is pure memory engineering.
+  # batch_size: number of PROBLEMS per training step.  B=4 → 4×128=512 sequences/step,
+  # 800 problem-encounters over 200 steps — matches baseline gradient density.
+  # Decoupled from G: changing batch_size only affects problems/step, not rollouts/problem.
+  # GRPO advantage normalisation is per-problem group of G=128 (no interleaving):
+  # traces come back ordered [problem_0 × 128, problem_1 × 128, ...]; advantages
+  # are computed before micro-batching and the ordering is preserved throughout.
+  batch_size: 4
+  # micro_batch_size: how many of the B×G=512 traces are processed per forward/backward.
+  # Advantages are pre-computed over the full group, so splitting the backward does
+  # NOT change GRPO correctness — it is pure memory engineering.
   # At micro_batch_size=32: logits tensor = 32×683×151,936×2 = 6.6 GB
-  #   vs 128 seqs (full batch) = 26.5 GB.
+  #   vs 512 seqs (full batch) = 105 GB.
   # Total Phase 1 peak: 6.6 + 3 (weights) + 15 (AdamW moments) + 2 (GC) ≈ 27 GB.
   micro_batch_size: 32
   # vLLM cannot be used: the 3-chunk loop in grpo_latent.py injects z_h embeddings as

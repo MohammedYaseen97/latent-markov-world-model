@@ -4,7 +4,7 @@ Design reference: reports/latent_markov_design.md
 
 Architecture change from v1: VAE-ELBO replaced by deterministic encoder +
 explicit calibration loss. z_h = μ_h (no sampling during training). σ² is
-trained directly via L_calib = BCE(sigmoid(mean_logvar), 1 − reward).
+trained directly via L_calib = BCE_with_logits(−mean_logvar, reward, pos_weight).
 
 Phase 0 — Online Encoder Pretraining
 ──────────────────────────────────────
@@ -970,8 +970,8 @@ def latent_training_step(
         L_RL = -mean_{i,h,t} [ advantage_i × log π_θ(token_t | context_{h,i}) ]
 
     L_calib:
-        BCE( sigmoid(mean_logvar),  1 − reward ) — keeps σ² calibrated to
-        trajectory quality during Phase 1. Lighter than Phase 0 (λ_calib=0.5).
+        BCE_with_logits(−mean_logvar, reward, pos_weight) — keeps σ² calibrated
+        to trajectory quality during Phase 1. Lighter than Phase 0 (λ_calib=0.5).
 
     Args:
         model:        backbone in training mode (UNFROZEN — .step() called by caller).
@@ -1024,9 +1024,10 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     the on-policy GRPO loop for max_steps steps.
 
     Every training step:
-      1. [no_grad] collect G=8 fresh rollouts for the current batch
-      2. compute GRPO advantages from group rewards
+      1. [no_grad] collect G=128 rollouts for B=4 problems → 512 sequences
+      2. compute GRPO advantages per-problem-group (no interleaving)
       3. [with_grad] re-run full pipeline → L_RL + λ_t·L_trans + λ_calib·L_calib
+         (micro-batched for memory; advantages pre-computed → GRPO math unchanged)
       4. step all optimizers (backbone lr=1e-6, encoder lr=3e-4)
 
     Config keys consumed:

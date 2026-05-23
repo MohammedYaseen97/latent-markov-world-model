@@ -648,40 +648,42 @@ def _estimate_pass_at_k_metrics_latent(
     z_injector.eval()
 
     # ── Eval loop ─────────────────────────────────────────────────────
-    # All P problems are batched together each iteration with N samples each
-    # (B = P × N sequences per model call).  This gives better GPU utilisation
-    # than the old per-problem loop and reduces total model dispatches from
-    # ceil(n_samples/old_mini_batch) × P × 5  to  ceil(n_samples/N) × 5.
+    # Problems are chunked into batches of latent_eval_problem_batch_size (P_batch)
+    # and each batch is called with N=latent_eval_n_per_problem samples per call.
+    # B = P_batch × N sequences per model.generate() call.
     #
-    # For P=40, n_samples=1024, N=8:
-    #   old: ceil(1024/128) × 40 × 5 = 1 600 model calls
-    #   new: ceil(1024/8)   × 1  × 5 =   640 model calls  → ~2.5× fewer dispatches
-    #   batch size per call: old=128 (1 problem), new=320 (40 problems × 8)
+    # latent_eval_n_per_problem controls how many samples are generated per
+    # iteration (ceil(n_samples/N) iterations total per problem batch).
+    # latent_eval_problem_batch_size limits P to prevent OOM on large eval pools.
     #
-    # Tune latent_eval_n_per_problem in eval config for your GPU.
-    # A100 80 GB handles N=16 comfortably (640 seq/call).
-    n_per_problem   = int(eval_cfg.get("latent_eval_n_per_problem", 8))
-    n_iters         = math.ceil(n_samples / n_per_problem)
+    # RTX Pro 6000 96 GB defaults (from eval config):
+    #   P_batch=128, N=8 → B=1024 seq/call; peak ≈ 48 GB.
+    n_per_problem = int(eval_cfg.get("latent_eval_n_per_problem", 8))
+    p_batch       = int(eval_cfg.get("latent_eval_problem_batch_size", 128))
+    n_iters       = math.ceil(n_samples / n_per_problem)
     per_problem_texts: list[list[str]] = [[] for _ in range(len(problems))]
 
-    for it in tqdm(range(n_iters), desc="latent eval batches", unit="batch"):
+    for it in tqdm(range(n_iters), desc="latent eval batches", unit="iter"):
         this_n = min(n_per_problem, n_samples - it * n_per_problem)
-        with torch.no_grad():
-            results = _generate_latent_eval_batch(
-                model=model,
-                tokenizer=tokenizer,
-                vae=vae,
-                z_injector=z_injector,
-                problems=problems,
-                n_per_problem=this_n,
-                chunk_tokens=chunk_tokens,
-                hidden_dim=hidden_dim,
-                temperature=temperature,
-                top_p=top_p,
-                device=device,
-            )
-        for i, texts in enumerate(results):
-            per_problem_texts[i].extend(texts)
+        for pb_start in range(0, len(problems), p_batch):
+            pb_end    = min(len(problems), pb_start + p_batch)
+            pb_probs  = problems[pb_start:pb_end]
+            with torch.no_grad():
+                results = _generate_latent_eval_batch(
+                    model=model,
+                    tokenizer=tokenizer,
+                    vae=vae,
+                    z_injector=z_injector,
+                    problems=pb_probs,
+                    n_per_problem=this_n,
+                    chunk_tokens=chunk_tokens,
+                    hidden_dim=hidden_dim,
+                    temperature=temperature,
+                    top_p=top_p,
+                    device=device,
+                )
+            for i, texts in enumerate(results):
+                per_problem_texts[pb_start + i].extend(texts)
 
     per_problem = [
         (len(per_problem_texts[i]), _grade(per_problem_texts[i], problems[i]["ground_truth"]))
@@ -739,10 +741,12 @@ def _estimate_pass_at_k_metrics_latent_pretrained(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    attn_impl = primary_cfg.get("attn_implementation", "sdpa")
     print(f"[latent_markov_pretrained] Loading pretrained backbone {model_id} @ {revision} …",
           file=sys.stderr)
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, revision=revision, torch_dtype=torch.bfloat16, device_map="auto",
+        model_id, revision=revision, torch_dtype=torch.bfloat16,
+        device_map="auto", attn_implementation=attn_impl,
     )
     model.eval()
 
@@ -763,28 +767,32 @@ def _estimate_pass_at_k_metrics_latent_pretrained(
         z_injector.load_state_dict(ckpt["z_injector"])
     z_injector.eval()
 
-    n_per_problem   = int(eval_cfg.get("latent_eval_n_per_problem", 8))
-    n_iters         = math.ceil(n_samples / n_per_problem)
+    n_per_problem = int(eval_cfg.get("latent_eval_n_per_problem", 8))
+    p_batch       = int(eval_cfg.get("latent_eval_problem_batch_size", 128))
+    n_iters       = math.ceil(n_samples / n_per_problem)
     per_problem_texts: list[list[str]] = [[] for _ in range(len(problems))]
 
-    for it in tqdm(range(n_iters), desc="latent_pretrained eval batches", unit="batch"):
+    for it in tqdm(range(n_iters), desc="latent_pretrained eval batches", unit="iter"):
         this_n = min(n_per_problem, n_samples - it * n_per_problem)
-        with torch.no_grad():
-            results = _generate_latent_eval_batch(
-                model=model,
-                tokenizer=tokenizer,
-                vae=vae,
-                z_injector=z_injector,
-                problems=problems,
-                n_per_problem=this_n,
-                chunk_tokens=chunk_tokens,
-                hidden_dim=hidden_dim,
-                temperature=temperature,
-                top_p=top_p,
-                device=device,
-            )
-        for i, texts in enumerate(results):
-            per_problem_texts[i].extend(texts)
+        for pb_start in range(0, len(problems), p_batch):
+            pb_end   = min(len(problems), pb_start + p_batch)
+            pb_probs = problems[pb_start:pb_end]
+            with torch.no_grad():
+                results = _generate_latent_eval_batch(
+                    model=model,
+                    tokenizer=tokenizer,
+                    vae=vae,
+                    z_injector=z_injector,
+                    problems=pb_probs,
+                    n_per_problem=this_n,
+                    chunk_tokens=chunk_tokens,
+                    hidden_dim=hidden_dim,
+                    temperature=temperature,
+                    top_p=top_p,
+                    device=device,
+                )
+            for i, texts in enumerate(results):
+                per_problem_texts[pb_start + i].extend(texts)
 
     per_problem = [
         (len(per_problem_texts[i]), _grade(per_problem_texts[i], problems[i]["ground_truth"]))

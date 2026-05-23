@@ -38,3 +38,16 @@ evaluation:
   # HF generate fallback (used when use_vllm: false).
   # 128 concurrent sequences safe at 96 GB for 1.5B model.
   gen_batch_size: 128
+
+  # Latent arm eval (HF-only; no vLLM).
+  # latent_eval_n_per_problem: rollouts generated per problem per call to
+  #   _generate_latent_eval_batch.  ceil(128/8)=16 calls × P problems × N seq each.
+  latent_eval_n_per_problem: 8
+  # latent_eval_problem_batch_size: max problems per _generate_latent_eval_batch call.
+  # Prevents OOM when evaluating all ~1117 hard-pool problems at once.
+  # RTX Pro 6000 96 GB: P=128, N=8 → B=1024 sequences/call.
+  # KV cache (chunk generation):  1024 × 541 tok × 28 × 2 × 16kv × 64head × 2B ≈ 10 GB
+  # Forward hidden (repr):        1024 × 741 × 1536 × 28 × 2B (SDPA fused)       ≈ 32 GB
+  # Model weights + overhead:                                                      ≈  6 GB
+  # Total:                                                                         ≈ 48 GB → fits comfortably.
+  latent_eval_problem_batch_size: 128
