@@ -93,16 +93,13 @@ phase0:
   # See header comment for full generation strategy rationale.
   n_steps: 400
   num_generations: 128       # rollouts per problem, total across Phase 0 (not per step)
-  # micro_batch_size=64: two 64-seq micro-batches per step.
-  # _run_pipeline_with_grad holds 3 forward passes' activations simultaneously
-  # (passes for chunk1/chunk2/chunk3 are all alive until loss.backward()).
-  # Peak activation memory per micro-batch (N=64):
-  #   Pass 1 (seq≈541): ~30 GB   Pass 2+3 (seq≈342): ~16 GB each
-  #   Total: ~62 GB + 3 GB weights = ~65 GB  ← fits in 96 GB
-  # N=128 would need ~130 GB (OOM); N=64 is the sweet spot.
-  # With GC disabled (see below), backward has no recomputation overhead,
-  # so 2× micro-batches of fast backward ≈ faster than 1× GC-heavy backward.
-  micro_batch_size: 64
+  # micro_batch_size: how many of the 128 sequences/step are processed per
+  # forward/backward call.  32 → 4 passes of 32 seqs × 342 tok (Markov context):
+  #   hidden states 32×342×1536×2 = 0.034 GB  (vs 0.14 GB for all 128)
+  #   lm_head bypassed in Phase 0 → no logits cost.
+  # Each micro-batch of 32 sees ~27 unique problems (from ~110/step total),
+  # giving strong cross-problem gradient signal to L_out on every backward call.
+  micro_batch_size: 32
 
   learning_rate: 3.0e-4     # AdamW for Encoder+ZInjector+OutcomeHead; not applied to backbone
 
@@ -119,11 +116,6 @@ phase0:
   lambda_trans_warmup_steps: 50
   lambda_out: 5.0
   lambda_calib: 1.0
-
-  # With micro_batch_size=64, activation memory without GC is ~65 GB (fits).
-  # Disabling GC removes the layer-recomputation overhead on the backward pass
-  # (backward is 2-3× faster; generate() uses KV cache regardless of this flag).
-  gradient_checkpointing: false
 
   logging_steps: 10
   save_steps: 50
