@@ -93,13 +93,14 @@ phase0:
   # See header comment for full generation strategy rationale.
   n_steps: 400
   num_generations: 128       # rollouts per problem, total across Phase 0 (not per step)
-  # micro_batch_size: how many of the 128 sequences/step are processed per
-  # forward/backward call.  32 → 4 passes of 32 seqs × 342 tok (Markov context):
-  #   hidden states 32×342×1536×2 = 0.034 GB  (vs 0.14 GB for all 128)
-  #   lm_head bypassed in Phase 0 → no logits cost.
-  # Each micro-batch of 32 sees ~27 unique problems (from ~110/step total),
-  # giving strong cross-problem gradient signal to L_out on every backward call.
-  micro_batch_size: 32
+  # micro_batch_size = seqs_per_step = 128: process all 128 sequences in one
+  # forward/backward pass (no micro-batching).  Safe because:
+  #   - lm_head bypassed (need_logits=False) → no logits tensor at all
+  #   - GC enabled → activation memory = 28×128×342×1536×2 = 3.75 GB total
+  #   - 128×342 tokens per forward easily saturates the RTX Pro 6000
+  # Mathematically identical to micro_batch_size=32 (n_micro=1, divide-by-1).
+  # Also improves pos_weight stability (computed from all 128 samples, not 32).
+  micro_batch_size: 128
 
   learning_rate: 3.0e-4     # AdamW for Encoder+ZInjector+OutcomeHead; not applied to backbone
 
