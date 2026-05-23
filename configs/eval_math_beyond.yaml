@@ -47,13 +47,11 @@ evaluation:
   # Prevents OOM when evaluating all ~1117 hard-pool problems at once.
   # repr_2/repr_3 use strict Markov context [z_pfx ‖ chunk] (seq≈342) not full history.
   #
-  # RTX Pro 6000 96 GB: P=32, N=8 → B=256 sequences/call.
-  #   gen1 KV cache (chunk1):    256 × 741 tok × 28 × 1 KB/tok ≈  5.5 GB
-  #   repr_1 forward (full ctx): peak MLP 256 × 741 × 8960 × 2 × 2B ≈  6.8 GB
-  #   gen2 KV cache (chunk2):    256 × 683 tok × 28 × 1 KB/tok ≈  5.0 GB
-  #   repr_2 forward (strict):   peak MLP 256 × 342 × 8960 × 2 × 2B ≈  3.2 GB
-  #   Model weights + misc:                                           ≈  6.0 GB
-  #   Total peak per call:                                            ≈ 27 GB
-  # Leaves 69 GB headroom for PyTorch allocator fragmentation.
-  # Can increase to 64 once you confirm no OOM (with expandable_segments=True).
-  latent_eval_problem_batch_size: 32
+  # RTX Pro 6000 96 GB: P=80, N=8 → B=640 sequences/call.
+  # Observed peak at P=32 (B=256): ~35 GB.
+  # Memory = ~14 GB (weights) + ~21 GB (variable); scales linearly with B.
+  # At B=640: est. 14 + 21×(640/256) ≈ 66 GB — comfortable headroom before 96 GB.
+  # Gives ~2.5× speedup over P=32 by reducing generate_latent_traces calls from
+  # 560 (16 iters × 35 batches) to 224 (16 iters × 14 batches).
+  # If OOM occurs, drop to 64 (B=512, ~56 GB); for more headroom use expandable_segments.
+  latent_eval_problem_batch_size: 80
