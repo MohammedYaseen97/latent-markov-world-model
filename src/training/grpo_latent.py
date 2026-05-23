@@ -234,8 +234,8 @@ def generate_latent_traces(
     Generation per rollout:
         Chunk 1: generate(prompt)  →  chunk1_ids
                  forward([prompt|chunk1]) → repr_1 → z_1 → prefix_1
-        Chunk 2: generate([prefix_1|chunk1]) → chunk2_ids
-                 forward([prefix_1|chunk1|chunk2]) → repr_2 → z_2 → prefix_2
+        Chunk 2: generate([prefix_1|chunk1]) → chunk2_ids        (crutch: chunk1 kept for generation quality)
+                 forward([prefix_1|chunk2])       → repr_2 → z_2 → prefix_2  (strict Markov)
         Chunk 3: generate([prefix_2|chunk2]) → chunk3_ids
                  grade(chunk1+chunk2+chunk3) → reward
         (No chunk-3 forward pass — z_3 not needed for prefix injection.)
@@ -372,16 +372,18 @@ def generate_latent_traces(
     del gen2, ie2, am2
     torch.cuda.empty_cache()
 
-    # Forward [z_pfx1 | chunk1 | chunk2] for repr_2 → z_2 → prefix_2 (right-padded)
+    # Forward [z_pfx1 | chunk2] for repr_2 → z_2 → prefix_2
+    # Strict Markov: same as _run_pipeline_with_grad — chunk-1 raw tokens dropped.
+    # The z_2 injected for chunk-3 generation is computed under the same context
+    # as the z_2 in the training pass, keeping generation and training consistent.
     c2_lens  = [c.shape[0] for c in chunk2_ids_list]
-    max_fwd2 = max(1 + c1_lens[i] + c2_lens[i] for i in range(B))
+    max_fwd2 = max(1 + c2_lens[i] for i in range(B))
     fe2 = torch.zeros(B, max_fwd2, hidden_dim, dtype=model_dtype, device=device)
     fa2 = torch.zeros(B, max_fwd2, dtype=torch.long, device=device)
     for i in range(B):
-        L1 = c1_lens[i]; L2 = c2_lens[i]; tot = 1 + L1 + L2
-        fe2[i, 0, :]          = z_pfx1[i, 0, :]
-        fe2[i, 1:1 + L1, :]   = embed_layer(chunk1_ids_list[i].to(device))
-        fe2[i, 1 + L1:tot, :] = embed_layer(chunk2_ids_list[i].to(device))
+        L2 = c2_lens[i]; tot = 1 + L2
+        fe2[i, 0, :]        = z_pfx1[i, 0, :]
+        fe2[i, 1:1 + L2, :] = embed_layer(chunk2_ids_list[i].to(device))
         fa2[i, :tot] = 1
 
     _, hidden2 = _fwd_with_hidden(model, inputs_embeds=fe2, attention_mask=fa2,
@@ -389,8 +391,8 @@ def generate_latent_traces(
 
     repr_2_list: list[torch.Tensor] = []
     for i in range(B):
-        L1 = c1_lens[i]; L2 = c2_lens[i]
-        repr_2_list.append(hidden2[i, 1 + L1:1 + L1 + L2, :].mean(0))
+        L2 = c2_lens[i]
+        repr_2_list.append(hidden2[i, 1:1 + L2, :].mean(0))
     del fe2, fa2, hidden2, z_pfx1
     torch.cuda.empty_cache()
 
@@ -471,8 +473,8 @@ def _run_pipeline_with_grad(
     All repr_h and z_h are LIVE in the computation graph.
 
     Chunk 1: right-padded [prompt|chunk1] → repr_1 LIVE → z_1 → prefix_1
-    Chunk 2: right-padded [prefix_1|chunk1|chunk2] → repr_2 LIVE → z_2 → prefix_2
-    Chunk 3: right-padded [prefix_2|chunk2|chunk3] → repr_3 LIVE → z_3
+    Chunk 2: right-padded [prefix_1|chunk2] → repr_2 LIVE → z_2 → prefix_2
+    Chunk 3: right-padded [prefix_2|chunk3] → repr_3 LIVE → z_3
 
     log_π per chunk: gathered from logits at the causal-LM shifted positions.
     When compute_log_pi=False (Phase 0), lm_head is bypassed entirely — saves
@@ -541,15 +543,19 @@ def _run_pipeline_with_grad(
     z_1_batch = vae.reparameterize(mu_1, logvar_1)           # (B, latent) LIVE
     prefix_1  = z_injector.get_prefix_embedding(z_1_batch)   # (B, 1, H) LIVE
 
-    # ── Chunk 2: [z_pfx | chunk1 | chunk2] right-padded ───────────────────
-    max_f2 = max(1 + c1_lens[i] + c2_lens[i] for i in range(B))
+    # ── Chunk 2: [z_pfx1 | chunk2] right-padded ───────────────────────────
+    # Strict Markov: chunk-1 raw tokens are dropped. repr_2 is conditioned only
+    # on z_1 (the Markov state) + chunk-2 tokens. The backbone cannot attend to
+    # raw chunk-1 history, forcing z_1 to actually carry the necessary context.
+    # Generation still uses [z_pfx1 | chunk1] as a quality crutch during Phase 0;
+    # for Phase 1 generation should be updated to [z_pfx1] only for full consistency.
+    max_f2 = max(1 + c2_lens[i] for i in range(B))
     fe2 = torch.zeros(B, max_f2, model.config.hidden_size, dtype=model_dtype, device=device)
     fa2 = torch.zeros(B, max_f2, dtype=torch.long, device=device)
     for i in range(B):
-        L1 = c1_lens[i]; L2 = c2_lens[i]; tot = 1 + L1 + L2
-        fe2[i, 0, :]          = prefix_1[i, 0, :]
-        fe2[i, 1:1 + L1, :]   = embed_layer(chunk1_ids_list[i].to(device))
-        fe2[i, 1 + L1:tot, :] = embed_layer(chunk2_ids_list[i].to(device))
+        L2 = c2_lens[i]; tot = 1 + L2
+        fe2[i, 0, :]        = prefix_1[i, 0, :]
+        fe2[i, 1:1 + L2, :] = embed_layer(chunk2_ids_list[i].to(device))
         fa2[i, :tot] = 1
 
     logits2, hidden2 = _fwd_with_hidden(
@@ -558,7 +564,7 @@ def _run_pipeline_with_grad(
     del fe2, fa2
 
     repr_2_batch = torch.stack([
-        hidden2[i, 1 + c1_lens[i]:1 + c1_lens[i] + c2_lens[i], :].mean(0)
+        hidden2[i, 1:1 + c2_lens[i], :].mean(0)
         for i in range(B)
     ]).float()                                               # (B, hidden) LIVE fp32
     del hidden2
@@ -566,8 +572,8 @@ def _run_pipeline_with_grad(
     log_pi_2: list[torch.Tensor] = []
     if compute_log_pi:
         for i in range(B):
-            L1 = c1_lens[i]; L2 = c2_lens[i]
-            sl = logits2[i, L1:L1 + L2, :]                  # causal: pos L1 predicts c2[0]
+            L2 = c2_lens[i]
+            sl = logits2[i, 0:L2, :]   # pos 0 (z_pfx1) predicts c2[0], pos 1 predicts c2[1]…
             c2 = chunk2_ids_list[i].to(device)
             lp = sl.gather(1, c2.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
             log_pi_2.append(lp)
@@ -577,15 +583,16 @@ def _run_pipeline_with_grad(
     z_2_batch = vae.reparameterize(mu_2, logvar_2)           # (B, latent) LIVE
     prefix_2  = z_injector.get_prefix_embedding(z_2_batch)   # (B, 1, H) LIVE
 
-    # ── Chunk 3: [z_pfx | chunk2 | chunk3] right-padded ───────────────────
-    max_f3 = max(1 + c2_lens[i] + c3_lens[i] for i in range(B))
+    # ── Chunk 3: [z_pfx2 | chunk3] right-padded ───────────────────────────
+    # Same strict Markov logic: chunk-2 raw tokens dropped. repr_3 conditioned
+    # only on z_2 + chunk-3 tokens. Symmetric with chunk-2 treatment above.
+    max_f3 = max(1 + c3_lens[i] for i in range(B))
     fe3 = torch.zeros(B, max_f3, model.config.hidden_size, dtype=model_dtype, device=device)
     fa3 = torch.zeros(B, max_f3, dtype=torch.long, device=device)
     for i in range(B):
-        L2 = c2_lens[i]; L3 = c3_lens[i]; tot = 1 + L2 + L3
-        fe3[i, 0, :]          = prefix_2[i, 0, :]
-        fe3[i, 1:1 + L2, :]   = embed_layer(chunk2_ids_list[i].to(device))
-        fe3[i, 1 + L2:tot, :] = embed_layer(chunk3_ids_list[i].to(device))
+        L3 = c3_lens[i]; tot = 1 + L3
+        fe3[i, 0, :]        = prefix_2[i, 0, :]
+        fe3[i, 1:1 + L3, :] = embed_layer(chunk3_ids_list[i].to(device))
         fa3[i, :tot] = 1
 
     logits3, hidden3 = _fwd_with_hidden(
@@ -594,7 +601,7 @@ def _run_pipeline_with_grad(
     del fe3, fa3
 
     repr_3_batch = torch.stack([
-        hidden3[i, 1 + c2_lens[i]:1 + c2_lens[i] + c3_lens[i], :].mean(0)
+        hidden3[i, 1:1 + c3_lens[i], :].mean(0)
         for i in range(B)
     ]).float()                                               # (B, hidden) LIVE fp32
     del hidden3
@@ -602,8 +609,8 @@ def _run_pipeline_with_grad(
     log_pi_3: list[torch.Tensor] = []
     if compute_log_pi:
         for i in range(B):
-            L2 = c2_lens[i]; L3 = c3_lens[i]
-            sl = logits3[i, L2:L2 + L3, :]
+            L3 = c3_lens[i]
+            sl = logits3[i, 0:L3, :]   # pos 0 (z_pfx2) predicts c3[0], pos 1 predicts c3[1]…
             c3 = chunk3_ids_list[i].to(device)
             lp = sl.gather(1, c3.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
             log_pi_3.append(lp)
@@ -774,6 +781,12 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
             )
 
         model.train(); vae.train(); z_injector.train(); outcome_head.train()
+
+        # Interleave: generate_latent_traces returns traces in problem-contiguous
+        # order [p0×G, p1×G, …].  Shuffling before the micro-batch loop ensures
+        # each micro-batch contains traces from all B problems rather than a
+        # single problem, giving L_out cross-problem gradient signal per micro-step.
+        _random.shuffle(traces)
 
         # ── Training step (with gradient) ─────────────────────────────────
         # Zero backbone grads from previous step (backbone is NOT in optimizer).

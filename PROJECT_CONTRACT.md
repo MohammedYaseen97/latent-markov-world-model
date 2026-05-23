@@ -27,7 +27,7 @@ Phases, gates, and what to ship. **Vision / hypothesis / architecture:** `PROJEC
 - **Benchmark:** MATH Level 5 hard pool — definition and build in `reports/DATA_PROTOCOL.md`,
   path in `configs/eval_math_beyond.yaml`.
 - **Three active arms (core table):**
-  1. `baseline_grpo` — history-as-state
+  1. `baseline_grpo` — history-as-state  
   2. `token_markov_grpo` — Delethink-style RL-learned textual carryover (Markovian Thinker, ICLR 2026)
   3. `latent_grpo` — deterministic latent Markov state with calibrated uncertainty (no bonus)
   4. `latent_grpo_uncertainty` — latent + KL variance exploration bonus (stub — not yet implemented)

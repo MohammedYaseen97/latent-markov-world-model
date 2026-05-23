@@ -1,15 +1,24 @@
 # Latent Markov arm — full RTX Pro 6000 Blackwell profile (v2 design).
 #
 # Phase 0: backbone FROZEN; Encoder + ZInjector + OutcomeHead trained ONLINE.
-#   Each step: generate G=128 rollouts per problem → re-run with grad → update encoder/ZInj.
-#   400 steps × 1 problem × 128 rollouts = 51 200 on-policy trajectories.
+#   Each step: generate G=128 rollouts × B=4 problems → 512 traces → update encoder/ZInj.
+#   400 steps × 4 problems × 128 rollouts = 204 800 on-policy trajectories.
 # Phase 1: backbone UNFROZEN; on-policy GRPO with live z injection on Level 5 hard pool.
 #   200 steps × 1 problem × 128 rollouts = 25 600 fresh rollouts.
 #
-# batch_size=1 (not 4): Qwen2.5's 151,936-token vocabulary makes the logits tensor
-# the VRAM bottleneck in _run_pipeline_with_grad. At B×G sequences and ~541 tok/chunk:
-#   B=4 problems → 512 seqs × 541 tok × 151,936 vocab × 2B = 84 GB logits alone → OOM
-#   B=1 problem  → 128 seqs × 541 tok × 151,936 vocab × 2B = 21 GB logits → fits
+# Phase 0 uses B=4, G=128 (original design-doc value, now restored):
+#   Phase 0 losses (L_trans, L_out, L_calib) are all per-trace mean-reduced — no group
+#   normalization, zero mathematical dependency between traces from different problems.
+#   G=128 is kept at 128 to match the standard across all arms (uniform with eval and
+#   Phase 1 training) and to ensure each problem has sufficient rollouts for a
+#   reasonable positive-sample rate (128 × ~20% ≈ 25 correct rollouts per problem).
+#   B=4 gives L_out gradient from 4 different problems per gradient update → outcome
+#   head learns general correctness features rather than problem-specific ones.
+#
+#   The logits-bottleneck concern that originally forced B=1 is gone:
+#   Phase 0 uses need_logits=False (lm_head bypassed) so no logits tensor is materialized.
+#   Peak VRAM during generation: KV cache (512 seqs, GQA kv_heads=2) ≈ 8 GB + weights
+#   3 GB ≈ 11 GB total. Training micro-batches (32 × 342 tok) are trivially light.
 #
 # Key v2 changes from v1:
 #   - VAE-ELBO removed; replaced by explicit calibration loss L_calib
@@ -82,19 +91,21 @@ phase0:
   pool_path: "data/math_easy_pool.jsonl"      # L1–L4 only (mutual exclusivity with L5 hard pool)
   checkpoint_path: "runs/latent_grpo/phase0_encoder.pt"
 
-  # 400 steps × 1 problem × 128 rollouts = 51 200 on-policy trajectories.
+  # 400 steps × 4 problems × 128 rollouts = 204 800 on-policy trajectories.
   # Extended from 200 (v1): losses were still declining at step 200.
-  # batch_size=1: logits bottleneck — see header comment.
+  # batch_size=4, num_generations=128: see header comment for full rationale.
   n_steps: 400
-  batch_size: 1
+  batch_size: 4
   num_generations: 128
-  # micro_batch_size: how many of the B×G=128 traces are processed per
+  # micro_batch_size: how many of the B×G=512 traces are processed per
   # forward/backward call.  Reduces peak VRAM without affecting the math
   # (L_trans/L_out/L_calib are mean-reduced; scaling by 1/n_micro preserves
-  # the mean).  32 → 4 forward passes of 32 seqs × 683 tok each:
-  #   hidden states 32×683×1536×2 = 0.07 GB  (vs 0.27 GB for all 128)
-  #   GC checkpoints 28×32×683×1536×2 = 1.9 GB  (vs 7.5 GB for all 128)
+  # the mean).  32 → 16 forward passes of 32 seqs × 342 tok (strict Markov ctx) each:
+  #   hidden states 32×342×1536×2 = 0.034 GB  (trivially light)
   #   lm_head bypassed in Phase 0 → no logits cost.
+  # Traces are shuffled before micro-batching (see grpo_latent.py) so each
+  # micro-batch of 32 contains ~8 traces from each of the 4 problems — L_out
+  # gets cross-problem gradient signal at every micro-step, not just per optimizer step.
   micro_batch_size: 32
 
   learning_rate: 3.0e-4     # AdamW for Encoder+ZInjector+OutcomeHead; not applied to backbone
