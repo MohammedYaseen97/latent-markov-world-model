@@ -308,7 +308,6 @@ def generate_latent_traces(
     )
     chunk1_ids_list = [gen1[i, max_prompt_len:].cpu() for i in range(B)]
     del gen1, input_ids, attn_mask
-    torch.cuda.empty_cache()
 
     # Forward [prompt | chunk1] for repr_1 → z_1 → prefix_1 (right-padded)
     full_seqs1 = [
@@ -334,7 +333,6 @@ def generate_latent_traces(
         pl = prompt_lengths[i]; rl = chunk1_ids_list[i].shape[0]
         repr_1_list.append(hidden1[i, pl:pl + rl, :].mean(0))
     del fi1, fa1, hidden1
-    torch.cuda.empty_cache()
 
     # VAE → z_1 (deterministic: vae.eval() so reparameterize returns μ)
     # .float(): backbone runs in bf16; VAE MLP weights are fp32.
@@ -342,7 +340,6 @@ def generate_latent_traces(
     mu_1, logvar_1 = vae.encode(repr_1_batch)
     z_1_batch = vae.reparameterize(mu_1, logvar_1)    # (B, latent)
     del repr_1_batch, mu_1, logvar_1
-    torch.cuda.empty_cache()
 
     # ── Chunk 2 generation — left-padded inputs_embeds [z_pfx | chunk1] ──
     z_pfx1   = z_injector.get_prefix_embedding(z_1_batch)   # (B, 1, H)
@@ -372,7 +369,6 @@ def generate_latent_traces(
         for i in range(B)
     ]
     del gen2, ie2, am2
-    torch.cuda.empty_cache()
 
     # Forward [z_pfx1 | chunk2] for repr_2 → z_2 → prefix_2
     # Strict Markov: same as _run_pipeline_with_grad — chunk-1 raw tokens dropped.
@@ -396,14 +392,12 @@ def generate_latent_traces(
         L2 = c2_lens[i]
         repr_2_list.append(hidden2[i, 1:1 + L2, :].mean(0))
     del fe2, fa2, hidden2, z_pfx1
-    torch.cuda.empty_cache()
 
     # VAE → z_2
     repr_2_batch = torch.stack(repr_2_list).float()   # bf16→fp32 for VAE
     mu_2, logvar_2 = vae.encode(repr_2_batch)
     z_2_batch = vae.reparameterize(mu_2, logvar_2)
     del repr_2_batch, mu_2, logvar_2
-    torch.cuda.empty_cache()
 
     # ── Chunk 3 generation — left-padded inputs_embeds [z_pfx2 | chunk2] ─
     z_pfx2   = z_injector.get_prefix_embedding(z_2_batch)   # (B, 1, H)
@@ -431,7 +425,6 @@ def generate_latent_traces(
         for i in range(B)
     ]
     del gen3, ie3, am3, z_pfx2, z_1_batch, z_2_batch
-    torch.cuda.empty_cache()
 
     # ── Grade and assemble traces ──────────────────────────────────────────
     trajectories: list[dict] = []
@@ -724,12 +717,22 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
     )
     optimizer = torch.optim.AdamW(vae_params, lr=lr)
 
-    if training_cfg.get("gradient_checkpointing", False):
+    # Phase 0 can override the global gradient_checkpointing setting.
+    # Default: off — Phase 0 activation memory fits in 96 GB without GC
+    # (~35 GB), and disabling GC keeps model.config.use_cache=True so
+    # model.generate() benefits from the KV cache.
+    use_gc = phase0_cfg.get(
+        "gradient_checkpointing",
+        training_cfg.get("gradient_checkpointing", False),
+    )
+    if use_gc:
         model.config.use_cache = False
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
         logger.info("  gradient checkpointing enabled")
+    else:
+        logger.info("  gradient checkpointing disabled (Phase 0: fits in VRAM without GC)")
 
     # ------------------------------------------------------------------
     # Problem pool

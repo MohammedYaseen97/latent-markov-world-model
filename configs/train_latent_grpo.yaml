@@ -96,8 +96,9 @@ phase0:
   # micro_batch_size = seqs_per_step = 128: process all 128 sequences in one
   # forward/backward pass (no micro-batching).  Safe because:
   #   - lm_head bypassed (need_logits=False) → no logits tensor at all
-  #   - GC enabled → activation memory = 28×128×342×1536×2 = 3.75 GB total
-  #   - 128×342 tokens per forward easily saturates the RTX Pro 6000
+  #   - GC disabled (see below) → all activations stored; backward is 2-3× faster
+  #   - Total activation memory: ~35 GB → fits in 96 GB with headroom
+  #   - 128×342 tokens per forward fully saturates the RTX Pro 6000
   # Mathematically identical to micro_batch_size=32 (n_micro=1, divide-by-1).
   # Also improves pos_weight stability (computed from all 128 samples, not 32).
   micro_batch_size: 128
@@ -117,6 +118,12 @@ phase0:
   lambda_trans_warmup_steps: 50
   lambda_out: 5.0
   lambda_calib: 1.0
+
+  # Gradient checkpointing is NOT needed in Phase 0: lm_head is bypassed
+  # (no logits), Markov context = 342 tokens, and activation memory fits
+  # comfortably within 96 GB (~35 GB without GC).  Disabling GC also keeps
+  # model.config.use_cache=True, so model.generate() uses the KV cache.
+  gradient_checkpointing: false
 
   logging_steps: 10
   save_steps: 50
