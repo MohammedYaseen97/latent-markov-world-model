@@ -4,7 +4,7 @@ Architecture (v2 — rung 2 of the research ladder):
 
   Encoder    1536 → 512 → 128 → split → μ (64)  log_σ² (64)
   Transition  64  → 512 → 64
-  OutcomeHead  64 → 64  → 1 → sigmoid         (Phase 0 only, discarded before Phase 1)
+  OutcomeHead  64 → 64  → 1                    (raw logit; Phase 0 only, discarded before Phase 1)
   ZInjector    64 → 1536                       (Phase 1: prepend z as soft prefix token)
 
 z_h = μ_h  — used deterministically during training for Markov tracking.
@@ -188,35 +188,40 @@ class VAEStateEncoder(nn.Module):
         self,
         logvar_list: list[torch.Tensor],
         rewards: torch.Tensor,
+        pos_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Calibrate σ² to be high on incorrect trajectories and low on correct ones.
 
-        L_calib = BCE( sigmoid(mean_logvar),  1 − reward )
+        Framing: treat −mean_logvar as a "correctness logit".
+          High σ² (high logvar) → low correctness logit → predicts incorrect.
+          Low σ² (low logvar)   → high correctness logit → predicts correct.
+        Target = reward (1 = correct minority, 0 = incorrect majority).
 
-        where mean_logvar = mean over chunks and latent dims of logvar_h.
-
-        High σ² (logvar >> 0) should predict incorrect trajectories (reward = 0).
-        Low σ² (logvar << 0) should predict correct trajectories (reward = 1).
-        The target is (1 − reward): 1 for incorrect, 0 for correct.
-
-        No KL, no reconstruction, no annealing schedule. σ² is trained directly
-        as a binary calibration signal, not as a VAE side-effect.
+        Using BCE_with_logits(−mean_logvar, reward) is mathematically identical to
+        the original BCE(sigmoid(mean_logvar), 1−reward); the benefit is that
+        pos_weight can upweight the minority correct class (≈18%) to counteract
+        the 82% incorrect dominance that caused the calibration loss to trivially
+        converge to "everything is uncertain".
 
         Args:
             logvar_list: log σ² per chunk. List of N_CHUNKS tensors (batch, latent_dim).
             rewards:     binary rewards. Shape: (batch, 1) or (batch,). Float.
+            pos_weight:  scalar tensor — weight for the positive (correct) class.
+                         Pass (1−pos_rate)/pos_rate clamped to [1, 20] to balance
+                         the 82/18 split.  None = no reweighting (unbalanced BCE).
 
         Returns:
             Scalar tensor — BCE loss.
         """
-        # Mean logvar over chunks and latent dims → (batch,) uncertainty score
-        stacked = torch.stack(logvar_list, dim=0)         # (N_CHUNKS, batch, latent_dim)
-        mean_logvar = stacked.mean(dim=(0, 2))             # (batch,)
+        stacked = torch.stack(logvar_list, dim=0)   # (N_CHUNKS, batch, latent_dim)
+        mean_logvar = stacked.mean(dim=(0, 2))       # (batch,)
 
-        uncertainty_score = torch.sigmoid(mean_logvar)    # (batch,) in (0, 1)
-        target = (1.0 - rewards.float().view(-1))          # high uncertainty = incorrect
+        # −mean_logvar: high uncertainty → low logit → predicts incorrect (target=0)
+        target = rewards.float().view(-1)            # 1=correct (minority class)
 
-        return F.binary_cross_entropy(uncertainty_score, target)
+        return F.binary_cross_entropy_with_logits(
+            -mean_logvar, target, pos_weight=pos_weight
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -239,16 +244,19 @@ class OutcomeHead(nn.Module):
         self.fc2 = nn.Linear(64, 1)
 
     def forward(self, z_final: torch.Tensor) -> torch.Tensor:
-        """Predict P(correct) from the final chunk's latent vector.
+        """Return raw logit for P(correct) from the final chunk's latent vector.
+
+        Returns a raw (pre-sigmoid) logit so the caller can use
+        F.binary_cross_entropy_with_logits with dynamic pos_weight.
 
         Args:
             z_final: latent of the last chunk (z_3). Shape: (batch, latent_dim).
 
         Returns:
-            prob: predicted probability of correctness. Shape: (batch, 1).
+            logit: raw correctness logit. Shape: (batch, 1).
         """
         x = F.relu(self.fc1(z_final))
-        return torch.sigmoid(self.fc2(x))
+        return self.fc2(x)
 
 
 # ---------------------------------------------------------------------------

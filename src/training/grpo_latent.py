@@ -641,7 +641,8 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
         batch_size                   — problems per step (default: 4)
         num_generations              — G rollouts per problem (default: 128)
         learning_rate                — AdamW lr for Encoder/ZInj/OutcomeHead (default: 3e-4)
-        lambda_trans_peak, lambda_out, lambda_calib — loss weights / schedule peak
+        lambda_trans_peak, lambda_trans_warmup_steps — λ_t schedule (peak and initial zero phase)
+        lambda_out, lambda_calib — loss weights
         temperature, top_p           — sampling params (from training.*)
         chunk_tokens                 — tokens per chunk (from latent_markov.*)
         checkpoint_path              — where to save phase0_encoder.pt
@@ -661,9 +662,10 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
     G                = int(phase0_cfg.get("num_generations",   128))
     micro_batch_size = int(phase0_cfg.get("micro_batch_size",   32))
     lr               = float(phase0_cfg.get("learning_rate",  3e-4))
-    lambda_trans_peak  = float(phase0_cfg.get("lambda_trans_peak",  3.0))
-    lambda_out         = float(phase0_cfg.get("lambda_out",         5.0))
-    lambda_calib       = float(phase0_cfg.get("lambda_calib",       1.0))
+    lambda_trans_peak        = float(phase0_cfg.get("lambda_trans_peak",        3.0))
+    lambda_trans_warmup_steps = int(phase0_cfg.get("lambda_trans_warmup_steps", 50))
+    lambda_out               = float(phase0_cfg.get("lambda_out",               5.0))
+    lambda_calib             = float(phase0_cfg.get("lambda_calib",             1.0))
     temperature   = float(training_cfg.get("temperature",  1.0))
     top_p         = float(training_cfg.get("top_p",        1.0))
     chunk_tokens  = int(latent_cfg.get("chunk_tokens",     341))
@@ -741,7 +743,16 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
     step_bar = tqdm(total=n_steps, desc="phase0", unit="step", dynamic_ncols=True)
 
     for global_step in range(n_steps):
-        lambda_t = lambda_trans_schedule(global_step, n_steps, peak=lambda_trans_peak)
+        # Warm-start: hold λ_t = 0 for the first `lambda_trans_warmup_steps` steps
+        # so L_out (outcome prediction) can establish a signal before the transition
+        # loss ramp competes for gradient budget.  After warmup the normal linear
+        # ramp resumes, offsetting the step index so the full ramp still completes.
+        if global_step < lambda_trans_warmup_steps:
+            lambda_t = 0.0
+        else:
+            effective_step = global_step - lambda_trans_warmup_steps
+            effective_max  = n_steps    - lambda_trans_warmup_steps
+            lambda_t = lambda_trans_schedule(effective_step, effective_max, peak=lambda_trans_peak)
 
         # Sample batch_size problems (reshuffle when pool exhausted).
         while len(pool_order) < batch_size:
@@ -793,11 +804,21 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
                 model, vae, z_injector, mb_traces, device, compute_log_pi=False
             )
 
+            # pos_weight = n_neg / n_pos balances the 82/18 incorrect/correct split.
+            # Clamped to [1, 20]: avoids exploding weights on degenerate micro-batches
+            # (e.g. all-zero reward step) while still upweighting rare correct signals.
+            pos_rate   = rewards_mb.mean().clamp(min=0.05)
+            pos_weight = ((1.0 - pos_rate) / pos_rate).clamp(max=20.0)
+
             l_trans = vae.compute_transition_loss(pipe["z_list"])
-            l_out   = F.binary_cross_entropy(
-                outcome_head(pipe["z_list"][-1]), rewards_mb
+            l_out   = F.binary_cross_entropy_with_logits(
+                outcome_head(pipe["z_list"][-1]).view(-1),
+                rewards_mb.view(-1),
+                pos_weight=pos_weight,
             )
-            l_calib = vae.compute_calibration_loss(pipe["logvar_list"], rewards_mb)
+            l_calib = vae.compute_calibration_loss(
+                pipe["logvar_list"], rewards_mb, pos_weight=pos_weight
+            )
 
             total_mb: torch.Tensor = (
                 lambda_t * l_trans + lambda_out * l_out + lambda_calib * l_calib

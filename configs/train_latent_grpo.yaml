@@ -106,6 +106,10 @@ phase0:
   #   L_calib × 1.0  →  ~10%   explicit σ² calibration
   #   (remainder: variance across steps)
   lambda_trans_peak: 3.0
+  # Warm-start: hold λ_t = 0 for the first 50 steps so L_out can establish a
+  # correctness signal before the transition ramp competes for gradient budget.
+  # After step 50 the normal linear ramp resumes over the remaining 350 steps.
+  lambda_trans_warmup_steps: 50
   lambda_out: 5.0
   lambda_calib: 1.0
 
