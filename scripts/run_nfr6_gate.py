@@ -395,11 +395,17 @@ def main() -> None:
     print(f"  {len(problems)} problems loaded", flush=True)
 
     # Sample n_problems (0 = all).
-    if args.n_problems > 0 and args.n_problems < len(problems):
+    pool_size = len(problems)  # capture before sampling for the overlap note below
+    if args.n_problems > 0 and args.n_problems < pool_size:
         problems = random.sample(problems, args.n_problems)
+        # Compute Phase 0 training coverage from config so this stays accurate.
+        p0_cfg   = config.get("phase0", {})
+        n_seen   = int(p0_cfg.get("n_steps", 400)) * int(p0_cfg.get("batch_size", 1))
+        pct_seen = 100.0 * min(n_seen, pool_size) / pool_size
         print(
             f"  Sampled {len(problems)} problems (seed={args.seed}) — "
-            f"note: Phase 0 saw ~16% of the easy pool; this sample is ~84% held-out",
+            f"Phase 0 trained on ~{n_seen} / {pool_size} pool problems "
+            f"({pct_seen:.0f}% seen, {100 - pct_seen:.0f}% held-out).",
             flush=True,
         )
 
