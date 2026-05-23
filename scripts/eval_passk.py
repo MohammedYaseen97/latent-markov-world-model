@@ -446,9 +446,12 @@ def _estimate_pass_at_k_metrics_latent(
     per_problem_correct: list[int] = [0] * len(problems)
     per_problem_total:   list[int] = [0] * len(problems)
 
+    n_pb = math.ceil(len(problems) / p_batch)
     for it in tqdm(range(n_iters), desc="latent eval", unit="iter"):
         this_n = min(n_per_problem, n_samples - it * n_per_problem)
-        for pb_start in range(0, len(problems), p_batch):
+        for pb_start in tqdm(range(0, len(problems), p_batch), total=n_pb,
+                             desc=f"  iter {it+1}/{n_iters} prob-batches", unit="batch",
+                             leave=False):
             pb_end   = min(len(problems), pb_start + p_batch)
             pb_probs = problems[pb_start:pb_end]
             traces   = generate_latent_traces(
@@ -550,9 +553,12 @@ def _estimate_pass_at_k_metrics_latent_pretrained(
     per_problem_correct: list[int] = [0] * len(problems)
     per_problem_total:   list[int] = [0] * len(problems)
 
+    n_pb = math.ceil(len(problems) / p_batch)
     for it in tqdm(range(n_iters), desc="latent_pretrained eval", unit="iter"):
         this_n = min(n_per_problem, n_samples - it * n_per_problem)
-        for pb_start in range(0, len(problems), p_batch):
+        for pb_start in tqdm(range(0, len(problems), p_batch), total=n_pb,
+                             desc=f"  iter {it+1}/{n_iters} prob-batches", unit="batch",
+                             leave=False):
             pb_end   = min(len(problems), pb_start + p_batch)
             pb_probs = problems[pb_start:pb_end]
             traces   = generate_latent_traces(
