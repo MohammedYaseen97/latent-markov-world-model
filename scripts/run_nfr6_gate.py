@@ -398,14 +398,20 @@ def main() -> None:
     pool_size = len(problems)  # capture before sampling for the overlap note below
     if args.n_problems > 0 and args.n_problems < pool_size:
         problems = random.sample(problems, args.n_problems)
-        # Compute Phase 0 training coverage from config so this stays accurate.
-        p0_cfg   = config.get("phase0", {})
-        n_seen   = int(p0_cfg.get("n_steps", 400)) * int(p0_cfg.get("batch_size", 1))
-        pct_seen = 100.0 * min(n_seen, pool_size) / pool_size
+        # Phase 0 sampling: batch_size=1, n_steps problems drawn from a single
+        # shuffle of the pool (no repeats since n_steps << pool_size).
+        # This sample is a random draw from the same pool — not a designated
+        # test split.  Expected overlap = n_sampled × (n_seen / pool_size).
+        p0_cfg        = config.get("phase0", {})
+        n_seen        = int(p0_cfg.get("n_steps", 400)) * int(p0_cfg.get("batch_size", 1))
+        n_seen        = min(n_seen, pool_size)
+        expected_overlap = len(problems) * n_seen / pool_size
         print(
-            f"  Sampled {len(problems)} problems (seed={args.seed}) — "
-            f"Phase 0 trained on ~{n_seen} / {pool_size} pool problems "
-            f"({pct_seen:.0f}% seen, {100 - pct_seen:.0f}% held-out).",
+            f"  Sampled {len(problems)} problems (seed={args.seed}).  "
+            f"Phase 0 used {n_seen}/{pool_size} pool problems "
+            f"({100.0 * n_seen / pool_size:.0f}%); "
+            f"~{expected_overlap:.0f} of these {len(problems)} are expected to overlap.  "
+            f"Overlap does not bias NFR6 — Phase 0 is RL pretraining, not memorisation.",
             flush=True,
         )
 
