@@ -45,9 +45,15 @@ evaluation:
   latent_eval_n_per_problem: 8
   # latent_eval_problem_batch_size: max problems per _generate_latent_eval_batch call.
   # Prevents OOM when evaluating all ~1117 hard-pool problems at once.
-  # RTX Pro 6000 96 GB: P=128, N=8 → B=1024 sequences/call.
-  # KV cache (chunk generation):  1024 × 541 tok × 28 × 2 × 16kv × 64head × 2B ≈ 10 GB
-  # Forward hidden (repr):        1024 × 741 × 1536 × 28 × 2B (SDPA fused)       ≈ 32 GB
-  # Model weights + overhead:                                                      ≈  6 GB
-  # Total:                                                                         ≈ 48 GB → fits comfortably.
-  latent_eval_problem_batch_size: 128
+  # repr_2/repr_3 use strict Markov context [z_pfx ‖ chunk] (seq≈342) not full history.
+  #
+  # RTX Pro 6000 96 GB: P=32, N=8 → B=256 sequences/call.
+  #   gen1 KV cache (chunk1):    256 × 741 tok × 28 × 1 KB/tok ≈  5.5 GB
+  #   repr_1 forward (full ctx): peak MLP 256 × 741 × 8960 × 2 × 2B ≈  6.8 GB
+  #   gen2 KV cache (chunk2):    256 × 683 tok × 28 × 1 KB/tok ≈  5.0 GB
+  #   repr_2 forward (strict):   peak MLP 256 × 342 × 8960 × 2 × 2B ≈  3.2 GB
+  #   Model weights + misc:                                           ≈  6.0 GB
+  #   Total peak per call:                                            ≈ 27 GB
+  # Leaves 69 GB headroom for PyTorch allocator fragmentation.
+  # Can increase to 64 once you confirm no OOM (with expandable_segments=True).
+  latent_eval_problem_batch_size: 32

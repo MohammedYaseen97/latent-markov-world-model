@@ -350,223 +350,11 @@ def _estimate_pass_at_k_metrics(
     }
 
 
-def _last_hidden_via_hook(
-    backbone: "torch.nn.Module",
-    *,
-    input_ids: "torch.Tensor | None" = None,
-    inputs_embeds: "torch.Tensor | None" = None,
-    attention_mask: "torch.Tensor",
-) -> "torch.Tensor":
-    """Run backbone forward, capturing the final hidden state via a single hook.
-
-    Using output_hidden_states=True stores all 28 intermediate layer tensors —
-    about 28× more GPU memory than we need for repr extraction.  A hook on the
-    backbone's output captures only the normed last-layer tensor, freeing the
-    intermediate activations immediately and allowing much larger eval batches.
-
-    Works for both token-ID inputs (input_ids) and embedding inputs (inputs_embeds).
-    The returned tensor has shape (B, seq_len, hidden_dim), same as
-    output.hidden_states[-1] from the output_hidden_states=True path.
-    """
-    _cap: dict[str, "torch.Tensor"] = {}
-
-    def _hook(module: "torch.nn.Module", inp: tuple, out: tuple) -> None:
-        _cap["h"] = out[0].detach()   # BaseModelOutputWithPast: out[0] = last_hidden_state
-
-    handle = backbone.register_forward_hook(_hook)
-    try:
-        backbone(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-        )
-    finally:
-        handle.remove()
-    return _cap["h"]
-
-
-def _generate_latent_eval_batch(
-    *,
-    model: "AutoModelForCausalLM",
-    tokenizer: "AutoTokenizer",
-    vae: "VAEStateEncoder",
-    z_injector: "ZInjector",
-    problems: "list[dict]",
-    n_per_problem: int,
-    chunk_tokens: int,
-    hidden_dim: int,
-    temperature: float,
-    top_p: float,
-    device: "torch.device",
-) -> "list[list[str]]":
-    """Generate n_per_problem completions for every problem in problems simultaneously.
-
-    Returns results[i] = list[str] of n_per_problem completion strings for problems[i].
-
-    ── Why this is fast ──────────────────────────────────────────────────────────
-    The old design looped over problems one at a time with a large per-problem
-    mini-batch.  This function inverts the loop: all P problems are batched
-    together with N = n_per_problem samples each (B = P × N total sequences per
-    model call).  With P=40 and N=8 that is 320 sequences/call instead of 1 × 128,
-    giving better GPU utilisation and 5× fewer total model dispatches for 1024 samples.
-
-    For the two repr forward passes the old code used output_hidden_states=True,
-    which materialised all 28 intermediate layers (~28× the memory needed).
-    We replace it with _last_hidden_via_hook, which captures only the final
-    normed hidden state and drops the rest immediately.  This memory saving is
-    what makes the larger cross-problem batch size feasible.
-
-    Args:
-        problems:      all P eval problems (prompt + ground_truth).
-        n_per_problem: N samples to generate per problem this call.
-
-    Returns:
-        List of P lists, each containing N completion strings.
-    """
-    from src.training.grpo_baseline import SYSTEM_PROMPT
-
-    P           = len(problems)
-    N           = n_per_problem
-    B           = P * N                           # total sequences this call
-    embed_layer = model.get_input_embeddings()
-    model_dtype = next(model.parameters()).dtype
-    pad_id      = tokenizer.eos_token_id
-    pad_emb     = embed_layer(torch.tensor([pad_id], dtype=torch.long, device=device))
-
-    # Build prompt IDs: problem p gets slots [p*N : (p+1)*N] in the flat batch.
-    all_prompt_ids: list[torch.Tensor] = []
-    for prob in problems:
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prob["prompt"]},
-        ]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        ids  = tokenizer(text, return_tensors="pt").input_ids[0].to(device)
-        for _ in range(N):
-            all_prompt_ids.append(ids)
-
-    pl_list = [ids.shape[0] for ids in all_prompt_ids]
-    max_pl  = max(pl_list)
-
-    # ── Chunk 1: B samples, each from their problem's prompt ──────────
-    inp1 = torch.full((B, max_pl), pad_id, dtype=torch.long, device=device)
-    am1  = torch.zeros(B, max_pl, dtype=torch.long, device=device)
-    for i, ids in enumerate(all_prompt_ids):
-        off = max_pl - pl_list[i]
-        inp1[i, off:] = ids
-        am1[i, off:]  = 1
-
-    gen1 = model.generate(
-        inp1, attention_mask=am1,
-        max_new_tokens=chunk_tokens, do_sample=True,
-        temperature=temperature, top_p=top_p,
-        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
-    )
-    chunk1_ids = [gen1[i, max_pl:].cpu() for i in range(B)]
-    c1_lens    = [c.shape[0] for c in chunk1_ids]
-    del gen1, inp1, am1
-    torch.cuda.empty_cache()
-
-    # repr_1 via hook — captures final hidden state only, not all 28 layers.
-    max_f1 = max_pl + max(c1_lens)
-    full1  = torch.zeros(B, max_f1, dtype=torch.long, device=device)
-    mask1  = torch.zeros(B, max_f1, dtype=torch.long, device=device)
-    for i in range(B):
-        L1 = c1_lens[i]; tot = pl_list[i] + L1
-        full1[i, :tot] = torch.cat([all_prompt_ids[i], chunk1_ids[i].to(device)])
-        mask1[i, :tot] = 1
-    last_h1 = _last_hidden_via_hook(model.model, input_ids=full1, attention_mask=mask1)
-    repr_1  = torch.stack([
-        last_h1[i, pl_list[i] : pl_list[i] + c1_lens[i], :].mean(0).float()
-        for i in range(B)
-    ]).to(device)
-    del full1, mask1, last_h1
-    torch.cuda.empty_cache()
-
-    mu_1, lv_1 = vae.encode(repr_1)
-    z_1        = vae.reparameterize(mu_1, lv_1)                        # (B, latent_dim)
-    z_pfx1     = z_injector.get_prefix_embedding(z_1).to(model_dtype)  # (B, 1, H)
-
-    # ── Chunk 2: B samples with per-sample z_1 prefix ─────────────────
-    max_c1   = max(c1_lens)
-    emb_len2 = 1 + max_c1
-    ie2 = torch.zeros(B, emb_len2, hidden_dim, dtype=model_dtype, device=device)
-    am2 = torch.zeros(B, emb_len2, dtype=torch.long, device=device)
-    for i in range(B):
-        L1 = c1_lens[i]; off = max_c1 - L1
-        ie2[i, :off]            = pad_emb
-        ie2[i, off]             = z_pfx1[i, 0]
-        ie2[i, off+1:off+1+L1]  = embed_layer(chunk1_ids[i].to(device))
-        am2[i, off:]            = 1
-    gen2 = model.generate(
-        inputs_embeds=ie2, attention_mask=am2,
-        max_new_tokens=chunk_tokens, do_sample=True,
-        temperature=temperature, top_p=top_p,
-        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
-    )
-    chunk2_ids = [
-        (gen2[i, emb_len2:] if gen2.shape[1] > chunk_tokens else gen2[i]).cpu()
-        for i in range(B)
-    ]
-    c2_lens = [c.shape[0] for c in chunk2_ids]
-    del ie2, am2, gen2
-    torch.cuda.empty_cache()
-
-    # repr_2 via hook
-    max_fwd2 = max(1 + c1_lens[i] + c2_lens[i] for i in range(B))
-    fe2 = torch.zeros(B, max_fwd2, hidden_dim, dtype=model_dtype, device=device)
-    fa2 = torch.zeros(B, max_fwd2, dtype=torch.long, device=device)
-    for i in range(B):
-        L1 = c1_lens[i]; L2 = c2_lens[i]; tot = 1 + L1 + L2
-        fe2[i, 0]         = z_pfx1[i, 0]
-        fe2[i, 1:1+L1]    = embed_layer(chunk1_ids[i].to(device))
-        fe2[i, 1+L1:tot]  = embed_layer(chunk2_ids[i].to(device))
-        fa2[i, :tot]      = 1
-    last_h2 = _last_hidden_via_hook(model.model, inputs_embeds=fe2, attention_mask=fa2)
-    repr_2  = torch.stack([
-        last_h2[i, 1+c1_lens[i] : 1+c1_lens[i]+c2_lens[i], :].mean(0).float()
-        for i in range(B)
-    ]).to(device)
-    del fe2, fa2, last_h2
-    torch.cuda.empty_cache()
-
-    mu_2, lv_2 = vae.encode(repr_2)
-    z_2        = vae.reparameterize(mu_2, lv_2)
-    z_pfx2     = z_injector.get_prefix_embedding(z_2).to(model_dtype)   # (B, 1, H)
-
-    # ── Chunk 3: B samples with per-sample z_2 prefix ─────────────────
-    max_c2   = max(c2_lens)
-    emb_len3 = 1 + max_c2
-    ie3 = torch.zeros(B, emb_len3, hidden_dim, dtype=model_dtype, device=device)
-    am3 = torch.zeros(B, emb_len3, dtype=torch.long, device=device)
-    for i in range(B):
-        L2 = c2_lens[i]; off = max_c2 - L2
-        ie3[i, :off]            = pad_emb
-        ie3[i, off]             = z_pfx2[i, 0]
-        ie3[i, off+1:off+1+L2]  = embed_layer(chunk2_ids[i].to(device))
-        am3[i, off:]            = 1
-    gen3 = model.generate(
-        inputs_embeds=ie3, attention_mask=am3,
-        max_new_tokens=chunk_tokens, do_sample=True,
-        temperature=temperature, top_p=top_p,
-        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
-    )
-    chunk3_ids = [
-        (gen3[i, emb_len3:] if gen3.shape[1] > chunk_tokens else gen3[i]).cpu()
-        for i in range(B)
-    ]
-    del ie3, am3, gen3
-
-    # Decode and group by problem (problem p occupies flat indices [p*N : (p+1)*N])
-    results: list[list[str]] = [[] for _ in range(P)]
-    for i in range(B):
-        results[i // N].append(
-            tokenizer.decode(
-                torch.cat([chunk1_ids[i], chunk2_ids[i], chunk3_ids[i]]),
-                skip_special_tokens=True,
-            )
-        )
-    return results
+# _last_hidden_via_hook and _generate_latent_eval_batch have been deleted.
+# Both latent eval functions now call generate_latent_traces() directly from
+# src.training.grpo_latent — the same function used by Phase 0 and Phase 1
+# training — so any fix to the training pipeline is automatically reflected
+# in eval without manual mirroring.
 
 
 def _estimate_pass_at_k_metrics_latent(
@@ -579,27 +367,26 @@ def _estimate_pass_at_k_metrics_latent(
 ) -> dict[str, float]:
     """Compute pass@k for the latent Markov arm using chunked z-injection inference.
 
-    Loads the Phase 1 checkpoint (backbone + VAE + ZInjector), then calls
-    _generate_latent_eval() for each sample of each problem.
+    Loads the Phase 1 checkpoint (backbone + VAE + ZInjector), then drives
+    generation through generate_latent_traces() — the same function used by
+    Phase 0 and Phase 1 training — so the eval pipeline is identical to the
+    training pipeline by construction.
 
-    This function does NOT support vLLM (the z-injection inputs_embeds path is
-    incompatible with vLLM's offline engine).  HF generate only.
+    Does NOT support vLLM (z-injection inputs_embeds is incompatible with
+    vLLM's offline engine).  HF generate only.
 
-    Args:
-        problems:   list of problem dicts from the eval JSONL pool.
-        checkpoint: path to the Phase 1 backbone directory (containing the adapter
-                    or merged weights from _save_phase1_checkpoint).
-        ks:         list of k values for pass@k (e.g. [1, 16, 1024]).
-        eval_cfg:   top-level evaluation config dict.
-        train_cfg:  training config (reads latent_markov.chunk_tokens, phase0.checkpoint_path).
+    Memory knobs (from eval_cfg):
+        latent_eval_n_per_problem       N samples generated per problem per call
+        latent_eval_problem_batch_size  P problems per generate_latent_traces call
+        → B = P × N sequences per model.generate() call.
     """
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from src.models.vae_state_encoder import VAEStateEncoder, ZInjector
-    from src.training.grpo_baseline import SYSTEM_PROMPT
+    from src.training.grpo_latent import generate_latent_traces
 
-    latent_cfg  = train_cfg["latent_markov"]
-    phase0_cfg  = train_cfg["phase0"]
+    latent_cfg   = train_cfg["latent_markov"]
+    primary_cfg  = train_cfg["primary"]
     chunk_tokens = int(latent_cfg.get("chunk_tokens", 341))
     latent_dim   = int(latent_cfg.get("latent_dim", 64))
     hidden_dim   = int(latent_cfg.get("hidden_dim", 1536))
@@ -610,23 +397,25 @@ def _estimate_pass_at_k_metrics_latent(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ── Load backbone ──────────────────────────────────────────────────
-    # _save_phase1_checkpoint writes the backbone to <checkpoint>/backbone/
-    # and phase1_latent.pt to <checkpoint>/phase1_latent.pt.
+    # _save_phase1_checkpoint writes backbone to <checkpoint>/backbone/
+    # and latent state to <checkpoint>/phase1_latent.pt.
     ckpt_dir     = Path(checkpoint)
     backbone_dir = ckpt_dir / "backbone"
+    attn_impl    = primary_cfg.get("attn_implementation", "sdpa")
     model = AutoModelForCausalLM.from_pretrained(
         str(backbone_dir), torch_dtype=torch.bfloat16, device_map="auto",
+        attn_implementation=attn_impl,
     )
     model.eval()
-    # Try loading the tokenizer from the saved backbone first; fall back to the
-    # original backbone model ID for checkpoints saved before the tokenizer fix.
-    _tok_src = str(backbone_dir)
+
+    # Try loading tokenizer from saved backbone; fall back to original model ID
+    # for checkpoints saved before the tokenizer was included.
+    _tok_src       = str(backbone_dir)
     _tok_candidate = AutoTokenizer.from_pretrained(
         _tok_src, trust_remote_code=True, padding_side="left",
     )
     if _tok_candidate.chat_template is None:
-        # Tokenizer was not saved alongside the backbone — load from the original.
-        _tok_src = train_cfg["primary"]["huggingface_repo_id"]
+        _tok_src  = primary_cfg["huggingface_repo_id"]
         tokenizer = AutoTokenizer.from_pretrained(
             _tok_src, trust_remote_code=True, padding_side="left",
         )
@@ -648,49 +437,42 @@ def _estimate_pass_at_k_metrics_latent(
     z_injector.eval()
 
     # ── Eval loop ─────────────────────────────────────────────────────
-    # Problems are chunked into batches of latent_eval_problem_batch_size (P_batch)
-    # and each batch is called with N=latent_eval_n_per_problem samples per call.
-    # B = P_batch × N sequences per model.generate() call.
-    #
-    # latent_eval_n_per_problem controls how many samples are generated per
-    # iteration (ceil(n_samples/N) iterations total per problem batch).
-    # latent_eval_problem_batch_size limits P to prevent OOM on large eval pools.
-    #
-    # RTX Pro 6000 96 GB defaults (from eval config):
-    #   P_batch=128, N=8 → B=1024 seq/call; peak ≈ 48 GB.
+    # generate_latent_traces is already decorated @torch.no_grad(); no wrapper needed.
+    # Rewards come pre-computed in each trace (same grading as training).
     n_per_problem = int(eval_cfg.get("latent_eval_n_per_problem", 8))
-    p_batch       = int(eval_cfg.get("latent_eval_problem_batch_size", 128))
+    p_batch       = int(eval_cfg.get("latent_eval_problem_batch_size", 32))
     n_iters       = math.ceil(n_samples / n_per_problem)
-    per_problem_texts: list[list[str]] = [[] for _ in range(len(problems))]
 
-    for it in tqdm(range(n_iters), desc="latent eval batches", unit="iter"):
+    per_problem_correct: list[int] = [0] * len(problems)
+    per_problem_total:   list[int] = [0] * len(problems)
+
+    for it in tqdm(range(n_iters), desc="latent eval", unit="iter"):
         this_n = min(n_per_problem, n_samples - it * n_per_problem)
         for pb_start in range(0, len(problems), p_batch):
-            pb_end    = min(len(problems), pb_start + p_batch)
-            pb_probs  = problems[pb_start:pb_end]
-            with torch.no_grad():
-                results = _generate_latent_eval_batch(
-                    model=model,
-                    tokenizer=tokenizer,
-                    vae=vae,
-                    z_injector=z_injector,
-                    problems=pb_probs,
-                    n_per_problem=this_n,
-                    chunk_tokens=chunk_tokens,
-                    hidden_dim=hidden_dim,
-                    temperature=temperature,
-                    top_p=top_p,
-                    device=device,
-                )
-            for i, texts in enumerate(results):
-                per_problem_texts[pb_start + i].extend(texts)
+            pb_end   = min(len(problems), pb_start + p_batch)
+            pb_probs = problems[pb_start:pb_end]
+            traces   = generate_latent_traces(
+                model=model, tokenizer=tokenizer,
+                vae=vae, z_injector=z_injector,
+                problems=pb_probs, n_rollouts=this_n,
+                chunk_tokens=chunk_tokens,
+                temperature=temperature, top_p=top_p,
+                device=device,
+            )
+            # traces is flat: [prob0_r0, ..., prob0_r{this_n-1}, prob1_r0, ...]
+            P_batch = pb_end - pb_start
+            for p_idx in range(P_batch):
+                abs_idx = pb_start + p_idx
+                for r_idx in range(this_n):
+                    t = traces[p_idx * this_n + r_idx]
+                    per_problem_correct[abs_idx] += t["reward"]
+                    per_problem_total[abs_idx]   += 1
 
-    per_problem = [
-        (len(per_problem_texts[i]), _grade(per_problem_texts[i], problems[i]["ground_truth"]))
-        for i in range(len(problems))
-    ]
     return {
-        f"pass@{k}": sum(_unbiased_pass_at_k(n, c, k) for n, c in per_problem) / len(per_problem)
+        f"pass@{k}": sum(
+            _unbiased_pass_at_k(per_problem_total[i], per_problem_correct[i], k)
+            for i in range(len(problems))
+        ) / len(problems)
         for k in ks
     }
 
@@ -706,23 +488,17 @@ def _estimate_pass_at_k_metrics_latent_pretrained(
 
     Loads the original pretrained backbone directly from HF (no LoRA, no Phase 1
     updates) together with the Phase 0 VAE checkpoint and a freshly initialised
-    ZInjector.  This establishes the capability floor under the latent generation
-    regime — the equivalent of baseline_pretrained and token_markov_pretrained for
-    the other arms.
+    ZInjector.  Establishes the capability floor under the latent generation
+    regime — the equivalent of baseline_pretrained for the latent arm.
 
-    The backbone is identified from train_cfg["primary"]["huggingface_repo_id"].
-    The Phase 0 VAE and ZInjector are loaded from train_cfg["phase0"]["checkpoint_path"].
-
-    Args:
-        problems:  list of problem dicts from the eval JSONL pool.
-        ks:        list of k values for pass@k (e.g. [1, 16, 1024]).
-        eval_cfg:  top-level evaluation config dict.
-        train_cfg: training config (reads primary.*, latent_markov.*, phase0.*).
+    Uses generate_latent_traces() from training for generation, so the forward
+    pass (prompt encoding, Markov repr computation, z injection) is byte-for-byte
+    identical to Phase 0 and Phase 1 training.
     """
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from src.models.vae_state_encoder import VAEStateEncoder, ZInjector
-    from src.training.grpo_baseline import SYSTEM_PROMPT
+    from src.training.grpo_latent import generate_latent_traces
 
     primary_cfg  = train_cfg["primary"]
     latent_cfg   = train_cfg["latent_markov"]
@@ -737,12 +513,11 @@ def _estimate_pass_at_k_metrics_latent_pretrained(
     top_p        = float(eval_cfg.get("top_p", 1.0))
     n_samples    = max(ks)
 
-    vae0_path    = Path(phase0_cfg.get("checkpoint_path", "runs/latent_grpo/phase0_encoder.pt"))
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vae0_path = Path(phase0_cfg.get("checkpoint_path", "runs/latent_grpo/phase0_encoder.pt"))
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     attn_impl = primary_cfg.get("attn_implementation", "sdpa")
-    print(f"[latent_markov_pretrained] Loading pretrained backbone {model_id} @ {revision} …",
+    print(f"[latent_markov_pretrained] Loading backbone {model_id} @ {revision} …",
           file=sys.stderr)
     model = AutoModelForCausalLM.from_pretrained(
         model_id, revision=revision, torch_dtype=torch.bfloat16,
@@ -767,39 +542,40 @@ def _estimate_pass_at_k_metrics_latent_pretrained(
         z_injector.load_state_dict(ckpt["z_injector"])
     z_injector.eval()
 
+    # generate_latent_traces is @torch.no_grad(); rewards pre-computed per trace.
     n_per_problem = int(eval_cfg.get("latent_eval_n_per_problem", 8))
-    p_batch       = int(eval_cfg.get("latent_eval_problem_batch_size", 128))
+    p_batch       = int(eval_cfg.get("latent_eval_problem_batch_size", 32))
     n_iters       = math.ceil(n_samples / n_per_problem)
-    per_problem_texts: list[list[str]] = [[] for _ in range(len(problems))]
 
-    for it in tqdm(range(n_iters), desc="latent_pretrained eval batches", unit="iter"):
+    per_problem_correct: list[int] = [0] * len(problems)
+    per_problem_total:   list[int] = [0] * len(problems)
+
+    for it in tqdm(range(n_iters), desc="latent_pretrained eval", unit="iter"):
         this_n = min(n_per_problem, n_samples - it * n_per_problem)
         for pb_start in range(0, len(problems), p_batch):
             pb_end   = min(len(problems), pb_start + p_batch)
             pb_probs = problems[pb_start:pb_end]
-            with torch.no_grad():
-                results = _generate_latent_eval_batch(
-                    model=model,
-                    tokenizer=tokenizer,
-                    vae=vae,
-                    z_injector=z_injector,
-                    problems=pb_probs,
-                    n_per_problem=this_n,
-                    chunk_tokens=chunk_tokens,
-                    hidden_dim=hidden_dim,
-                    temperature=temperature,
-                    top_p=top_p,
-                    device=device,
-                )
-            for i, texts in enumerate(results):
-                per_problem_texts[pb_start + i].extend(texts)
+            traces   = generate_latent_traces(
+                model=model, tokenizer=tokenizer,
+                vae=vae, z_injector=z_injector,
+                problems=pb_probs, n_rollouts=this_n,
+                chunk_tokens=chunk_tokens,
+                temperature=temperature, top_p=top_p,
+                device=device,
+            )
+            P_batch = pb_end - pb_start
+            for p_idx in range(P_batch):
+                abs_idx = pb_start + p_idx
+                for r_idx in range(this_n):
+                    t = traces[p_idx * this_n + r_idx]
+                    per_problem_correct[abs_idx] += t["reward"]
+                    per_problem_total[abs_idx]   += 1
 
-    per_problem = [
-        (len(per_problem_texts[i]), _grade(per_problem_texts[i], problems[i]["ground_truth"]))
-        for i in range(len(problems))
-    ]
     return {
-        f"pass@{k}": sum(_unbiased_pass_at_k(n, c, k) for n, c in per_problem) / len(per_problem)
+        f"pass@{k}": sum(
+            _unbiased_pass_at_k(per_problem_total[i], per_problem_correct[i], k)
+            for i in range(len(problems))
+        ) / len(problems)
         for k in ks
     }
 

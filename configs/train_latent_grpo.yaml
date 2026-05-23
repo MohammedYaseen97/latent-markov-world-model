@@ -45,6 +45,7 @@
 #       --n-problems 200 --n-rollouts 2
 #
 #   # 3. Controlled latent baseline eval (pretrained backbone + Phase 0 encoder)
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 #   python scripts/eval_passk.py --generation-mode latent_markov_pretrained \
 #       --train-config configs/train_latent_grpo.yaml --arm latent_grpo_pretrained \
 #       --output runs/latent_grpo/eval_pretrained.json
@@ -54,6 +55,7 @@
 #
 #   # 5. Phase 1 eval
 #   PHASE1_CKPT=$(ls -td artifacts/latent_grpo/*/phase1/final | head -1)
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 #   python scripts/eval_passk.py --generation-mode latent_markov \
 #       --train-config configs/train_latent_grpo.yaml --checkpoint "$PHASE1_CKPT" \
 #       --arm latent_grpo --output runs/latent_grpo/eval_phase1.json
