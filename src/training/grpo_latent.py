@@ -995,7 +995,13 @@ def latent_training_step(
         [float(t["reward"]) for t in traces],
         dtype=torch.float32, device=device,
     )
-    l_calib = vae.compute_calibration_loss(pipe["logvar_list"], rewards_t)
+    # Dynamic pos_weight: mirrors Phase 0 treatment.  Hard pool reward rate is
+    # ~0.1% → without weighting the model trivially drives l_calib→0 by predicting
+    # "always wrong".  pos_weight=20 cap prevents gradient explosion on zero-reward steps.
+    pos_rate_p1 = rewards_t.mean().clamp(min=0.05)
+    pos_weight_p1 = ((1.0 - pos_rate_p1) / pos_rate_p1).clamp(max=20.0)
+    l_calib = vae.compute_calibration_loss(pipe["logvar_list"], rewards_t,
+                                           pos_weight=pos_weight_p1)
 
     # L_RL: -mean_{i,h,t} [ adv_i × log_π(token_t | context_{h,i}) ]
     adv = [float(a) for a in advantages]

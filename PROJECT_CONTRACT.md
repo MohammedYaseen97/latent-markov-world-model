@@ -130,12 +130,12 @@ method, not implementation.
 
 ### Controlled latent baseline eval
 
-- [ ] Run: `python scripts/eval_passk.py --generation-mode latent_markov_pretrained ...`
-- [ ] **PASS criterion:** pass@128 ≥ baseline_pretrained pass@128 (ZInjector near-zero init check)
+- [x] Run: `python scripts/eval_passk.py --generation-mode latent_markov_pretrained ...`
+- [x] **PASS:** pass@128 = 9.58% >> baseline_pretrained ≈ 0%. Numbers and interpretation in `reports/ablation_core.md`.
 
 ### Phase 1 — Joint RL (200 steps)
 
-- [ ] Run: `python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 1`
+- [x] Run: `python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 1` *(training in progress)*
 - [ ] Log: L_trans non-zero from step 0; L_RL non-zero within first 30 steps; L_calib non-zero
 - [ ] Log: λ_trans=0.3 confirmed (maintenance mode); λ_calib=0.5 confirmed
 

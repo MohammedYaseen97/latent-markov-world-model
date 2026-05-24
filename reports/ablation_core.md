@@ -14,7 +14,7 @@ Rows below are hand-updated as runs complete.*
 |-----|--------|---------|----------|-----|
 | `baseline_grpo` | 0.00220 | 0.03235 | **0.1620** | `artifacts/baseline_grpo/20260522T121721Z/checkpoint-200` |
 | `token_markov_grpo` | — | — | — | — |
-| `latent_grpo_pretrained` | — | — | — | — |
+| `latent_grpo_pretrained` | 0.00116 | 0.01718 | **0.09579** | `Qwen/Qwen2.5-1.5B-Instruct` + Phase 0 encoder |
 | `latent_grpo` | — | — | — | — |
 | `latent_grpo_uncertainty` | — | — | — | — |
 
@@ -24,7 +24,7 @@ Rows below are hand-updated as runs complete.*
 |-----|-------------------|
 | `baseline_grpo` | `artifacts/baseline_grpo/20260522T121721Z/checkpoint-200/eval_metrics.json` |
 | `token_markov_grpo` | — |
-| `latent_grpo_pretrained` | — |
+| `latent_grpo_pretrained` | pretrained backbone + Phase 0 VAE; no separate artifact path |
 | `latent_grpo` | — |
 | `latent_grpo_uncertainty` | — |
 
@@ -114,13 +114,53 @@ context ([prefix_h ‖ chunk_{h+1}] replacing [prefix_h ‖ full history]).
 
 ---
 
-## Remaining gates (not yet run)
+---
+
+### latent_grpo_pretrained — Controlled baseline eval
+
+**Verdict: PASS ✅** (gate criterion: pass@128 ≥ baseline_pretrained ≈ 0)
+
+| metric | value |
+|--------|-------|
+| Pool | MATH Level 5 hard pool, n=1117 |
+| Backbone | `Qwen/Qwen2.5-1.5B-Instruct` (pretrained, no Phase 1 GRPO) |
+| Encoder | Phase 0 VAE + ZInjector checkpoint |
+| pass@1 | 0.00116 |
+| pass@16 | 0.01718 |
+| pass@128 | **0.09579** |
+
+**Interpretation:** 9.58% pass@128 for the pretrained backbone under the latent generation
+regime, compared to ≈0% for the same backbone under vanilla generation (by hard pool
+construction). The gap has two contributing causes:
+
+1. **Generation regime difference:** the latent arm uses chunked generation (3 × 341 tokens)
+   rather than a single unconstrained 1024-token rollout. Forced chunking may impose a
+   reasoning structure that helps on some hard problems even with an uninformative z.
+2. **Phase 0 encoder contribution:** the Phase 0 VAE was trained to produce outcome-correlated
+   z states (NFR6 PASS confirmed). These states inject a context-shaping prefix between chunks
+   that can steer generation toward correct reasoning paths.
+
+The two effects cannot be cleanly separated without a further ablation (chunked generation with
+random z vs. Phase 0 z). For the current purpose, 9.58% serves as the **latent arm floor**:
+Phase 1 GRPO training (now running) must push meaningfully above this to attribute the gain to
+the RL-trained Markov state rather than the chunking structure alone.
+
+**Win condition context:**
+- baseline_grpo (200 steps RL): pass@128 = 16.20%
+- latent_pretrained (Phase 0 only): pass@128 = 9.58%
+- latent_grpo Phase 1 target: pass@128 ≥ 19.20% (baseline + 3pp)
+- A result between 16.2% and 19.2% would indicate latent RL matches but does not beat baseline;
+  above 19.2% is the win condition.
+
+---
+
+## Remaining gates
 
 | Gate | Status |
 |------|--------|
-| `latent_grpo_pretrained` pass@128 ≥ baseline_pretrained | ⬜ pending |
-| `latent_grpo` Phase 1 (200 steps) | ⬜ pending |
-| `latent_grpo` pass@128 ≥ 0.192 (baseline + 3pp) | ⬜ pending |
+| `latent_grpo_pretrained` pass@128 ≥ baseline_pretrained | ✅ PASS (9.58% >> ~0%) |
+| `latent_grpo` Phase 1 (200 steps) | 🔄 training in progress |
+| `latent_grpo` pass@128 ≥ 0.192 (baseline + 3pp) | ⬜ pending Phase 1 eval |
 | E1: held-out L_trans < 0.5 | ⬜ pending |
 | E3: Pearson r < −0.1 AND Δσ² > 0.01 | ⬜ pending |
 | `token_markov_grpo` training + eval | ⬜ pending |
