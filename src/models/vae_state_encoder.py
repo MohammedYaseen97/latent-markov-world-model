@@ -1,22 +1,26 @@
 """Deterministic state encoder, transition model, and policy-conditioning injector.
 
-Architecture (v2 — rung 2 of the research ladder):
+Shared by arm 3 (latent_grpo) and arm 4 (latent_grpo_uncertainty).
 
-  Encoder    1536 → 512 → 128 → split → μ (64)  log_σ² (64)
-  Transition  64  → 512 → 64
-  OutcomeHead  64 → 64  → 1                    (raw logit; Phase 0 only, discarded before Phase 1)
-  ZInjector    64 → 1536                       (Phase 1: prepend z as soft prefix token)
+Architecture:
 
-z_h = μ_h  — always deterministic (training and generation). No sampling.
-log_σ²_h   — quality indicator auxiliary output. Trained via L_calib to be high on
-               incorrect trajectories and low on correct ones. Never used for z
-               computation; provides quality-oriented gradient to the shared encoder trunk.
+  Encoder     1536 → 512 → 128 → split → μ (64)   log_σ² (64)
+  Transition   64  → 512 → 64
+  OutcomeHead  64  → 64  → 1     (raw logit; Phase 0 only, discarded before Phase 1)
+  ZInjector    64  → 1536        (Phase 1: prepend z as soft prefix token)
 
-The decoder, ELBO/KL machinery, and reparameterize() are removed (rung 2 is a
-deterministic tracker, not a generator).
+ARM 3 — latent_grpo (deterministic tracker, no sampling):
+  z_h = μ_h always. No sampling anywhere.
+  log_σ²_h is a quality-indicator auxiliary head trained via L_calib to be high on
+  incorrect trajectories and low on correct ones. Its only role is to inject quality-
+  oriented gradient into the shared encoder trunk — it never enters z computation.
+  No decoder, no ELBO, no KL, no reparameterize().
+
+ARM 4 — latent_grpo_uncertainty (stub, not yet implemented):
+  Same encoder. σ² used additionally as an exploration signal (reward bonus or sampling).
+  See PROJECT_CONTRACT.md §Phase 3b and reports/writeup_stubs.md.
 
 See reports/latent_markov_design.md §Architecture for full design rationale.
-See reports/NEXT_STEPS_V2.md for the rung 2 → rung 3 (diffusion) upgrade path.
 """
 from __future__ import annotations
 

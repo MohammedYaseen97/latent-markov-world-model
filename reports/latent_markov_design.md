@@ -252,11 +252,15 @@ token-space state.
 
 ## Architecture
 
-### Encoder, transition (v2 — no decoder, no sampling)
+### Encoder, transition — arm 3: deterministic tracker
 
 All components are small MLPs satisfying R4.4 (< 10M params total).
-The decoder, ELBO/KL machinery, and reparameterization sampling from v1 are removed —
-rung 2 is a purely deterministic tracker. z = μ everywhere: training, generation, eval.
+The decoder, ELBO/KL machinery, and reparameterize() from v1 are removed.
+Arm 3 (`latent_grpo`) is a purely deterministic tracker: z = μ everywhere — training,
+generation, eval. No sampling at any point.
+
+Arm 4 (`latent_grpo_uncertainty`) shares the same encoder but adds σ² as an active
+exploration signal. It is a stub; nothing below applies to it until it is implemented.
 
 **Encoder** — maps trajectory representation to a latent state and a quality indicator:
 
@@ -537,8 +541,8 @@ and the NFR6 t-SNE gate.
 | R3.2 — transition loss satisfies R3.1      | explicitly: L_transition is always computable                  |
 | R3.4 — gradients in first ~20 steps        | L_transition + L_calib flow from step 0                        |
 | R4.1 — encoder: MLP, dim 64–128            | 1536 → 512 → 64, latent dim 64                                 |
-| R4.2 — no decoder in v2                    | decoder removed; rung 2 is tracking, not generation            |
-| R4.3 — deterministic z during training     | z_h = μ_h; no reparameterization; σ² trained via L_calib only  |
+| R4.2 — no decoder in arm 3                 | decoder removed; arm 3 is deterministic tracking, not generation |
+| R4.3 — deterministic z always              | z_h = μ_h everywhere; reparameterize() removed; σ² is quality-indicator only |
 | R4.4 — encoder < 10M params                | encoder + transition ≈ 2–3M (decoder removed)                  |
 | R4.5 — same latent dim both arms           | 64-dim shared between latent and latent+uncertainty            |
 | R5.1 — z_h injected before policy head     | soft prefix prepended to inputs_embeds                         |

@@ -29,7 +29,7 @@ Phases, gates, and what to ship. **Vision / hypothesis / architecture:** `PROJEC
 - **Three active arms (core table):**
   1. `baseline_grpo` — history-as-state  
   2. `token_markov_grpo` — Delethink-style RL-learned textual carryover (Markovian Thinker, ICLR 2026)
-  3. `latent_grpo` — deterministic latent Markov state with calibrated uncertainty (no bonus)
+  3. `latent_grpo` — purely deterministic latent Markov state (z = μ always); σ² as quality-indicator auxiliary only, no sampling, no exploration bonus
   4. `latent_grpo_uncertainty` — latent + KL variance exploration bonus (stub — not yet implemented)
 - **Primary metric:** `pass@128` on the Level 5 hard pool (all arms).
   Also report `pass@1`, `pass@16`.
