@@ -15,7 +15,7 @@ Rows below are hand-updated as runs complete.*
 | `baseline_grpo` | 0.00220 | 0.03235 | **0.1620** | `artifacts/baseline_grpo/20260522T121721Z/checkpoint-200` |
 | `token_markov_grpo` | — | — | — | — |
 | `latent_grpo_pretrained` | 0.00116 | 0.01718 | **0.09579** | `Qwen/Qwen2.5-1.5B-Instruct` + Phase 0 encoder |
-| `latent_grpo` | — | — | — | — |
+| `latent_grpo` | 0.00115 | 0.01631 | **0.0842** | `artifacts/latent_grpo/20260524T032554Z/phase1/final` |
 | `latent_grpo_uncertainty` | — | — | — | — |
 
 ## Artifact paths
@@ -25,7 +25,7 @@ Rows below are hand-updated as runs complete.*
 | `baseline_grpo` | `artifacts/baseline_grpo/20260522T121721Z/checkpoint-200/eval_metrics.json` |
 | `token_markov_grpo` | — |
 | `latent_grpo_pretrained` | pretrained backbone + Phase 0 VAE; no separate artifact path |
-| `latent_grpo` | — |
+| `latent_grpo` | `artifacts/latent_grpo/20260524T032554Z/phase1/final/eval_metrics.json` |
 | `latent_grpo_uncertainty` | — |
 
 ---
@@ -156,11 +156,68 @@ the RL-trained Markov state rather than the chunking structure alone.
 
 ## Remaining gates
 
+---
+
+### latent_grpo — Phase 1 joint RL training (200 steps)
+
+**Verdict: ❌ FAIL — Phase 1 degraded performance below Phase 0 floor**
+
+| metric | value |
+|--------|-------|
+| Pool | MATH Level 5 hard pool, n=1117 |
+| Checkpoint | `artifacts/latent_grpo/20260524T032554Z/phase1/final` |
+| pass@1 | 0.00115 |
+| pass@16 | 0.01631 |
+| pass@128 | **0.0842** |
+| vs. latent_pretrained (Phase 0 floor) | **−1.16pp** (worse) |
+| vs. baseline_grpo target (≥19.2%) | **−10.8pp** (far below) |
+
+**Training log summary:**
+
+Two encoder disruption cycles occurred during Phase 1:
+- Cycle 1 (step 70): l_trans spiked 0.39 → 1.51, recovered to new low 0.22 by step 100
+- Cycle 2 (step 160–170): l_trans spiked 0.39 → **4.16**, only partially recovered to 0.67 by step 200
+
+Reward rate: 0.0–0.3% throughout (sparse; ~0.6 correct rollouts/step expected on hard pool).
+L_calib was degenerate in the first run (no pos_weight). Fixed and rerun — l_calib maintained at
+0.05–0.19 throughout the valid run. L_RL showed real signal at steps 100/130/140 (+0.019/+0.003/+0.003).
+
+**Root causes of failure:**
+
+1. **Encoder instability from joint backbone training:** the backbone (lr=1e-6) accumulated 170+
+   gradient steps before the second disruption. Each step shifts hidden representations; the
+   encoder cannot track fast enough, causing l_trans spikes. The second spike hit too late
+   (step 170) to recover by step 200 — final checkpoint has l_trans=0.671, 3× above the
+   stable range (0.22 at step 120).
+
+2. **Reward sparsity:** ~0.1–0.3% per rollout on hard Level 5 problems gives ~0.6 correct
+   rollouts per step (4 problems × 128 rollouts). L_RL gradient is real but too weak to
+   compensate for encoder degradation from L_trans instability.
+
+3. **z = μ + ε·σ IS gap (now fixed):** generation used sampled z but training computed log_π
+   under z = μ. For correct rollouts this breaks IS=1 assumption. Fixed in code before this
+   eval was run. The current eval used z = μ during generation.
+
+**What Phase 1 did achieve:**
+- l_trans floor of 0.22 at step 120 (better than Phase 0 final of 0.74) — encoder improved mid-run
+- L_RL showed positive signal at peak (step 100: l_rl=+0.019) — RL learning was real, just interrupted
+- Confirms Phase 0 pre-training is necessary but not sufficient
+
+**Fix direction for Phase 1 rerun:**
+Encoder stability during joint training. Options: gradient norm clipping specifically on the encoder
+parameters, lower backbone lr (1e-7?), periodic encoder-only stabilization steps, or decoupling
+encoder and backbone update schedules.
+
+---
+
+## Remaining gates
+
 | Gate | Status |
 |------|--------|
 | `latent_grpo_pretrained` pass@128 ≥ baseline_pretrained | ✅ PASS (9.58% >> ~0%) |
-| `latent_grpo` Phase 1 (200 steps) | 🔄 training in progress |
-| `latent_grpo` pass@128 ≥ 0.192 (baseline + 3pp) | ⬜ pending Phase 1 eval |
+| `latent_grpo` Phase 1 (200 steps) | ✅ complete |
+| `latent_grpo` pass@128 ≥ 0.192 (baseline + 3pp) | ❌ FAIL (8.42% — below pretrained floor) |
 | E1: held-out L_trans < 0.5 | ⬜ pending |
 | E3: Pearson r < −0.1 AND Δσ² > 0.01 | ⬜ pending |
 | `token_markov_grpo` training + eval | ⬜ pending |
+| **Phase 1 rerun** (encoder stability fix needed) | 🔄 pending investigation |

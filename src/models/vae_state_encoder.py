@@ -7,12 +7,13 @@ Architecture (v2 — rung 2 of the research ladder):
   OutcomeHead  64 → 64  → 1                    (raw logit; Phase 0 only, discarded before Phase 1)
   ZInjector    64 → 1536                       (Phase 1: prepend z as soft prefix token)
 
-z_h = μ_h  — used deterministically during training for Markov tracking.
-σ²_h        — trained explicitly via L_calib to be high on incorrect trajectories
-               and low on correct ones. Not a KL side-effect.
+z_h = μ_h  — always deterministic (training and generation). No sampling.
+log_σ²_h   — quality indicator auxiliary output. Trained via L_calib to be high on
+               incorrect trajectories and low on correct ones. Never used for z
+               computation; provides quality-oriented gradient to the shared encoder trunk.
 
-reparameterize() is retained for optional noise injection at inference time only.
-The decoder and ELBO/KL machinery are removed (rung 2 is a tracker, not a generator).
+The decoder, ELBO/KL machinery, and reparameterize() are removed (rung 2 is a
+deterministic tracker, not a generator).
 
 See reports/latent_markov_design.md §Architecture for full design rationale.
 See reports/NEXT_STEPS_V2.md for the rung 2 → rung 3 (diffusion) upgrade path.
@@ -97,23 +98,6 @@ class VAEStateEncoder(nn.Module):
         logvar = self.logvar_head(x)
         return mu, logvar
 
-    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Return z = μ during training (deterministic) or μ + ε·σ at eval.
-
-        Training: z = μ  (no sampling noise — z is the Markov state).
-        Eval / inference: z = μ + ε·σ for optional diversity.
-
-        Args:
-            mu:     posterior mean. Shape: (batch, latent_dim).
-            logvar: log σ². Shape: (batch, latent_dim).
-
-        Returns:
-            z: latent vector. Shape: (batch, latent_dim).
-        """
-        if self.training:
-            return mu
-        return mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
-
     def transition(self, z_h: torch.Tensor) -> torch.Tensor:
         """Predict z_{h+1} from the current latent state alone.
 
@@ -144,7 +128,7 @@ class VAEStateEncoder(nn.Module):
 
         Returns:
             List of N_CHUNKS tuples (z_h, mu_h, logvar_h).
-            z_h = mu_h during training (deterministic).
+            z_h = mu_h always (deterministic).
         """
         assert len(repr_list) == N_CHUNKS, (
             f"Expected {N_CHUNKS} chunk representations, got {len(repr_list)}"
@@ -152,8 +136,7 @@ class VAEStateEncoder(nn.Module):
         results = []
         for repr_h in repr_list:
             mu_h, logvar_h = self.encode(repr_h)
-            z_h = self.reparameterize(mu_h, logvar_h)
-            results.append((z_h, mu_h, logvar_h))
+            results.append((mu_h, mu_h, logvar_h))  # (z_h=μ, mu_h, logvar_h)
         return results
 
     # ------------------------------------------------------------------

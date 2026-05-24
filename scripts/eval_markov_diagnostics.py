@@ -164,9 +164,8 @@ def collect_repr(
     # (which are detached by context).
     pipe = _run_pipeline_with_grad(model, vae, z_injector, traces, device)
 
-    # Encode repr_h to get logvar_h (the distribution parameter we need for E3).
-    # Note: vae.eval() → reparameterize returns mu (no sampling), but we want
-    # logvar directly from encode(), which we call here separately.
+    # Encode repr_h to get logvar_h (the quality indicator we need for E3).
+    # encode() returns (mu, logvar); z = mu always — no sampling.
     logvar_list = []
     for repr_h in pipe["repr_list"]:
         _, lv = vae.encode(repr_h.to(device))    # (B, latent_dim)
@@ -199,7 +198,7 @@ def eval_e1_transition(
     """Compute mean transition loss on held-out trajectories.
 
     For each trajectory:
-        z_h = vae.reparameterize(*vae.encode(repr_h))   for h in {1, 2, 3}
+        mu_h, _ = vae.encode(repr_h);  z_h = mu_h        for h in {1, 2, 3}
         L_transition = ||f(z_1) − z_2||² + ||f(z_2) − z_3||²
 
     Low held-out loss = Markov property holds (z_h alone predicts z_{h+1}).

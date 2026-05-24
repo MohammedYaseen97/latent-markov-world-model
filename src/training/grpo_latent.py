@@ -336,11 +336,13 @@ def generate_latent_traces(
     del fi1, fa1, hidden1
     torch.cuda.empty_cache()
 
-    # VAE → z_1 (deterministic: vae.eval() so reparameterize returns μ)
+    # VAE → z_1: z = μ always (reparameterize() removed from VAEStateEncoder).
+    # Rollout-to-rollout diversity comes from different chunk1 tokens producing
+    # different repr_1 → different μ_1 per rollout — no noise needed.
     # .float(): backbone runs in bf16; VAE MLP weights are fp32.
     repr_1_batch = torch.stack(repr_1_list).float()   # (B, hidden) fp32
     mu_1, logvar_1 = vae.encode(repr_1_batch)
-    z_1_batch = vae.reparameterize(mu_1, logvar_1)    # (B, latent)
+    z_1_batch = mu_1                                  # z = μ always
     del repr_1_batch, mu_1, logvar_1
     torch.cuda.empty_cache()
 
@@ -398,10 +400,10 @@ def generate_latent_traces(
     del fe2, fa2, hidden2, z_pfx1
     torch.cuda.empty_cache()
 
-    # VAE → z_2
+    # VAE → z_2: z = μ always
     repr_2_batch = torch.stack(repr_2_list).float()   # bf16→fp32 for VAE
     mu_2, logvar_2 = vae.encode(repr_2_batch)
-    z_2_batch = vae.reparameterize(mu_2, logvar_2)
+    z_2_batch = mu_2
     del repr_2_batch, mu_2, logvar_2
     torch.cuda.empty_cache()
 
@@ -542,7 +544,7 @@ def _run_pipeline_with_grad(
     del logits1
 
     mu_1, logvar_1 = vae.encode(repr_1_batch)
-    z_1_batch = vae.reparameterize(mu_1, logvar_1)           # (B, latent) LIVE
+    z_1_batch = mu_1                                          # (B, latent) LIVE; z = μ always
     prefix_1  = z_injector.get_prefix_embedding(z_1_batch)   # (B, 1, H) LIVE
 
     # ── Chunk 2: [z_pfx1 | chunk2] right-padded ───────────────────────────
@@ -582,7 +584,7 @@ def _run_pipeline_with_grad(
     del logits2
 
     mu_2, logvar_2 = vae.encode(repr_2_batch)
-    z_2_batch = vae.reparameterize(mu_2, logvar_2)           # (B, latent) LIVE
+    z_2_batch = mu_2                                          # (B, latent) LIVE; z = μ always
     prefix_2  = z_injector.get_prefix_embedding(z_2_batch)   # (B, 1, H) LIVE
 
     # ── Chunk 3: [z_pfx2 | chunk3] right-padded ───────────────────────────
@@ -619,7 +621,7 @@ def _run_pipeline_with_grad(
     del logits3
 
     mu_3, logvar_3 = vae.encode(repr_3_batch)
-    z_3_batch = vae.reparameterize(mu_3, logvar_3)           # (B, latent) LIVE
+    z_3_batch = mu_3                                          # (B, latent) LIVE; z = μ always
 
     return {
         "repr_list":     [repr_1_batch, repr_2_batch, repr_3_batch],

@@ -20,9 +20,9 @@ a stable fixed point with no learning.
 
 The latent arm tests a third approach: **replace token history with a learned compact
 latent state `z_h` — a continuous vector derived from the backbone's internal hidden
-states via a deterministic encoder with calibrated uncertainty.** The Markov property is not enforced by construction; it is learned
-via a transition consistency loss that forces `z_h` to satisfy the Markov property
-empirically on actual reasoning trajectories.
+states via a deterministic encoder.** The Markov property is not enforced by construction;
+it is learned via a transition consistency loss that forces `z_h` to satisfy the Markov
+property empirically on actual reasoning trajectories.
 
 ---
 
@@ -30,18 +30,21 @@ empirically on actual reasoning trajectories.
 
 At each reasoning step `h` (chunk boundary), the backbone has processed some tokens and
 produced internal hidden states. We compress those hidden states through a deterministic
-encoder to get a state estimate and calibrated uncertainty:
+encoder:
 
 ```
 encoder(mean_pool(final_layer_hidden_states_of_chunk_h))  →  (μ_h, log_σ_h²)
-z_h  =  μ_h        [deterministic during training]
+z_h  =  μ_h        [always deterministic — training and generation]
 ```
 
-`z_h` is a 64-dimensional vector used as the Markov state. `σ²_h` is trained explicitly
-to be high on incorrect trajectories and low on correct ones via a calibration loss —
-not as a KL side-effect. `z_h` is injected into the next chunk's input as a soft prefix
-token: project `z_h` (dim 64) → model hidden dim (dim 1536) via a learned linear,
-prepend as a virtual token to chunk h+1's `inputs_embeds`.
+`z_h` is a 64-dimensional vector used as the Markov state. The encoder also outputs
+`log_σ²_h` — a quality indicator head trained explicitly to be high on incorrect
+trajectories and low on correct ones via L_calib. `log_σ²_h` is never used for z
+computation or sampling; its only role is to inject quality-oriented gradient pressure
+into the shared encoder backbone through L_calib. `z_h` is injected into the next
+chunk's input as a soft prefix token: project `z_h` (dim 64) → model hidden dim
+(dim 1536) via a learned linear, prepend as a virtual token to chunk h+1's
+`inputs_embeds`.
 
 The transition model learns: `z_h → z_{h+1}`. If this loss is small, `z_h` alone
 is sufficient to predict the next latent state without token history. That is the
@@ -73,7 +76,7 @@ with a frozen backbone. Phase 1 runs joint RL with all components live.
                      ┌──────────▼──────────────────────────────────────────────┐
                      │  Encoder  (MLP 1536→512→64×2)               [UPDATES]   │
                      │  μ_1, log_σ_1²  =  encoder(repr_1)                      │
-                     │  z_1  =  μ_1   (deterministic during training)           │
+                     │  z_1  =  μ_1   (always deterministic)                    │
                      └──────────┬──────────────────────────────────────────────┘
                                 │  z_1  (64-dim)
                      ┌──────────▼──────────────────────────────────────────────┐
@@ -196,7 +199,7 @@ query q = [system prompt] + [problem]
 │ CHUNK 1                                                       │
 │  generate: model.generate([q])  →  chunk1_ids (341 tokens)   │
 │  repr fwd: model([q ‖ chunk1])  →  repr_1 = mean_pool(hidden) │
-│  encode:   encoder(repr_1) → (μ_1, log_σ_1²); z_1 = μ_1      │
+│  encode:   encoder(repr_1) → (μ_1, log_σ_1²); z_1 = μ_1 always│
 │  project:  ZInjector(z_1) → prefix_1  (1536-dim virtual token)│
 └─────────────────────────┬─────────────────────────────────────┘
                           │ prefix_1 used for chunk 2
@@ -249,21 +252,32 @@ token-space state.
 
 ## Architecture
 
-### Encoder, transition (v2 — no decoder)
+### Encoder, transition (v2 — no decoder, no sampling)
 
 All components are small MLPs satisfying R4.4 (< 10M params total).
-The decoder and ELBO/KL machinery from v1 are removed — rung 2 is a tracker,
-not a generator. σ² is trained explicitly via L_calib.
+The decoder, ELBO/KL machinery, and reparameterization sampling from v1 are removed —
+rung 2 is a purely deterministic tracker. z = μ everywhere: training, generation, eval.
 
-**Encoder** — maps trajectory representation to (state estimate, uncertainty):
+**Encoder** — maps trajectory representation to a latent state and a quality indicator:
 
 ```
 repr_h (1536-dim)
   → Linear(1536, 512) + ReLU
-  → Linear(512, 128)
-  → split into μ (64-dim) and log_σ² (64-dim)
-z_h = μ_h  (deterministic during training)
+  → Linear(512, 128)  [shared trunk]
+  → mu_head:     Linear(128, 64)  →  μ_h       [the Markov state]
+  → logvar_head: Linear(128, 64)  →  log_σ²_h  [quality indicator; never used for z]
+
+z_h = μ_h   always (training and generation)
 ```
+
+`log_σ²_h` is an auxiliary output that shares the encoder trunk with `μ_h`. It is trained
+via L_calib to be high for incorrect trajectories and low for correct ones. It never enters
+the z computation — no sampling, no KL — but its gradient flows through the shared trunk and
+shapes `μ_h` to be quality-aware. In Phase 0, the encoder also receives L_out (OutcomeHead) as a quality signal; L_calib
+provides complementary quality pressure through the shared trunk. In Phase 1, OutcomeHead
+is discarded — without L_calib, the encoder would only receive L_trans (Markov consistency)
+and the extremely sparse L_RL (~0.1% reward rate), leaving no reliable quality-oriented
+gradient for most training steps.
 
 **Transition model** — predicts next latent from current latent:
 
@@ -275,10 +289,10 @@ z_h  (64-dim)
 ```
 
 The pure Markov property is `f(z_h) → z_{h+1}`: the current state alone predicts
-the next. `repr_h` is deliberately excluded. The ELBO separately handles the
-compression task (repr_h → z_h); including repr_h in the transition would let the
-model bypass the bottleneck and weaken the gradient pressure on z_h to be
-information-dense.
+the next. `repr_h` is deliberately excluded. L_trans handles the compression task
+(repr_h → z_h via the encoder); including repr_h in the transition directly would
+let the model bypass the latent bottleneck and weaken the gradient pressure on z_h
+to be information-dense.
 
 **Outcome head** — Phase 0 only, attached to z_final:
 

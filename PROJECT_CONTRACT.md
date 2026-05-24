@@ -135,15 +135,17 @@ method, not implementation.
 
 ### Phase 1 — Joint RL (200 steps)
 
-- [x] Run: `python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 1` *(training in progress)*
-- [ ] Log: L_trans non-zero from step 0; L_RL non-zero within first 30 steps; L_calib non-zero
-- [ ] Log: λ_trans=0.3 confirmed (maintenance mode); λ_calib=0.5 confirmed
+- [x] Run: `python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 1`
+- [x] Log: L_trans non-zero ✓; L_RL positive at step 100 (+0.019) ✓; L_calib non-zero ✓
+- [x] Log: λ_trans=0.3 plateau from step 110 ✓; λ_calib=0.5 ✓
+- ⚠️ Two encoder disruption cycles (l_trans spikes at steps 70 and 170). Second spike not recovered at step 200.
 
 ### Phase 1 eval
 
-- [ ] Run: `python scripts/eval_passk.py --generation-mode latent_markov ...`
-- [ ] Artifact: `artifacts/latent_grpo/{run_id}/phase1/final/eval_metrics.json`
-- [ ] **Target:** pass@128 ≥ baseline_grpo pass@128 + 3pp
+- [x] Run: `python scripts/eval_passk.py --generation-mode latent_markov ...`
+- [x] Artifact: `artifacts/latent_grpo/20260524T032554Z/phase1/final/eval_metrics.json`
+- [x] Result: pass@128 = **0.0842** — below Phase 0 pretrained floor (0.0958). Full diagnostics in `reports/ablation_core.md`.
+- [ ] **Target:** pass@128 ≥ 0.192 — ❌ NOT MET. Phase 1 rerun needed with encoder stability fix.
 
 ### E1 + E3 Markov diagnostics
 
