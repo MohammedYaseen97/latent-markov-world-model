@@ -85,17 +85,25 @@ def compute_grpo_advantages(
     rewards: list[float],
     group_size: int,
     eps: float = 1e-8,
+    adv_clip: float = 5.0,
 ) -> list[float]:
     """Normalise rewards into GRPO advantages within each group of G rollouts.
 
     For each group of `group_size` consecutive rollouts belonging to the same
-    problem:  A_i = (r_i − μ_group) / (σ_group + eps)
+    problem:  A_i = clip((r_i − μ_group) / (σ_group + eps), -adv_clip, adv_clip)
+
+    The clip is critical on the hard pool where sparse rewards (e.g. 1-of-128
+    correct) produce raw normalised advantages of ~11. Without clipping, a single
+    lucky step causes a proportionally large backbone gradient and an l_trans
+    spike. Clipping to ±5 has no effect at normal reward rates (~25%), but caps
+    the worst-case RL gradient at ~5× instead of ~11×.
 
     Args:
         rewards:    flat list of scalar rewards, length = n_problems × group_size.
                     Rollouts for the same problem must be contiguous.
         group_size: G — number of rollouts per problem.
         eps:        numerical stability floor for the std.
+        adv_clip:   symmetric clip range for normalised advantages. Default 5.0.
 
     Returns:
         List of advantages, same length and ordering as `rewards`.
@@ -110,7 +118,8 @@ def compute_grpo_advantages(
         var = sum((r - mu) ** 2 for r in group) / group_size
         sig = var ** 0.5
         for r in group:
-            advantages.append((r - mu) / (sig + eps))
+            raw = (r - mu) / (sig + eps)
+            advantages.append(max(-adv_clip, min(adv_clip, raw)))
     return advantages
 
 
@@ -1073,7 +1082,12 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     top_p        = float(training_cfg.get("top_p",         1.0))
     log_steps    = int(training_cfg.get("logging_steps",   10))
     save_steps   = int(training_cfg.get("save_steps",      50))
-    grad_clip    = 1.0
+    # Separate grad norms: backbone is large (1.5B params) and should be
+    # protected from large single-step updates; VAE/ZInjector are small and
+    # designed to be more adaptive.
+    grad_clip_backbone = float(phase1_cfg.get("grad_clip_backbone", 0.3))
+    grad_clip_vae      = float(phase1_cfg.get("grad_clip_vae",      1.0))
+    adv_clip           = float(phase1_cfg.get("adv_clip",           5.0))
 
     chunk_tokens = int(latent_cfg.get("chunk_tokens",  341))
     latent_dim   = int(latent_cfg.get("latent_dim",  LATENT_DIM))
@@ -1202,7 +1216,7 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
         model.train(); vae.train(); z_injector.train()
 
         rewards    = [float(t["reward"]) for t in traces]
-        advantages = compute_grpo_advantages(rewards, group_size=G)
+        advantages = compute_grpo_advantages(rewards, group_size=G, adv_clip=adv_clip)
 
         # ── Training step (with gradient) ─────────────────────────────────
         optimizer.zero_grad()
@@ -1235,8 +1249,11 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
             for k in ("total", "l_rl", "l_calib", "l_trans"):
                 metrics_acc[k] += metrics_mb[k].item() / n_micro_p1
 
-        all_params = list(model.parameters()) + vae_params
-        torch.nn.utils.clip_grad_norm_(all_params, grad_clip)
+        # Separate clips: backbone is 1.5B params and must not take large single
+        # steps (joint clipping masks its share behind the larger norm count);
+        # VAE/ZInjector are small and designed for fast adaptation.
+        torch.nn.utils.clip_grad_norm_(list(model.parameters()), grad_clip_backbone)
+        torch.nn.utils.clip_grad_norm_(vae_params,                grad_clip_vae)
         optimizer.step()
 
         # ── Logging ───────────────────────────────────────────────────────

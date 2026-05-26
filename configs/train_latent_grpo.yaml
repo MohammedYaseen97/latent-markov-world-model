@@ -167,6 +167,22 @@ training:
 phase1_loss:
   lambda_trans_peak: 0.3
   lambda_calib: 0.5
+  # Advantage clipping: bounds normalised GRPO advantages to ±adv_clip.
+  # Motivation: on the hard pool with 1-of-128 correct rollouts, the raw normalised
+  # advantage for the single positive sample is ~11 — 6.5× larger than on the easy
+  # pool (~1.7). Without clipping, a lucky batch triggers a proportionally large
+  # backbone gradient and causes an l_trans spike. Clipping to ±5 is inert at normal
+  # reward rates but caps the worst-case RL update. TRL's GRPOTrainer enforces the
+  # equivalent via probability-ratio clipping; our custom loop uses advantage clipping
+  # (equivalent protection given IS=1).
+  adv_clip: 5.0
+  # Per-group gradient clipping (replaces a single joint clip).
+  # The backbone (1.5B params) dominates joint norm-based clipping, leaving the
+  # VAE/ZInjector (10M params) effectively unconstrained. Separating them:
+  #   - backbone 0.3: protect against large single-step updates from rare large gradients
+  #   - vae 1.0: encoder/ZInjector need fast adaptation to track the moving backbone
+  grad_clip_backbone: 0.3
+  grad_clip_vae: 1.0
 
 # ---------------------------------------------------------------------------
 # NFR6 diagnostic — run_nfr6_gate.py

@@ -203,10 +203,45 @@ L_calib was degenerate in the first run (no pos_weight). Fixed and rerun — l_c
 - L_RL showed positive signal at peak (step 100: l_rl=+0.019) — RL learning was real, just interrupted
 - Confirms Phase 0 pre-training is necessary but not sufficient
 
-**Fix direction for Phase 1 rerun:**
-Encoder stability during joint training. Options: gradient norm clipping specifically on the encoder
-parameters, lower backbone lr (1e-7?), periodic encoder-only stabilization steps, or decoupling
-encoder and backbone update schedules.
+**Root cause precision — l_trans spike mechanism:**
+
+Phase 0 data (plots_5) provides a clean reference: with backbone FROZEN, l_trans declined
+monotonically from 3.0 → 0.24 over 400 steps. No spikes because the target (backbone representations)
+was stationary.
+
+In Phase 1, the first spike (step 70, l_trans=1.51) occurred after 70 backbone update steps — the
+accumulated backbone drift exceeded the encoder's tracking capacity. The second spike (step 170,
+l_trans=4.16) was triggered by a high-reward batch (reward=0.33% — the highest in the run): a lucky
+step with 1–2 correct rollouts produces a large L_RL gradient on the backbone. The missing protection
+mechanisms amplified this:
+
+1. **No advantage clipping**: with 1-of-128 correct, the normalised advantage for the positive
+   rollout = ~11.3 (vs ~1.7 on the easy pool at 25% reward rate). An 11× advantage multiplied by
+   log_π produced a proportionally large backbone gradient step.
+
+2. **No per-component gradient clipping**: `clip_grad_norm_(all_params, 1.0)` applied to the 1.5B
+   backbone + 10M encoder jointly. The backbone's contribution dominates the global norm — the encoder
+   contribution is negligible. In practice the backbone is clipped to near 1.0 while the encoder
+   is effectively unconstrained. More importantly, the backbone itself is not protected from large
+   single-step updates driven by rare high-advantage batches.
+
+**Fixes implemented (Phase 1 rerun v2):**
+
+1. **Advantage clipping ±5** (both latent and token arms): `compute_grpo_advantages(..., adv_clip=5.0)`.
+   With 1-of-128 correct, advantage drops from 11.3 → 5.0 (2.25× smaller RL gradient). At normal
+   reward rates (>5-of-128 correct) the clip is inert. Equivalent to the ratio-clip protection in
+   TRL's GRPOTrainer, DAPO, and Dr. GRPO — our custom loop uses advantage clipping directly since
+   IS=1 exactly makes ratio clipping a no-op.
+
+2. **Separate per-component gradient clipping** (latent arm only): backbone `max_norm=0.3`,
+   VAE/ZInjector `max_norm=1.0`. The joint clip on `all_params` was dominated by the 1.5B backbone
+   norm, effectively leaving VAE unconstrained. Separating them protects the backbone from large
+   single-step RL updates while keeping VAE/ZInjector fast-adapting to track moving representations.
+   **Token arm backbone clip stays at 1.0** (no encoder to protect; ratio clipping + advantage
+   clipping are sufficient; matching baseline for fair ablation).
+
+Config parameters (latent arm, `configs/train_latent_grpo.yaml` under `phase1_loss`):
+`adv_clip: 5.0`, `grad_clip_backbone: 0.3`, `grad_clip_vae: 1.0`.
 
 ---
 
@@ -220,4 +255,4 @@ encoder and backbone update schedules.
 | E1: held-out L_trans < 0.5 | ⬜ pending |
 | E3: Pearson r < −0.1 AND Δσ² > 0.01 | ⬜ pending |
 | `token_markov_grpo` training + eval | ⬜ pending |
-| **Phase 1 rerun** (encoder stability fix needed) | 🔄 pending investigation |
+| **Phase 1 rerun v2** (adv_clip±5 + separate grad_clip) | 🔄 ready to run |
