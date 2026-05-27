@@ -166,20 +166,23 @@ that Phase 1 RL will be able to exploit the latent geometry.
 
 ---
 
-### latent_grpo_pretrained — Controlled baseline eval
+### latent_grpo_pretrained — Controlled baseline eval — instance 2 (canonical)
 
 **Verdict: PASS ✅** (gate criterion: pass@128 ≥ baseline_pretrained ≈ 0)
 
 | metric | value |
 |--------|-------|
-| Pool | MATH Level 5 hard pool, n=1117 |
+| Pool | MATH Level 5 hard pool, n=1118 |
 | Backbone | `Qwen/Qwen2.5-1.5B-Instruct` (pretrained, no Phase 1 GRPO) |
-| Encoder | Phase 0 VAE + ZInjector checkpoint |
-| pass@1 | 0.00116 |
-| pass@16 | 0.01718 |
-| pass@128 | **0.09579** |
+| Encoder | Phase 0 v2 VAE + ZInjector checkpoint (z=μ throughout) |
+| pass@1 | 0.00135 |
+| pass@16 | 0.01953 |
+| pass@128 | **0.09839** |
 
-**Interpretation:** 9.58% pass@128 for the pretrained backbone under the latent generation
+*Instance 1 (archived): pass@128=0.09579. Instance 2 is +0.26pp — consistent with the
+slightly better Phase 0 v2 encoder (l_trans final 0.233 vs 0.242) and cleaner z=μ training.*
+
+**Interpretation:** 9.84% pass@128 for the pretrained backbone under the latent generation
 regime, compared to ≈0% for the same backbone under vanilla generation (by hard pool
 construction). The gap has two contributing causes:
 
@@ -302,8 +305,8 @@ Config parameters (latent arm, `configs/train_latent_grpo.yaml` under `phase1_lo
 | baseline_grpo instance 2 eval | ✅ 0.1619 pass@128 (reproduces instance 1 within 0.01pp) |
 | Phase 0 v2 training (z=μ, 400 steps) | ✅ complete — l_trans=0.233, `plots_6` |
 | NFR6 gate (Phase 0 v2 checkpoint) | ✅ PASS — ~2× enrichment, clear gap, `plots_6` |
-| `latent_grpo_pretrained` eval (Phase 0 v2 encoder) | ⬜ pending NFR6 pass |
-| `latent_grpo` Phase 1 v2 (adv_clip±5 + separate grad_clip) | 🔄 pending NFR6 pass |
+| `latent_grpo_pretrained` eval (Phase 0 v2 encoder) | ✅ 9.84% pass@128 (floor for Phase 1) |
+| `latent_grpo` Phase 1 v2 (adv_clip±5 + separate grad_clip) | 🔄 running — step 80/200 |
 | `latent_grpo` pass@128 ≥ 0.1919 (instance 2 baseline + 3pp) | ⬜ pending |
 | E1: held-out L_trans < 0.5 | ⬜ pending |
 | E3: Pearson r < −0.1 AND Δσ² > 0.01 | ⬜ pending |
