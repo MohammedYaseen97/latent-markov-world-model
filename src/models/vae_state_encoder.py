@@ -1,24 +1,18 @@
 """Deterministic state encoder, transition model, and policy-conditioning injector.
 
-Shared by arm 3 (latent_grpo) and arm 4 (latent_grpo_uncertainty).
-
 Architecture:
 
-  Encoder     1536 → 512 → 128 → split → μ (64)   log_σ² (64)
+  Encoder     1536 → 512 → 128 → μ (64)
   Transition   64  → 512 → 64
   OutcomeHead  64  → 64  → 1     (raw logit; Phase 0 only, discarded before Phase 1)
   ZInjector    64  → 1536        (Phase 1: prepend z as soft prefix token)
 
-ARM 3 — latent_grpo (deterministic tracker, no sampling):
-  z_h = μ_h always. No sampling anywhere.
-  log_σ²_h is a quality-indicator auxiliary head trained via L_calib to be high on
-  incorrect trajectories and low on correct ones. Its only role is to inject quality-
-  oriented gradient into the shared encoder trunk — it never enters z computation.
-  No decoder, no ELBO, no KL, no reparameterize().
+ARM 3 — latent_grpo:
+  z_h = μ_h always. Deterministic encoder only — no sampling, no decoder.
 
 ARM 4 — latent_grpo_uncertainty (stub, not yet implemented):
-  Same encoder. σ² used additionally as an exploration signal (reward bonus or sampling).
-  See PROJECT_CONTRACT.md §Phase 3b and reports/writeup_stubs.md.
+  Will extend this with a logvar head and uncertainty-driven exploration.
+  See PROJECT_CONTRACT.md §Phase 3b.
 
 See reports/latent_markov_design.md §Architecture for full design rationale.
 """
@@ -38,25 +32,18 @@ N_CHUNKS   = 3      # fixed: chunks per rollout
 # ---------------------------------------------------------------------------
 
 class VAEStateEncoder(nn.Module):
-    """Deterministic state encoder with calibrated uncertainty.
+    """Deterministic state encoder with Markov transition model.
 
-    Encodes the backbone's hidden-state summary (repr_h) of one chunk into a
-    (μ_h, log_σ²_h) pair.  z_h = μ_h is used throughout the pipeline for
-    Markov tracking; log_σ²_h is trained via an explicit calibration loss so
-    that σ² is high on incorrect trajectories and low on correct ones.
-
-    A transition model predicts z_{h+1} from z_h alone to enforce the Markov
-    property across chunks.
+    Encodes the backbone's hidden-state summary (repr_h) into μ_h. z_h = μ_h.
+    A transition model predicts z_{h+1} from z_h alone (Markov property).
 
     Usage (single chunk):
         enc = VAEStateEncoder()
-        mu, logvar = enc.encode(repr_h)
-        z = mu                                  # deterministic during training
-        z_next_pred = enc.transition(z)         # predicts z_{h+1}
+        z = enc.encode(repr_h)
+        z_next_pred = enc.transition(z)
 
     Usage (full 3-chunk rollout):
-        results = enc.forward([repr_1, repr_2, repr_3])
-        # returns list of (z_h, mu_h, logvar_h) per chunk
+        z_list = enc.forward([repr_1, repr_2, repr_3])
     """
 
     def __init__(
@@ -68,13 +55,12 @@ class VAEStateEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
 
-        # Encoder: repr_h (hidden_dim) → intermediate → (μ, log_σ²)
-        self.enc_fc1     = nn.Linear(hidden_dim, 512)
-        self.enc_fc2     = nn.Linear(512, 128)
-        self.mu_head     = nn.Linear(128, latent_dim)
-        self.logvar_head = nn.Linear(128, latent_dim)
+        # Encoder: repr_h (hidden_dim) → μ_h (latent_dim)
+        self.enc_fc1 = nn.Linear(hidden_dim, 512)
+        self.enc_fc2 = nn.Linear(512, 128)
+        self.mu_head = nn.Linear(128, latent_dim)
 
-        # Transition: z_h (latent_dim) → z_{h+1}_predicted
+        # Transition: z_h → z_{h+1}_predicted.
         # Pure Markov: z_h alone must predict the next state. repr_h is excluded —
         # including it would let the transition bypass the bottleneck.
         self.trans_fc1 = nn.Linear(latent_dim, 512)
@@ -84,23 +70,19 @@ class VAEStateEncoder(nn.Module):
     # Per-chunk forward methods
     # ------------------------------------------------------------------
 
-    def encode(self, repr_h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode a chunk representation into (μ_h, log_σ²_h).
+    def encode(self, repr_h: torch.Tensor) -> torch.Tensor:
+        """Encode a chunk representation into μ_h (= z_h).
 
         Args:
             repr_h: mean-pooled final-layer hidden states for chunk h.
                     Shape: (batch, hidden_dim) or (hidden_dim,) for single sample.
 
         Returns:
-            mu:     state estimate. Shape: (batch, latent_dim).
-            logvar: log σ² (uncertainty). Shape: (batch, latent_dim).
-                    Both are unconstrained — no output activation.
+            mu: latent state. Shape: (batch, latent_dim). Unconstrained.
         """
         x = F.relu(self.enc_fc1(repr_h))
         x = F.relu(self.enc_fc2(x))
-        mu     = self.mu_head(x)
-        logvar = self.logvar_head(x)
-        return mu, logvar
+        return self.mu_head(x)
 
     def transition(self, z_h: torch.Tensor) -> torch.Tensor:
         """Predict z_{h+1} from the current latent state alone.
@@ -124,24 +106,19 @@ class VAEStateEncoder(nn.Module):
     def forward(
         self,
         repr_list: list[torch.Tensor],
-    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> list[torch.Tensor]:
         """Encode all N_CHUNKS chunk representations in a single rollout.
 
         Args:
             repr_list: list of N_CHUNKS tensors, each (batch, hidden_dim).
 
         Returns:
-            List of N_CHUNKS tuples (z_h, mu_h, logvar_h).
-            z_h = mu_h always (deterministic).
+            List of N_CHUNKS latent tensors z_h = μ_h. Each (batch, latent_dim).
         """
         assert len(repr_list) == N_CHUNKS, (
             f"Expected {N_CHUNKS} chunk representations, got {len(repr_list)}"
         )
-        results = []
-        for repr_h in repr_list:
-            mu_h, logvar_h = self.encode(repr_h)
-            results.append((mu_h, mu_h, logvar_h))  # (z_h=μ, mu_h, logvar_h)
-        return results
+        return [self.encode(repr_h) for repr_h in repr_list]
 
     # ------------------------------------------------------------------
     # Loss computation
@@ -171,44 +148,6 @@ class VAEStateEncoder(nn.Module):
             loss = loss + F.mse_loss(z_next_pred, target)
         return loss
 
-    def compute_calibration_loss(
-        self,
-        logvar_list: list[torch.Tensor],
-        rewards: torch.Tensor,
-        pos_weight: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Calibrate σ² to be high on incorrect trajectories and low on correct ones.
-
-        Framing: treat −mean_logvar as a "correctness logit".
-          High σ² (high logvar) → low correctness logit → predicts incorrect.
-          Low σ² (low logvar)   → high correctness logit → predicts correct.
-        Target = reward (1 = correct minority, 0 = incorrect majority).
-
-        Using BCE_with_logits(−mean_logvar, reward) is mathematically identical to
-        the original BCE(sigmoid(mean_logvar), 1−reward); the benefit is that
-        pos_weight can upweight the minority correct class (≈18%) to counteract
-        the 82% incorrect dominance that caused the calibration loss to trivially
-        converge to "everything is uncertain".
-
-        Args:
-            logvar_list: log σ² per chunk. List of N_CHUNKS tensors (batch, latent_dim).
-            rewards:     binary rewards. Shape: (batch, 1) or (batch,). Float.
-            pos_weight:  scalar tensor — weight for the positive (correct) class.
-                         Pass (1−pos_rate)/pos_rate clamped to [1, 20] to balance
-                         the 82/18 split.  None = no reweighting (unbalanced BCE).
-
-        Returns:
-            Scalar tensor — BCE loss.
-        """
-        stacked = torch.stack(logvar_list, dim=0)   # (N_CHUNKS, batch, latent_dim)
-        mean_logvar = stacked.mean(dim=(0, 2))       # (batch,)
-
-        # −mean_logvar: high uncertainty → low logit → predicts incorrect (target=0)
-        target = rewards.float().view(-1)            # 1=correct (minority class)
-
-        return F.binary_cross_entropy_with_logits(
-            -mean_logvar, target, pos_weight=pos_weight
-        )
 
 
 # ---------------------------------------------------------------------------

@@ -45,7 +45,6 @@ phase0:
   learning_rate: 3.0e-4
   lambda_trans_peak: 3.0
   lambda_out: 5.0
-  lambda_calib: 1.0
 
   logging_steps: 1
   save_steps: 10
@@ -79,5 +78,5 @@ evaluation:
   path: "data/math_level5_hard_pool.jsonl"
 
 phase1_loss:
-  lambda_trans_peak: 0.3
-  lambda_calib: 0.5
+  adv_clip: 5.0
+  grad_clip: 1.0

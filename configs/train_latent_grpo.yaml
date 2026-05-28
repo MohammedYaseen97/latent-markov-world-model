@@ -17,13 +17,11 @@
 #           (3) same memory as before (128 simultaneous sequences per step).
 #   "batch_size" is no longer a meaningful concept for Phase 0; removed from config.
 #
-# Key v2 changes from v1:
-#   - VAE-ELBO removed; replaced by explicit calibration loss L_calib
-#   - z_h = μ_h (deterministic during training; no reparameterization noise)
-#   - Phase 0 extended to 400 steps (losses were still declining at 200)
-#   - Phase 1 λ_trans reduced to 0.3 (maintenance only; E1=0.015 shows transition trained)
-#   - Benchmark changed to MATH Level 5 hard pool (~350 problems)
-#   - Metric changed to pass@128
+# v2 design:
+#   - Deterministic encoder: z_h = μ_h always. No sampling, no logvar.
+#   - Phase 0: L_trans + L_out only (400 steps, frozen backbone)
+#   - Phase 1: pure L_RL (adv_clip=5.0, grad_clip=1.0, matches baseline GRPO)
+#   - Benchmark: MATH Level 5 hard pool (~350 problems), metric: pass@128
 #
 # Inherits shared training knobs (lr, G, backbone, dtype) from
 # train_baseline_grpo.yaml. Only latent-specific fields are set here.
@@ -105,19 +103,15 @@ phase0:
 
   learning_rate: 3.0e-4     # AdamW for Encoder+ZInjector+OutcomeHead; not applied to backbone
 
-  # Loss weights (v2 — no ELBO/KL).
-  # Approximate Phase 0 gradient budget at peak (step >= 200):
-  #   L_trans × 3.0  →  ~50%   primary: Markov structure
-  #   L_out   × 5.0  →  ~23%   outcome quality signal
-  #   L_calib × 1.0  →  ~10%   explicit σ² calibration
-  #   (remainder: variance across steps)
+  # Phase 0 gradient budget at peak (step >= 50):
+  #   L_trans × 3.0  →  ~60%   primary: Markov structure
+  #   L_out   × 5.0  →  ~40%   outcome quality signal
   lambda_trans_peak: 3.0
   # Warm-start: hold λ_t = 0 for the first 50 steps so L_out can establish a
   # correctness signal before the transition ramp competes for gradient budget.
   # After step 50 the normal linear ramp resumes over the remaining 350 steps.
   lambda_trans_warmup_steps: 50
   lambda_out: 5.0
-  lambda_calib: 1.0
 
   logging_steps: 10
   save_steps: 50
@@ -154,35 +148,13 @@ training:
   # add another ~8.7 GB → 36 GB without GC — still fits, but GC is safe practice.
   gradient_checkpointing: true
 
-# Phase 1 loss weights (v2).
-# λ_trans = 0.3: maintenance only — transition already well-trained in Phase 0
-#   (E1 diagnostic showed L_trans_held_out = 0.015 after Phase 0).
-#   Reduced from 1.0 (v1) to give L_RL more gradient budget headroom.
-# λ_calib = 0.5: lighter anchor — keeps σ² calibrated but does not dominate L_RL.
-#
-# Approximate Phase 1 gradient budget (L_RL≈2, L_trans≈0.6, L_calib≈0.55):
-#   L_RL          × 1.0  ≈ 2.0   →  ~65%   primary objective
-#   L_trans       × 0.3  ≈ 0.6   →  ~19%   Markov maintenance
-#   L_calib       × 0.5  ≈ 0.28  →  ~9%    uncertainty anchor
+# Phase 1: pure L_RL. Markov structure is enforced architecturally (each chunk sees
+# only [z_h ‖ chunk_{h+1}], never raw token history), so no auxiliary losses are needed.
+# adv_clip: bounds normalised GRPO advantages to ±5 (caps worst-case RL update on sparse rewards).
+# grad_clip: single global clip (max_norm=1.0), matching baseline GRPO.
 phase1_loss:
-  lambda_trans_peak: 0.3
-  lambda_calib: 0.5
-  # Advantage clipping: bounds normalised GRPO advantages to ±adv_clip.
-  # Motivation: on the hard pool with 1-of-128 correct rollouts, the raw normalised
-  # advantage for the single positive sample is ~11 — 6.5× larger than on the easy
-  # pool (~1.7). Without clipping, a lucky batch triggers a proportionally large
-  # backbone gradient and causes an l_trans spike. Clipping to ±5 is inert at normal
-  # reward rates but caps the worst-case RL update. TRL's GRPOTrainer enforces the
-  # equivalent via probability-ratio clipping; our custom loop uses advantage clipping
-  # (equivalent protection given IS=1).
   adv_clip: 5.0
-  # Per-group gradient clipping (replaces a single joint clip).
-  # The backbone (1.5B params) dominates joint norm-based clipping, leaving the
-  # VAE/ZInjector (10M params) effectively unconstrained. Separating them:
-  #   - backbone 0.3: protect against large single-step updates from rare large gradients
-  #   - vae 1.0: encoder/ZInjector need fast adaptation to track the moving backbone
-  grad_clip_backbone: 0.3
-  grad_clip_vae: 1.0
+  grad_clip: 1.0
 
 # ---------------------------------------------------------------------------
 # NFR6 diagnostic — run_nfr6_gate.py

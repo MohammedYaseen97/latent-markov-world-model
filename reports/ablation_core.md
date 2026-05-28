@@ -8,17 +8,15 @@ Rows below are hand-updated as runs complete.*
 
 ---
 
-## Core Ablation Table — MATH Level 5 hard pool (n=1118, instance 2)
+## Core Ablation Table — MATH Level 5 hard pool (n=1118)
 
 | arm | pass@1 | pass@16 | pass@128 | run |
 |-----|--------|---------|----------|-----|
 | `baseline_grpo` | 0.00210 | 0.03126 | **0.1619** | `artifacts/baseline_grpo/20260526T161327Z/checkpoint-200` |
 | `token_markov_grpo` | — | — | — | — |
-| `latent_grpo_pretrained` | — | — | — | pending Phase 0 v2 encoder |
-| `latent_grpo` | — | — | — | pending Phase 1 rerun (v2 fixes) |
+| `latent_grpo_pretrained` | — | — | — | pending Phase 0 |
+| `latent_grpo` | — | — | — | pending Phase 1 |
 | `latent_grpo_uncertainty` | — | — | — | — |
-
-*Previous instance (n=1117) numbers archived below. Pool reproduced with <0.1% composition difference (1 problem delta); baseline pass@128 delta = 0.01pp — confirming pool and seed stability across hardware instances.*
 
 ## Artifact paths
 
@@ -26,15 +24,15 @@ Rows below are hand-updated as runs complete.*
 |-----|-------------------|
 | `baseline_grpo` | `artifacts/baseline_grpo/20260526T161327Z/checkpoint-200/eval_metrics.json` |
 | `token_markov_grpo` | — |
-| `latent_grpo_pretrained` | pretrained backbone + Phase 0 v2 encoder; pending |
-| `latent_grpo` | pending Phase 1 v2 rerun |
+| `latent_grpo_pretrained` | pending |
+| `latent_grpo` | pending |
 | `latent_grpo_uncertainty` | — |
 
 ---
 
 ## Phase Diagnostics
 
-### baseline_grpo — Phase 1 training (200 steps) — instance 2 (canonical)
+### baseline_grpo — Phase 1 training (200 steps)
 
 | metric | value |
 |--------|-------|
@@ -46,255 +44,11 @@ Rows below are hand-updated as runs complete.*
 | pass@16 | 0.03126 |
 | pass@1 | 0.00210 |
 
-**Interpretation:** Reproduces instance 1 result (0.1620) to within 0.01pp — confirming
-pool stability and run reproducibility across hardware instances. A clean ~16pp improvement
-from pass@128≈0 to 0.1619 after 200 steps. The latent arm target is pass@128 ≥ 0.1919
-(baseline + 3pp).
+**Interpretation:** Clean ~16pp improvement from pass@128≈0 to 0.1619 after 200 steps.
+The latent arm target is pass@128 ≥ 0.1919 (baseline + 3pp).
 
 The training log showed non-zero loss and reward from step 1, clipped-ratio near zero
 throughout (on-policy; IS=1), and mean completion length ~672 tokens per chunk.
-
----
-
-### baseline_grpo — instance 1 (archived, superseded by instance 2)
-
-| metric | value |
-|--------|-------|
-| Pool | MATH Level 5 hard pool, n=1117 |
-| pass@128 | 0.1620 |
-| pass@16 | 0.03235 |
-| pass@1 | 0.00220 |
-| Checkpoint | `artifacts/baseline_grpo/20260522T121721Z/checkpoint-200` (deleted with instance) |
-
-*Archived for reference. Instance 2 numbers are canonical going forward.*
-
----
-
-### latent_grpo — Phase 0 encoder pretraining (400 steps) — v2 / instance 2 (canonical)
-
-| metric | value |
-|--------|-------|
-| Steps | 400 |
-| Pool | MATH easy pool (L1–L4), n≈3974 |
-| Trainer state | `plots_6/trainer_state.json` |
-| Final reward_rate | ~0.237 |
-| Peak l_trans (warmup, step 50) | 4.077 |
-| l_trans at step 100 | 0.593 |
-| l_trans at step 200 | 0.436 |
-| l_trans at step 300 | 0.281 |
-| **l_trans final (step 400)** | **0.233** |
-| λ_t at step 400 | 3.0 (plateau from step ~230) |
-
-**Key improvement over plots_5 (previous run):** Final l_trans 0.233 vs 0.242 — slightly
-better convergence. Higher warmup peak (4.077 vs 2.97) followed by stronger recovery, indicating
-the encoder explored further along L_out/L_calib before the Markov constraint engaged, then
-converged more effectively. **Critical:** this run was performed with z=μ throughout
-(reparameterize removed) — the encoder and transition model are now properly initialised for
-deterministic μ operation, eliminating the Phase 0/Phase 1 z-representation mismatch that
-affected the previous run.
-
-**l_trans trajectory:** clean monotonic decline from peak 4.077 → 0.233 over 400 steps.
-Decelerating at the end (0.27–0.24 range from step 240–400) but not flat — still compressing.
-
-**reward_rate:** stable 21–26% throughout, consistent with the easy pool difficulty.
-
-**l_out / l_calib:** both declined steadily across 400 steps (from ~1.0 → ~0.84–0.90),
-indicating the encoder is progressively separating correct from incorrect trajectories in latent
-space. Did not converge to near-zero (expected — encoder is not a powerful binary classifier
-from z_final alone; the signal orients rather than fully separates).
-
----
-
-### latent_grpo — Phase 0 encoder pretraining — instance 1 (archived, superseded)
-
-| metric | value |
-|--------|-------|
-| Steps | 400 |
-| Pool | MATH easy pool (L1–L4) |
-| Trainer state | `plots_5/trainer_state.json` |
-| Final reward_rate | 0.230 |
-| Final l_trans | 0.242 |
-| Note | Trained with z=μ+ε·σ (reparameterize present); superseded by v2 run |
-
----
-
-### latent_grpo — NFR6 Gate (Phase 0 v2 checkpoint) — instance 2 (canonical)
-
-**Verdict: PASS ✅ — stronger separation than previous run**
-
-| metric | value |
-|--------|-------|
-| n_correct | 96 |
-| n_incorrect | 304 |
-| Background correct rate | **24%** |
-| Right cluster correct rate | ~50% (**~2× enrichment**) |
-| Left cluster correct rate | ~13% (~0.5× depleted) |
-| UMAP structure | Two clearly distinct clusters, large gap (UMAP-1 ≈ 3–10 empty) |
-| Summary file | `plots_6/nfr6_summary.json` |
-
-**UMAP:**
-
-![UMAP of z_final coloured by correct/incorrect trajectory](plots_6/latent_structure_umap.png)
-
-**Interpretation:** Sharper separation than the previous NFR6 pass (plots_5: 1.4× enrichment
-in the enriched cluster; plots_6: ~2× enrichment). The right cluster (~140 points, UMAP-1
-≈ 10–15) is approximately 50% green vs 24% background — a 2× enrichment. The left cluster
-(~260 points, UMAP-1 ≈ -2.5 to 3) is correspondingly depleted at ~13%.
-
-The improvement is attributable to z=μ throughout Phase 0 training: without sampling noise,
-the transition model and encoder build cleaner Markov structure, yielding more coherent cluster
-boundaries in latent space.
-
-The large gap between clusters (no points in UMAP-1 ≈ 3–10) indicates the encoder has learned
-two structurally distinct trajectory regimes, not a continuous manifold. This is a strong signal
-that Phase 1 RL will be able to exploit the latent geometry.
-
----
-
-### latent_grpo — NFR6 Gate — instance 1 (archived, superseded)
-
-**Verdict: PASS ✅**
-
-| metric | value |
-|--------|-------|
-| Background correct rate | ~23% |
-| Left cluster correct rate | ~33% (~1.4× enrichment) |
-| Right cluster correct rate | ~19% |
-| Note | Trained with z=μ+ε·σ; superseded by v2 run |
-
----
-
----
-
-### latent_grpo_pretrained — Controlled baseline eval — instance 2 (canonical)
-
-**Verdict: PASS ✅** (gate criterion: pass@128 ≥ baseline_pretrained ≈ 0)
-
-| metric | value |
-|--------|-------|
-| Pool | MATH Level 5 hard pool, n=1118 |
-| Backbone | `Qwen/Qwen2.5-1.5B-Instruct` (pretrained, no Phase 1 GRPO) |
-| Encoder | Phase 0 v2 VAE + ZInjector checkpoint (z=μ throughout) |
-| pass@1 | 0.00135 |
-| pass@16 | 0.01953 |
-| pass@128 | **0.09839** |
-
-*Instance 1 (archived): pass@128=0.09579. Instance 2 is +0.26pp — consistent with the
-slightly better Phase 0 v2 encoder (l_trans final 0.233 vs 0.242) and cleaner z=μ training.*
-
-**Interpretation:** 9.84% pass@128 for the pretrained backbone under the latent generation
-regime, compared to ≈0% for the same backbone under vanilla generation (by hard pool
-construction). The gap has two contributing causes:
-
-1. **Generation regime difference:** the latent arm uses chunked generation (3 × 341 tokens)
-   rather than a single unconstrained 1024-token rollout. Forced chunking may impose a
-   reasoning structure that helps on some hard problems even with an uninformative z.
-2. **Phase 0 encoder contribution:** the Phase 0 VAE was trained to produce outcome-correlated
-   z states (NFR6 PASS confirmed). These states inject a context-shaping prefix between chunks
-   that can steer generation toward correct reasoning paths.
-
-The two effects cannot be cleanly separated without a further ablation (chunked generation with
-random z vs. Phase 0 z). For the current purpose, 9.58% serves as the **latent arm floor**:
-Phase 1 GRPO training (now running) must push meaningfully above this to attribute the gain to
-the RL-trained Markov state rather than the chunking structure alone.
-
-**Win condition context:**
-- baseline_grpo (200 steps RL): pass@128 = 16.20%
-- latent_pretrained (Phase 0 only): pass@128 = 9.58%
-- latent_grpo Phase 1 target: pass@128 ≥ 19.20% (baseline + 3pp)
-- A result between 16.2% and 19.2% would indicate latent RL matches but does not beat baseline;
-  above 19.2% is the win condition.
-
----
-
-## Remaining gates
-
----
-
-### latent_grpo — Phase 1 joint RL training (200 steps)
-
-**Verdict: ❌ FAIL — Phase 1 degraded performance below Phase 0 floor**
-
-| metric | value |
-|--------|-------|
-| Pool | MATH Level 5 hard pool, n=1117 |
-| Checkpoint | `artifacts/latent_grpo/20260524T032554Z/phase1/final` |
-| pass@1 | 0.00115 |
-| pass@16 | 0.01631 |
-| pass@128 | **0.0842** |
-| vs. latent_pretrained (Phase 0 floor) | **−1.16pp** (worse) |
-| vs. baseline_grpo target (≥19.2%) | **−10.8pp** (far below) |
-
-**Training log summary:**
-
-Two encoder disruption cycles occurred during Phase 1:
-- Cycle 1 (step 70): l_trans spiked 0.39 → 1.51, recovered to new low 0.22 by step 100
-- Cycle 2 (step 160–170): l_trans spiked 0.39 → **4.16**, only partially recovered to 0.67 by step 200
-
-Reward rate: 0.0–0.3% throughout (sparse; ~0.6 correct rollouts/step expected on hard pool).
-L_calib was degenerate in the first run (no pos_weight). Fixed and rerun — l_calib maintained at
-0.05–0.19 throughout the valid run. L_RL showed real signal at steps 100/130/140 (+0.019/+0.003/+0.003).
-
-**Root causes of failure:**
-
-1. **Encoder instability from joint backbone training:** the backbone (lr=1e-6) accumulated 170+
-   gradient steps before the second disruption. Each step shifts hidden representations; the
-   encoder cannot track fast enough, causing l_trans spikes. The second spike hit too late
-   (step 170) to recover by step 200 — final checkpoint has l_trans=0.671, 3× above the
-   stable range (0.22 at step 120).
-
-2. **Reward sparsity:** ~0.1–0.3% per rollout on hard Level 5 problems gives ~0.6 correct
-   rollouts per step (4 problems × 128 rollouts). L_RL gradient is real but too weak to
-   compensate for encoder degradation from L_trans instability.
-
-3. **z = μ + ε·σ IS gap (now fixed):** generation used sampled z but training computed log_π
-   under z = μ. For correct rollouts this breaks IS=1 assumption. Fixed in code before this
-   eval was run. The current eval used z = μ during generation.
-
-**What Phase 1 did achieve:**
-- l_trans floor of 0.22 at step 120 (better than Phase 0 final of 0.74) — encoder improved mid-run
-- L_RL showed positive signal at peak (step 100: l_rl=+0.019) — RL learning was real, just interrupted
-- Confirms Phase 0 pre-training is necessary but not sufficient
-
-**Root cause precision — l_trans spike mechanism:**
-
-Phase 0 data (plots_5) provides a clean reference: with backbone FROZEN, l_trans declined
-monotonically from 3.0 → 0.24 over 400 steps. No spikes because the target (backbone representations)
-was stationary.
-
-In Phase 1, the first spike (step 70, l_trans=1.51) occurred after 70 backbone update steps — the
-accumulated backbone drift exceeded the encoder's tracking capacity. The second spike (step 170,
-l_trans=4.16) was triggered by a high-reward batch (reward=0.33% — the highest in the run): a lucky
-step with 1–2 correct rollouts produces a large L_RL gradient on the backbone. The missing protection
-mechanisms amplified this:
-
-1. **No advantage clipping**: with 1-of-128 correct, the normalised advantage for the positive
-   rollout = ~11.3 (vs ~1.7 on the easy pool at 25% reward rate). An 11× advantage multiplied by
-   log_π produced a proportionally large backbone gradient step.
-
-2. **No per-component gradient clipping**: `clip_grad_norm_(all_params, 1.0)` applied to the 1.5B
-   backbone + 10M encoder jointly. The backbone's contribution dominates the global norm — the encoder
-   contribution is negligible. In practice the backbone is clipped to near 1.0 while the encoder
-   is effectively unconstrained. More importantly, the backbone itself is not protected from large
-   single-step updates driven by rare high-advantage batches.
-
-**Fixes implemented (Phase 1 rerun v2):**
-
-1. **Advantage clipping ±5** (both latent and token arms): `compute_grpo_advantages(..., adv_clip=5.0)`.
-   With 1-of-128 correct, advantage drops from 11.3 → 5.0 (2.25× smaller RL gradient). At normal
-   reward rates (>5-of-128 correct) the clip is inert. Equivalent to the ratio-clip protection in
-   TRL's GRPOTrainer, DAPO, and Dr. GRPO — our custom loop uses advantage clipping directly since
-   IS=1 exactly makes ratio clipping a no-op.
-
-2. **Separate per-component gradient clipping** (latent arm only): backbone `max_norm=0.3`,
-   VAE/ZInjector `max_norm=1.0`. The joint clip on `all_params` was dominated by the 1.5B backbone
-   norm, effectively leaving VAE unconstrained. Separating them protects the backbone from large
-   single-step RL updates while keeping VAE/ZInjector fast-adapting to track moving representations.
-   **Token arm backbone clip stays at 1.0** (no encoder to protect; ratio clipping + advantage
-   clipping are sufficient; matching baseline for fair ablation).
-
-Config parameters (latent arm, `configs/train_latent_grpo.yaml` under `phase1_loss`):
-`adv_clip: 5.0`, `grad_clip_backbone: 0.3`, `grad_clip_vae: 1.0`.
 
 ---
 
@@ -302,13 +56,11 @@ Config parameters (latent arm, `configs/train_latent_grpo.yaml` under `phase1_lo
 
 | Gate | Status |
 |------|--------|
-| baseline_grpo instance 2 eval | ✅ 0.1619 pass@128 (reproduces instance 1 within 0.01pp) |
-| Phase 0 v2 training (z=μ, 400 steps) | ✅ complete — l_trans=0.233, `plots_6` |
-| NFR6 gate (Phase 0 v2 checkpoint) | ✅ PASS — ~2× enrichment, clear gap, `plots_6` |
-| `latent_grpo_pretrained` eval (Phase 0 v2 encoder) | ✅ 9.84% pass@128 (floor for Phase 1) |
-| `latent_grpo` Phase 1 v2 (adv_clip±5 + separate grad_clip) | 🔄 running — step 80/200 |
-| `latent_grpo` pass@128 ≥ 0.1919 (instance 2 baseline + 3pp) | ⬜ pending |
+| baseline_grpo eval | ✅ 0.1619 pass@128 |
+| Phase 0 training (400 steps, L_trans + L_out) | ⬜ pending |
+| NFR6 gate (Phase 0 checkpoint) | ⬜ pending |
+| `latent_grpo_pretrained` eval (Phase 0 encoder) | ⬜ pending |
+| `latent_grpo` Phase 1 eval | ⬜ pending |
+| `latent_grpo` pass@128 ≥ 0.1919 (baseline + 3pp) | ⬜ pending |
 | E1: held-out L_trans < 0.5 | ⬜ pending |
-| E3: Pearson r < −0.1 AND Δσ² > 0.01 | ⬜ pending |
 | `token_markov_grpo` training + eval | ⬜ pending |
-| *[archived] `latent_grpo` instance 1 Phase 1* | ❌ 8.42% — below pretrained floor; superseded |

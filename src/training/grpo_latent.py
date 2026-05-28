@@ -2,9 +2,7 @@
 
 Design reference: reports/latent_markov_design.md
 
-Architecture change from v1: VAE-ELBO replaced by deterministic encoder +
-explicit calibration loss. z_h = μ_h (no sampling during training). σ² is
-trained directly via L_calib = BCE_with_logits(−mean_logvar, reward, pos_weight).
+Architecture: deterministic encoder. z_h = μ_h always. No sampling, no logvar.
 
 Phase 0 — Online Encoder Pretraining
 ──────────────────────────────────────
@@ -13,18 +11,18 @@ Encoder + ZInjector + OutcomeHead optimised jointly.
 Each step:
   1. [no_grad] generate G=128 rollouts per problem → chunk_ids + reward
   2. [with_grad] re-run full 3-chunk pipeline → live repr_h, z_h (= μ_h)
-  3. losses: λ_trans × L_trans + λ_out × L_out + λ_calib × L_calib
+  3. losses: λ_trans × L_trans + λ_out × L_out
   4. step Encoder+ZInjector+OutcomeHead optimizer; backbone grads zeroed, NOT stepped.
 
-Phase 1 — Joint RL Training
-─────────────────────────────
+Phase 1 — Joint RL Training (pure L_RL)
+─────────────────────────────────────────
 Backbone UNFROZEN. Encoder + ZInjector loaded from Phase 0 checkpoint.
 On-policy GRPO loop (200 steps): every step =
   1. [no_grad] collect G=128 fresh rollouts → chunk_ids + reward
-  2. compute GRPO advantages from group rewards
+  2. compute GRPO advantages per-problem-group (clipped to ±adv_clip)
   3. [with_grad] re-run full 3-chunk pipeline → live repr_h, z_h, log_π
-  4. losses: L_RL + λ_t × L_trans + λ_calib × L_calib
-  5. step all optimizers (backbone + Encoder + ZInjector)
+  4. loss: L_RL only
+  5. single global grad clip (max_norm=1.0), step all optimizers
 
 G=128 matches eval pass@128 scale. IS = 1 exactly. z_h = μ_h (deterministic).
 
@@ -345,14 +343,13 @@ def generate_latent_traces(
     del fi1, fa1, hidden1
     torch.cuda.empty_cache()
 
-    # VAE → z_1: z = μ always (reparameterize() removed from VAEStateEncoder).
+    # VAE → z_1: z = μ always (deterministic encoder).
     # Rollout-to-rollout diversity comes from different chunk1 tokens producing
-    # different repr_1 → different μ_1 per rollout — no noise needed.
+    # different repr_1 → different μ_1 per rollout.
     # .float(): backbone runs in bf16; VAE MLP weights are fp32.
     repr_1_batch = torch.stack(repr_1_list).float()   # (B, hidden) fp32
-    mu_1, logvar_1 = vae.encode(repr_1_batch)
-    z_1_batch = mu_1                                  # z = μ always
-    del repr_1_batch, mu_1, logvar_1
+    z_1_batch = vae.encode(repr_1_batch)               # z = μ always
+    del repr_1_batch
     torch.cuda.empty_cache()
 
     # ── Chunk 2 generation — left-padded inputs_embeds [z_pfx | chunk1] ──
@@ -411,9 +408,8 @@ def generate_latent_traces(
 
     # VAE → z_2: z = μ always
     repr_2_batch = torch.stack(repr_2_list).float()   # bf16→fp32 for VAE
-    mu_2, logvar_2 = vae.encode(repr_2_batch)
-    z_2_batch = mu_2
-    del repr_2_batch, mu_2, logvar_2
+    z_2_batch = vae.encode(repr_2_batch)               # z = μ always
+    del repr_2_batch
     torch.cuda.empty_cache()
 
     # ── Chunk 3 generation — left-padded inputs_embeds [z_pfx2 | chunk2] ─
@@ -501,10 +497,9 @@ def _run_pipeline_with_grad(
 
     Returns dict with:
         "repr_list"    : list[3 × Tensor (B, hidden)]  — LIVE
-        "z_list"       : list[3 × Tensor (B, latent)]  — LIVE
-        "mu_list"      : list[3 × Tensor (B, latent)]  — LIVE
-        "logvar_list"  : list[3 × Tensor (B, latent)]  — LIVE
+        "z_list"       : list[3 × Tensor (B, latent)]  — LIVE (z_h = μ_h)
         "log_pi_chunks": list[3 × list[B × Tensor(chunk_len,)]]  — empty when compute_log_pi=False
+
     """
     pad_id      = 0  # pad value for token-id inputs; actual vocab doesn't matter
     embed_layer = model.get_input_embeddings()
@@ -552,8 +547,7 @@ def _run_pipeline_with_grad(
             log_pi_1.append(lp)
     del logits1
 
-    mu_1, logvar_1 = vae.encode(repr_1_batch)
-    z_1_batch = mu_1                                          # (B, latent) LIVE; z = μ always
+    z_1_batch = vae.encode(repr_1_batch)                      # (B, latent) LIVE; z = μ always
     prefix_1  = z_injector.get_prefix_embedding(z_1_batch)   # (B, 1, H) LIVE
 
     # ── Chunk 2: [z_pfx1 | chunk2] right-padded ───────────────────────────
@@ -592,8 +586,7 @@ def _run_pipeline_with_grad(
             log_pi_2.append(lp)
     del logits2
 
-    mu_2, logvar_2 = vae.encode(repr_2_batch)
-    z_2_batch = mu_2                                          # (B, latent) LIVE; z = μ always
+    z_2_batch = vae.encode(repr_2_batch)                      # (B, latent) LIVE; z = μ always
     prefix_2  = z_injector.get_prefix_embedding(z_2_batch)   # (B, 1, H) LIVE
 
     # ── Chunk 3: [z_pfx2 | chunk3] right-padded ───────────────────────────
@@ -629,14 +622,11 @@ def _run_pipeline_with_grad(
             log_pi_3.append(lp)
     del logits3
 
-    mu_3, logvar_3 = vae.encode(repr_3_batch)
-    z_3_batch = mu_3                                          # (B, latent) LIVE; z = μ always
+    z_3_batch = vae.encode(repr_3_batch)                      # (B, latent) LIVE; z = μ always
 
     return {
         "repr_list":     [repr_1_batch, repr_2_batch, repr_3_batch],
         "z_list":        [z_1_batch,    z_2_batch,    z_3_batch],
-        "mu_list":       [mu_1,         mu_2,         mu_3],
-        "logvar_list":   [logvar_1,     logvar_2,     logvar_3],
         "log_pi_chunks": [log_pi_1,     log_pi_2,     log_pi_3],
     }
 
@@ -651,7 +641,7 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
     Each step:
       1. [no_grad] generate G rollouts per problem → chunk_ids + reward
       2. [with_grad] re-run full pipeline → live repr_h, z_h (= μ_h)
-      3. losses: λ_trans × L_trans + λ_out × L_out + λ_calib × L_calib
+      3. losses: λ_trans × L_trans + λ_out × L_out
       4. step Encoder+ZInjector+OutcomeHead; backbone grads zeroed (not stepped)
 
     Config keys consumed (under "phase0"):
@@ -661,7 +651,7 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
         num_generations              — G total rollouts per problem across Phase 0 (default: 128)
         learning_rate                — AdamW lr for Encoder/ZInj/OutcomeHead (default: 3e-4)
         lambda_trans_peak, lambda_trans_warmup_steps — λ_t schedule (peak and initial zero phase)
-        lambda_out, lambda_calib — loss weights
+        lambda_out — L_out loss weight
         temperature, top_p           — sampling params (from training.*)
         chunk_tokens                 — tokens per chunk (from latent_markov.*)
         checkpoint_path              — where to save phase0_encoder.pt
@@ -684,7 +674,6 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
     lambda_trans_peak        = float(phase0_cfg.get("lambda_trans_peak",        3.0))
     lambda_trans_warmup_steps = int(phase0_cfg.get("lambda_trans_warmup_steps", 50))
     lambda_out               = float(phase0_cfg.get("lambda_out",               5.0))
-    lambda_calib             = float(phase0_cfg.get("lambda_calib",             1.0))
     temperature   = float(training_cfg.get("temperature",  1.0))
     top_p         = float(training_cfg.get("top_p",        1.0))
     chunk_tokens  = int(latent_cfg.get("chunk_tokens",     341))
@@ -826,17 +815,15 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
         model.zero_grad(set_to_none=True)
         optimizer.zero_grad()
 
-        # Micro-batch loop: split B×G traces into chunks of micro_batch_size.
+        # Micro-batch loop: split traces into chunks of micro_batch_size.
         # Each chunk's loss is scaled by 1/n_micro and backward() is called
         # immediately, releasing that chunk's computation graph before the
         # next chunk is processed.  Mathematically identical to one full-batch
-        # backward: L_trans / L_out / L_calib are all mean-reduced within each
-        # micro-batch, and averaging over n_micro micro-batches preserves the
-        # same mean.  Advantages are not used in Phase 0 (no L_RL), so there is
+        # backward.  Advantages are not used in Phase 0 (no L_RL), so there is
         # no group-normalization dependency across micro-batches.
         n_total = len(traces)
         n_micro = math.ceil(n_total / micro_batch_size)
-        l_trans_acc = l_out_acc = l_calib_acc = total_acc = 0.0
+        l_trans_acc = l_out_acc = total_acc = 0.0
 
         for mb_start in range(0, n_total, micro_batch_size):
             mb_traces  = traces[mb_start : mb_start + micro_batch_size]
@@ -850,9 +837,7 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
                 model, vae, z_injector, mb_traces, device, compute_log_pi=False
             )
 
-            # pos_weight = n_neg / n_pos balances the 82/18 incorrect/correct split.
-            # Clamped to [1, 20]: avoids exploding weights on degenerate micro-batches
-            # (e.g. all-zero reward step) while still upweighting rare correct signals.
+            # pos_weight = n_neg / n_pos balances the incorrect/correct split.
             pos_rate   = rewards_mb.mean().clamp(min=0.05)
             pos_weight = ((1.0 - pos_rate) / pos_rate).clamp(max=20.0)
 
@@ -862,18 +847,14 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
                 rewards_mb.view(-1),
                 pos_weight=pos_weight,
             )
-            l_calib = vae.compute_calibration_loss(
-                pipe["logvar_list"], rewards_mb, pos_weight=pos_weight
-            )
 
             total_mb: torch.Tensor = (
-                lambda_t * l_trans + lambda_out * l_out + lambda_calib * l_calib
+                lambda_t * l_trans + lambda_out * l_out
             ) / n_micro
             total_mb.backward()  # release this micro-batch's computation graph
 
             l_trans_acc += l_trans.detach().item() / n_micro
             l_out_acc   += l_out.detach().item()   / n_micro
-            l_calib_acc += l_calib.detach().item() / n_micro
             total_acc   += total_mb.detach().item()
 
         torch.nn.utils.clip_grad_norm_(vae_params, max_norm=1.0)
@@ -885,8 +866,7 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
         # ── Logging ───────────────────────────────────────────────────────
         for k, v in (("loss",  total_acc),
                      ("trans", l_trans_acc),
-                     ("out",   l_out_acc),
-                     ("calib", l_calib_acc)):
+                     ("out",   l_out_acc)):
             pending[k] = pending.get(k, 0.0) + v
         reward_rate = sum(t["reward"] for t in traces) / len(traces)
         pending["reward_rate"] = pending.get("reward_rate", 0.0) + reward_rate
@@ -897,14 +877,14 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
                 "step":     global_step + 1,
                 "lambda_t": round(lambda_t, 4),
                 **{k: pending.get(k, 0.0) / n
-                   for k in ("loss", "trans", "out", "calib", "reward_rate")},
+                   for k in ("loss", "trans", "out", "reward_rate")},
             }
             log_history.append(entry)
             pending = {}
             logger.info(
-                "step %d | λ_t=%.2f | loss=%.4f trans=%.4f out=%.4f calib=%.4f | reward=%.1f%%",
+                "step %d | λ_t=%.2f | loss=%.4f trans=%.4f out=%.4f | reward=%.1f%%",
                 entry["step"], entry["lambda_t"],
-                entry["loss"], entry["trans"], entry["out"], entry["calib"],
+                entry["loss"], entry["trans"], entry["out"],
                 entry["reward_rate"] * 100,
             )
 
@@ -916,7 +896,7 @@ def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
 
         step_bar.set_postfix(
             loss=f"{total_acc:.4f}",
-            calib=f"{l_calib_acc:.4f}",
+            trans=f"{l_trans_acc:.4f}",
             rwd=f"{reward_rate:.0%}",
         )
         step_bar.update(1)
@@ -966,71 +946,42 @@ def latent_training_step(
     z_injector: ZInjector,
     traces: list[dict],
     advantages: list[float],
-    lambda_t: float,
-    lambda_calib: float,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    """Compute the combined Phase 1 loss for one training step.
+    """Compute the Phase 1 loss for one training step: pure L_RL (GRPO).
 
-    L_total = L_RL  +  λ_t × L_transition  +  λ_calib × L_calib
+    L_RL = -mean_{i,h,t} [ advantage_i × log π_θ(token_t | context_{h,i}) ]
 
-    L_RL (GRPO, no IS correction):
-        The full 3-chunk pipeline is re-run with grad. z_h = μ_h (deterministic).
-        IS = 1 exactly (policy not updated between rollout and training step).
-
-        L_RL = -mean_{i,h,t} [ advantage_i × log π_θ(token_t | context_{h,i}) ]
-
-    L_calib:
-        BCE_with_logits(−mean_logvar, reward, pos_weight) — keeps σ² calibrated
-        to trajectory quality during Phase 1. Lighter than Phase 0 (λ_calib=0.5).
+    IS = 1 exactly (on-policy: rollout collected from current policy, one
+    gradient step per rollout batch, no multiple epochs).
+    Markov structure is enforced architecturally: each chunk's forward pass sees
+    only [z_h_prefix ‖ chunk_{h+1}], never raw token history.
 
     Args:
-        model:        backbone in training mode (UNFROZEN — .step() called by caller).
-        vae:          VAEStateEncoder in training mode.
-        z_injector:   ZInjector in training mode.
-        traces:       output of generate_latent_traces() for this step.
-        advantages:   aligned GRPO advantages (output of compute_grpo_advantages()).
-        lambda_t:     current transition loss weight (from lambda_trans_schedule()).
-        lambda_calib: L_calib loss weight (config: phase1_loss.lambda_calib).
-        device:       CUDA device.
+        model:      backbone in training mode (UNFROZEN).
+        vae:        VAEStateEncoder in training mode.
+        z_injector: ZInjector in training mode.
+        traces:     output of generate_latent_traces() for this step.
+        advantages: aligned GRPO advantages (clipped to ±adv_clip by caller).
+        device:     CUDA device.
 
     Returns:
-        Dict with backward-able scalar tensor "total" and detached scalars
-        "l_rl", "l_calib", "l_trans" for logging.
+        Dict with backward-able scalar "total" and detached scalar "l_rl".
     """
     pipe = _run_pipeline_with_grad(model, vae, z_injector, traces, device)
 
-    l_trans = vae.compute_transition_loss(pipe["z_list"])
-
-    rewards_t = torch.tensor(
-        [float(t["reward"]) for t in traces],
-        dtype=torch.float32, device=device,
-    )
-    # Dynamic pos_weight: mirrors Phase 0 treatment.  Hard pool reward rate is
-    # ~0.1% → without weighting the model trivially drives l_calib→0 by predicting
-    # "always wrong".  pos_weight=20 cap prevents gradient explosion on zero-reward steps.
-    pos_rate_p1 = rewards_t.mean().clamp(min=0.05)
-    pos_weight_p1 = ((1.0 - pos_rate_p1) / pos_rate_p1).clamp(max=20.0)
-    l_calib = vae.compute_calibration_loss(pipe["logvar_list"], rewards_t,
-                                           pos_weight=pos_weight_p1)
-
-    # L_RL: -mean_{i,h,t} [ adv_i × log_π(token_t | context_{h,i}) ]
     adv = [float(a) for a in advantages]
     rl_sum   = torch.zeros(1, device=device)
     n_tokens = 0
-    for lp_chunk in pipe["log_pi_chunks"]:                 # 3 chunks
-        for i, lp in enumerate(lp_chunk):                  # B×G traces
+    for lp_chunk in pipe["log_pi_chunks"]:      # 3 chunks
+        for i, lp in enumerate(lp_chunk):        # B×G traces
             rl_sum   = rl_sum + (-adv[i] * lp.sum())
             n_tokens += lp.shape[0]
     l_rl = rl_sum / max(n_tokens, 1)
 
-    l_total = l_rl + lambda_t * l_trans + lambda_calib * l_calib
-
     return {
-        "total":    l_total,
-        "l_rl":     l_rl.detach(),
-        "l_calib":  l_calib.detach(),
-        "l_trans":  l_trans.detach(),
+        "total": l_rl,
+        "l_rl":  l_rl.detach(),
     }
 
 
@@ -1043,7 +994,7 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     Every training step:
       1. [no_grad] collect G=128 rollouts for B=4 problems → 512 sequences
       2. compute GRPO advantages per-problem-group (no interleaving)
-      3. [with_grad] re-run full pipeline → L_RL + λ_t·L_trans + λ_calib·L_calib
+      3. [with_grad] re-run full pipeline → L_RL
          (micro-batched for memory; advantages pre-computed → GRPO math unchanged)
       4. step all optimizers (backbone lr=1e-6, encoder lr=3e-4)
 
@@ -1054,7 +1005,7 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
         training.*             — seed, learning_rate, num_generations,
                                  batch_size, max_steps, temperature, top_p,
                                  gradient_checkpointing, logging_steps, save_steps
-        phase1_loss.*          — lambda_calib, lambda_trans_peak
+        phase1_loss.*          — adv_clip, grad_clip
         evaluation.path        — Level 5 hard pool JSONL for RL training
     """
     primary      = config["primary"]
@@ -1063,8 +1014,7 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     phase0_cfg   = config["phase0"]
     phase1_cfg   = config.get("phase1_loss", {})
 
-    lambda_calib      = float(phase1_cfg.get("lambda_calib",      0.5))
-    lambda_trans_peak = float(phase1_cfg.get("lambda_trans_peak", 0.3))
+    # Phase 1: pure L_RL.
 
     model_id     = primary["huggingface_repo_id"]
     revision     = primary.get("revision", "main")
@@ -1082,12 +1032,10 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     top_p        = float(training_cfg.get("top_p",         1.0))
     log_steps    = int(training_cfg.get("logging_steps",   10))
     save_steps   = int(training_cfg.get("save_steps",      50))
-    # Separate grad norms: backbone is large (1.5B params) and should be
-    # protected from large single-step updates; VAE/ZInjector are small and
-    # designed to be more adaptive.
-    grad_clip_backbone = float(phase1_cfg.get("grad_clip_backbone", 0.3))
-    grad_clip_vae      = float(phase1_cfg.get("grad_clip_vae",      1.0))
-    adv_clip           = float(phase1_cfg.get("adv_clip",           5.0))
+    # Single global grad clip — no competing objectives in Phase 1, so no need
+    # to protect individual parameter groups from each other.
+    grad_clip = float(phase1_cfg.get("grad_clip", 1.0))
+    adv_clip  = float(phase1_cfg.get("adv_clip",  5.0))
 
     chunk_tokens = int(latent_cfg.get("chunk_tokens",  341))
     latent_dim   = int(latent_cfg.get("latent_dim",  LATENT_DIM))
@@ -1100,8 +1048,8 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Phase 1 — device: %s  lambda_calib=%.4f  lambda_trans_peak=%.2f",
-                device, lambda_calib, lambda_trans_peak)
+    logger.info("Phase 1 — device: %s  adv_clip=%.1f  grad_clip=%.2f  (pure L_RL)",
+                device, adv_clip, grad_clip)
 
     # ------------------------------------------------------------------
     # Backbone
@@ -1192,8 +1140,6 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     step_bar = tqdm(total=max_steps, desc="phase1", unit="step", dynamic_ncols=True)
 
     for global_step in range(max_steps):
-        lambda_t = lambda_trans_schedule(global_step, max_steps, peak=lambda_trans_peak)
-
         # Sample batch_size problems (reshuffle when pool exhausted).
         while len(pool_order) < batch_size:
             order = list(range(len(problems)))
@@ -1229,9 +1175,7 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
         # full-batch backward.
         n_total_p1 = len(traces)
         n_micro_p1 = math.ceil(n_total_p1 / micro_batch_size)
-        metrics_acc: dict[str, float] = {
-            "total": 0.0, "l_rl": 0.0, "l_calib": 0.0, "l_trans": 0.0
-        }
+        metrics_acc: dict[str, float] = {"total": 0.0, "l_rl": 0.0}
 
         for mb_start in range(0, n_total_p1, micro_batch_size):
             mb_traces = traces    [mb_start : mb_start + micro_batch_size]
@@ -1240,24 +1184,20 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
             metrics_mb = latent_training_step(
                 model=model, vae=vae, z_injector=z_injector,
                 traces=mb_traces, advantages=mb_adv,
-                lambda_t=lambda_t, lambda_calib=lambda_calib,
                 device=device,
             )
 
             (metrics_mb["total"] / n_micro_p1).backward()  # release graph immediately
 
-            for k in ("total", "l_rl", "l_calib", "l_trans"):
+            for k in ("total", "l_rl"):
                 metrics_acc[k] += metrics_mb[k].item() / n_micro_p1
 
-        # Separate clips: backbone is 1.5B params and must not take large single
-        # steps (joint clipping masks its share behind the larger norm count);
-        # VAE/ZInjector are small and designed for fast adaptation.
-        torch.nn.utils.clip_grad_norm_(list(model.parameters()), grad_clip_backbone)
-        torch.nn.utils.clip_grad_norm_(vae_params,                grad_clip_vae)
+        all_params = list(model.parameters()) + vae_params
+        torch.nn.utils.clip_grad_norm_(all_params, grad_clip)
         optimizer.step()
 
         # ── Logging ───────────────────────────────────────────────────────
-        for k in ("total", "l_rl", "l_calib", "l_trans"):
+        for k in ("total", "l_rl"):
             pending[k] = pending.get(k, 0.0) + metrics_acc[k]
         pending["reward_rate"] = (
             pending.get("reward_rate", 0.0) + sum(rewards) / len(rewards)
@@ -1266,19 +1206,15 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
         if (global_step + 1) % log_steps == 0:
             n = log_steps
             entry = {
-                "step":     global_step + 1,
-                "lambda_t": round(lambda_t, 4),
+                "step": global_step + 1,
                 **{k: pending.get(k, 0.0) / n
-                   for k in ("total", "l_rl", "l_calib", "l_trans", "reward_rate")},
+                   for k in ("total", "l_rl", "reward_rate")},
             }
             log_history.append(entry)
             pending = {}
             logger.info(
-                "step %d | λ_t=%.2f λ_calib=%.3f | total=%.4f rl=%.4f "
-                "calib=%.4f trans=%.4f | reward=%.1f%%",
-                entry["step"], entry["lambda_t"], lambda_calib,
-                entry["total"], entry["l_rl"],
-                entry["l_calib"], entry["l_trans"],
+                "step %d | total=%.4f rl=%.4f | reward=%.1f%%",
+                entry["step"], entry["total"], entry["l_rl"],
                 entry["reward_rate"] * 100,
             )
 
@@ -1292,7 +1228,6 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
         step_bar.set_postfix(
             loss=f"{metrics_acc['total']:.4f}",
             rl=f"{metrics_acc['l_rl']:.4f}",
-            calib=f"{metrics_acc['l_calib']:.4f}",
         )
         step_bar.update(1)
 

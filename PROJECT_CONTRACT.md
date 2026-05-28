@@ -52,8 +52,8 @@ hyperparameters across arms unless the field is explicitly method-specific
 | NFR6 gate | UMAP shows outcome-correlated geometry in z-space |
 | `latent_grpo_pretrained` pass@128 | ≥ `baseline_pretrained` pass@128 (controlled regime check) |
 | `latent_grpo` pass@128 | ≥ `baseline_grpo` pass@128 + 3pp |
-| **E1 + E3 joint (solution-space check)** | E1 < 0.5 AND E3 Pearson r < −0.1 AND Δσ²(correct vs incorrect) > 0.01 |
-| No NaN blowups | L_RL, L_trans, L_calib all non-zero throughout Phase 1 |
+| **E1 (Markov property check)** | held-out L_trans < 0.5 |
+| No NaN blowups | L_RL non-zero throughout Phase 1; L_trans + L_out non-zero throughout Phase 0 |
 
 ---
 
@@ -115,46 +115,41 @@ method, not implementation.
 
 **Deliverables:**
 
-### Phase 0 ✅ — Encoder pretraining (400 steps)
+### Phase 0 ☐ — Encoder pretraining (400 steps, L_trans + L_out)
 
-- [x] Run: `python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 0`
-- [x] Checkpoint: `runs/latent_grpo/phase0_encoder.pt`
-- [x] Loss: L_trans declining throughout 400 steps ✓; L_calib non-zero ✓
-- [x] Log: reward rate stable on easy pool ✓
+- [ ] Run: `python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 0`
+- [ ] Checkpoint: `runs/latent_grpo/phase0_encoder.pt`
+- [ ] Loss: L_trans declining throughout 400 steps; L_out non-zero
+- [ ] Log: reward rate stable on easy pool
 
-### NFR6 gate ✅
+### NFR6 gate ☐
 
-- [x] Run: `python scripts/run_nfr6_gate.py --config configs/train_latent_grpo.yaml --n-problems 200 --n-rollouts 2`
-- [x] **PASS:** structured latent space with outcome-correlated geometry confirmed.
+- [ ] Run: `python scripts/run_nfr6_gate.py --config configs/train_latent_grpo.yaml --n-problems 200 --n-rollouts 2`
+- [ ] **PASS:** structured latent space with outcome-correlated geometry confirmed.
 - Full diagnostics and UMAP in `reports/ablation_core.md`.
 
-### Controlled latent baseline eval
+### Controlled latent baseline eval ☐
 
-- [x] Run: `python scripts/eval_passk.py --generation-mode latent_markov_pretrained ...`
-- [x] **PASS:** pass@128 = 9.58% >> baseline_pretrained ≈ 0%. Numbers and interpretation in `reports/ablation_core.md`.
+- [ ] Run: `python scripts/eval_passk.py --generation-mode latent_markov_pretrained ...`
+- [ ] **PASS:** pass@128 ≥ baseline_pretrained ≈ 0%. Numbers and interpretation in `reports/ablation_core.md`.
 
-### Phase 1 — Joint RL (200 steps)
+### Phase 1 — Joint RL (200 steps, pure L_RL) ☐
 
-- [x] Run: `python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 1`
-- [x] Log: L_trans non-zero ✓; L_RL positive at step 100 (+0.019) ✓; L_calib non-zero ✓
-- [x] Log: λ_trans=0.3 plateau from step 110 ✓; λ_calib=0.5 ✓
-- ⚠️ Two encoder disruption cycles (l_trans spikes at steps 70 and 170). Second spike not recovered at step 200.
+- [ ] Run: `python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 1`
+- [ ] Log: L_RL non-zero within first 30 steps; adv_clip=5.0, grad_clip=1.0 confirmed
 
-### Phase 1 eval
+### Phase 1 eval ☐
 
-- [x] Run: `python scripts/eval_passk.py --generation-mode latent_markov ...`
-- [x] Artifact: `artifacts/latent_grpo/20260524T032554Z/phase1/final/eval_metrics.json`
-- [x] Result: pass@128 = **0.0842** — below Phase 0 pretrained floor (0.0958). Full diagnostics in `reports/ablation_core.md`.
-- [ ] **Target:** pass@128 ≥ 0.192 — ❌ NOT MET. Phase 1 rerun needed with encoder stability fix.
+- [ ] Run: `python scripts/eval_passk.py --generation-mode latent_markov ...`
+- [ ] Artifact: `artifacts/latent_grpo/{run_id}/phase1/final/eval_metrics.json`
+- [ ] **Target:** pass@128 ≥ 0.192 (baseline + 3pp)
 
-### E1 + E3 Markov diagnostics
+### E1 Markov diagnostics ☐
 
 - [ ] Run: `python scripts/eval_markov_diagnostics.py --checkpoint $PHASE1_CKPT ...`
 - [ ] **E1:** held-out L_trans < 0.5 (Markov property holds on unseen trajectories)
-- [ ] **E3 joint:** Pearson r < −0.1 AND Δσ²(correct vs incorrect) > 0.01
-  - Both conditions required for solution-space interpretation (see `reports/NEXT_STEPS_V2.md`)
 
-**Pass:** E1 + E3 joint criterion met; pass@128 result interpreted in context of diagnostics.
+**Pass:** E1 criterion met; pass@128 result interpreted in context of diagnostic.
 
 ---
 
@@ -168,8 +163,7 @@ method, not implementation.
 - `train_latent_with_uncertainty()` in `grpo_latent.py`
 - Eval artifacts
 
-**Pass:** same criteria as Phase 3 + uncertainty bonus active; E3 diagnostic validates
-σ² as an exploration signal.
+**Pass:** same criteria as Phase 3 + uncertainty bonus active.
 
 ---
 
@@ -194,7 +188,7 @@ Before treating the core table as final:
 
 - [ ] **Data:** `DATA_PROTOCOL.md` + manifest files + config paths all consistent
 - [ ] **Token-Markov:** pretrained arm matches baseline at initialisation (regime sanity check)
-- [ ] **Latent diagnostics:** E1 + E3 joint criterion met (solution-space evidence)
+- [ ] **Latent diagnostics:** E1 criterion met (held-out L_trans < 0.5)
 - [ ] **Fairness:** same pretrained checkpoint, same reward, same eval budget, same decode settings
 - [ ] **Metrics:** `pass@128` all active arms; table from `run_ablation_table.py` artifacts
 - [ ] **Repro:** seeds in `repro_tolerance.yaml`; `check_reproducibility.py` verified
