@@ -181,7 +181,7 @@ def eval_e1_transition(
     """Compute mean transition loss on held-out trajectories.
 
     For each trajectory:
-        mu_h, _ = vae.encode(repr_h);  z_h = mu_h        for h in {1, 2, 3}
+        z_h = vae.encode(repr_h)        for h in {1, 2, 3}
         L_transition = ||f(z_1) − z_2||² + ||f(z_2) − z_3||²
 
     Low held-out loss = Markov property holds (z_h alone predicts z_{h+1}).
