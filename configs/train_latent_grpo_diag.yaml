@@ -1,0 +1,43 @@
+# Phase 1 early diagnostic — 20-step go/no-go probe.
+#
+# Inherits everything from the full config. Overrides only the training
+# budget and logging cadence so you get per-step visibility and a checkpoint
+# at step 20 without touching the production config.
+#
+# Usage:
+#   # Step 1: pretrained floor probe (run before starting training)
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   python scripts/eval_passk.py --generation-mode latent_markov_pretrained \
+#       --train-config configs/train_latent_grpo.yaml \
+#       --arm latent_grpo_pretrained_diag \
+#       --n-problems 60 --n-rollouts 32 \
+#       --output runs/latent_grpo/diag_floor.json
+#
+#   # Step 2: 20 Phase 1 training steps with this config
+#   python scripts/train_latent.py --config configs/train_latent_grpo_diag.yaml --phase 1
+#
+#   # Step 3: post-training probe on same 60 problems
+#   DIAG_CKPT=$(ls -td artifacts/latent_grpo/*/phase1/checkpoint-20 | head -1)
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   python scripts/eval_passk.py --generation-mode latent_markov \
+#       --train-config configs/train_latent_grpo.yaml \
+#       --checkpoint "$DIAG_CKPT" \
+#       --arm latent_grpo_diag_20steps \
+#       --n-problems 60 --n-rollouts 32 \
+#       --output runs/latent_grpo/diag_post20.json
+#
+# Go/No-Go:
+#   GO     — pass@32 after 20 steps >= floor pass@32
+#            AND reward appeared in >= 5 of 20 training steps
+#   NO-GO  — reward = 0 for all 20 steps (DOA, like token_markov)
+#            OR pass@32 clearly below floor
+
+extends: "configs/train_latent_grpo.yaml"
+
+experiment:
+  name: "latent_grpo_diag"
+
+training:
+  max_steps: 20
+  logging_steps: 1    # log every step — fine-grained reward visibility
+  save_steps: 20      # single checkpoint at step 20 for the post-training probe

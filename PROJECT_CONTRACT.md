@@ -136,7 +136,7 @@ method, not implementation.
 ### Phase 1 — Joint RL (200 steps, pure L_RL) ☐
 
 - [ ] Run: `python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 1`
-- [ ] Log: L_RL non-zero within first 30 steps; adv_clip=5.0, grad_clip=1.0 confirmed
+- [ ] Log: L_RL non-zero within first 30 steps; adv_clip=20.0, grad_clip=1.0 confirmed
 
 ### Phase 1 eval ☐
 

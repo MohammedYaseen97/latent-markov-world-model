@@ -464,16 +464,15 @@ def score_traces(traces: list[Trace], answer: str) -> None:
 
 def compute_grpo_advantages(
     rewards: list[float],
-    adv_clip: float = 5.0,
+    adv_clip: float = 20.0,
 ) -> list[float]:
     """Normalize a group of rewards into GRPO advantages: clip((R-mean)/std, ±adv_clip).
 
     If all rewards are identical (std == 0), advantages are all 0 — no gradient
     signal, which is correct (the group provides no discriminating information).
 
-    The clip is critical on the hard pool: 1-of-G correct gives a raw normalised
-    advantage of ~11, producing large RL gradients that destabilise training.
-    Clipping to ±5 is inert at normal reward rates but caps the worst-case spike.
+    With G=128 the maximum natural advantage is sqrt(G-1) ≈ 11.3 (at k=1 correct).
+    adv_clip=20 is a numerical safety ceiling only — inert in all practical cases.
     """
     import statistics
     mean = sum(rewards) / len(rewards)

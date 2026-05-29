@@ -20,7 +20,7 @@
 # v2 design:
 #   - Deterministic encoder: z_h = μ_h always. No sampling, no logvar.
 #   - Phase 0: L_trans + L_out only (400 steps, frozen backbone)
-#   - Phase 1: pure L_RL (adv_clip=5.0, grad_clip=1.0, matches baseline GRPO)
+#   - Phase 1: pure L_RL (adv_clip=20.0, grad_clip=1.0, matches baseline GRPO)
 #   - Benchmark: MATH Level 5 hard pool (~350 problems), metric: pass@128
 #
 # Inherits shared training knobs (lr, G, backbone, dtype) from
@@ -150,10 +150,12 @@ training:
 
 # Phase 1: pure L_RL. Markov structure is enforced architecturally (each chunk sees
 # only [z_h ‖ chunk_{h+1}], never raw token history), so no auxiliary losses are needed.
-# adv_clip: bounds normalised GRPO advantages to ±5 (caps worst-case RL update on sparse rewards).
+# adv_clip: numerical safety ceiling. With G=128, the maximum natural advantage is
+#   sqrt(G-1) ≈ 11.3 (at k=1 correct rollout). A clip at 20 is inert in all
+#   practical cases — it only guards against numerical pathologies.
 # grad_clip: single global clip (max_norm=1.0), matching baseline GRPO.
 phase1_loss:
-  adv_clip: 5.0
+  adv_clip: 20.0
   grad_clip: 1.0
 
 # ---------------------------------------------------------------------------

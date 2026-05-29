@@ -140,7 +140,7 @@ with a frozen backbone. Phase 1 runs joint RL with all components live.
   │                                                                            │
   │  Same 3-chunk loop as Phase 0.  G=128 rollouts per problem.                │
   │  Store per rollout: chunk_ids, reward.  (No repr_h, z_h, or log_π_old.)    │
-  │  Compute GRPO advantages from group rewards (clipped to ±5).               │
+  │  Compute GRPO advantages from group rewards (safety-clipped to ±20).      │
   │                                                                            │
   └────────────────────────────────────────────────────────────────────────────┘
 
@@ -155,7 +155,7 @@ with a frozen backbone. Phase 1 runs joint RL with all components live.
   │  │  PHASE 1 LOSS                                                       │   │
   │  │                                                                     │   │
   │  │  L_RL  = −adv · log_π_current               [GRPO; IS = 1]          │   │
-  │  │  adv clipped to ±5 before applying                                  │   │
+  │  │  adv safety-clipped to ±20 (inert in practice; max natural ≈ 11.3)  │   │
   │  └─────────────────────────────────────────────────────────────────────┘   │
   │                                                                            │
   │  ┌─────────────────────────────────────────────────────────────────────┐   │
@@ -403,7 +403,7 @@ dominates the gradient budget.
 ```
 L_RL  =  GRPO policy gradient
       =  -advantage × log_π_current   [IS = 1; same policy as rollout]
-      Advantages normalised per group (G=128), clipped to ±5.
+      Advantages normalised per group (G=128), safety-clipped to ±20.
       With G=128, expected ≥1 correct rollout per step whenever per-sample success > 0.8%.
 ```
 
@@ -423,7 +423,7 @@ uses z prefix injection between chunks, (c) each step processes a 3-chunk pipeli
 
 **On-policy GRPO loop (200 steps):** every single training step is:
 1. `[no_grad]` collect G=128 fresh rollouts for the current batch of 4 problems → 512 sequences
-2. Grade all 512, compute GRPO advantages from normalised group rewards per problem, clip to ±5
+2. Grade all 512, compute GRPO advantages from normalised group rewards per problem (safety clip ±20)
 3. `[with_grad]` re-run full 3-chunk pipeline for all 512 sequences → live log_π, repr_h, z_h
    (micro-batched to fit memory; math equivalent to full-batch update)
 4. Compute L_RL, backward, single global grad clip (max_norm=1.0), step optimiser
@@ -495,7 +495,7 @@ the E1 diagnostic.
 | R6.1 — GRPO hyperparameters locked         | inherited from train_baseline_grpo.yaml via extends            |
 | R6.2 — reward unchanged                    | binary correctness, same math_reward function                  |
 | R6.3 — total loss (Phase 1)                | L_RL only                                                       |
-| R6.4 — hyperparameters documented          | λ_t schedule above; adv_clip=5.0, grad_clip=1.0               |
+| R6.4 — hyperparameters documented          | λ_t schedule above; adv_clip=20.0, grad_clip=1.0              |
 | R6.5 — no NaN blowups when reward=0        | L_transition + L_out keep gradients finite in Phase 0          |
 | R7.1–R7.5 — fairness                       | same checkpoint, pool, reward, budget, token limit as all arms |
 
@@ -528,7 +528,7 @@ the E1 diagnostic.
 | Phase 1 G (rollouts per problem) | 128                                        | locked; matches eval pass@128 scale                          |
 | Phase 1 lr                       | 1e-6                                       | locked (all arms)                                            |
 | Phase 1 loss                     | L_RL only (no L_trans, no L_out)           | pure GRPO; matches baseline optimisation structure           |
-| Phase 1 adv_clip                 | ±5.0                                       | advantage clipping; equivalent to ratio-clip at IS=1         |
+| Phase 1 adv_clip                 | 20.0                                       | numerical safety ceiling; inert in practice (max natural adv ≈ 11.3 at G=128) |
 | Phase 1 grad_clip                | 1.0 (global)                               | matches baseline GRPO default                                |
 | Benchmark                        | MATH Level 5 hard pool, ~350 problems      | pass@128=0 filter on pretrained model                        |
 | Primary metric                   | pass@128                                   | 8× cheaper than pass@1024; more problems compensates         |
@@ -580,7 +580,7 @@ Ordered by dependency. Each step is a gate for the next.
 | 4   | `OutcomeHead` — 2-layer MLP on z_final, raw logit (no sigmoid), Phase 0 only                                   | `src/models/vae_state_encoder.py`      | ✅      |
 | 5   | `ZInjector` — near-zero init (std=0.01)                                                                        | `src/models/vae_state_encoder.py`      | ✅      |
 | 6   | `pretrain_vae_online()` — Phase 0: L_trans + L_out; 400 steps; pre-shuffled assignment; strict Markov repr     | `src/training/grpo_latent.py`          | ✅      |
-| 7   | `train_latent()` — Phase 1 custom GRPO loop; pure L_RL; adv_clip=5.0; single grad_clip=1.0                    | `src/training/grpo_latent.py`          | ✅      |
+| 7   | `train_latent()` — Phase 1 custom GRPO loop; pure L_RL; adv_clip=20.0; single grad_clip=1.0                   | `src/training/grpo_latent.py`          | ✅      |
 | 8   | `generate_latent_traces()` — chunked inference engine with z injection; stores chunk_ids + reward only         | `src/training/grpo_latent.py`          | ✅      |
 | 9   | Smoke config                                                                                                    | `configs/train_latent_grpo_smoke.yaml` | ✅      |
 | 10  | Full config (Phase 0: 400 steps; Phase 1: 200 steps, L_RL only)                                                | `configs/train_latent_grpo.yaml`       | ✅      |
@@ -663,7 +663,7 @@ baseline → covered by the core ablation table; no separate script needed.
 | Smoke test                                     | completes end-to-end < 10 min on 4060                                                |
 | NFR6 gate                                      | structured UMAP manifold with outcome correlation                                    |
 | Controlled baseline (`latent_grpo_pretrained`) | pass@128 ≥ baseline_pretrained pass@128                                              |
-| Phase 1 logs                                   | L_RL non-zero within first 30 steps; adv_clip=5.0, grad_clip=1.0 confirmed in log   |
+| Phase 1 logs                                   | L_RL non-zero within first 30 steps; adv_clip=20.0, grad_clip=1.0 confirmed in log  |
 | `latent_grpo` pass@128                         | ≥ baseline_grpo pass@128 + 3pp                                                       |
 | **E1**                                         | held-out L_trans < 0.5                                                               |
 | No NaN blowups                                 | L_RL non-zero throughout Phase 1 (R6.5)                                              |

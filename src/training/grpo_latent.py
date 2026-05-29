@@ -19,7 +19,7 @@ Phase 1 — Joint RL Training (pure L_RL)
 Backbone UNFROZEN. Encoder + ZInjector loaded from Phase 0 checkpoint.
 On-policy GRPO loop (200 steps): every step =
   1. [no_grad] collect G=128 fresh rollouts → chunk_ids + reward
-  2. compute GRPO advantages per-problem-group (clipped to ±adv_clip)
+  2. compute GRPO advantages per-problem-group (safety ceiling ±adv_clip=20, inert in practice)
   3. [with_grad] re-run full 3-chunk pipeline → live repr_h, z_h, log_π
   4. loss: L_RL only
   5. single global grad clip (max_norm=1.0), step all optimizers
@@ -83,25 +83,25 @@ def compute_grpo_advantages(
     rewards: list[float],
     group_size: int,
     eps: float = 1e-8,
-    adv_clip: float = 5.0,
+    adv_clip: float = 20.0,
 ) -> list[float]:
     """Normalise rewards into GRPO advantages within each group of G rollouts.
 
     For each group of `group_size` consecutive rollouts belonging to the same
     problem:  A_i = clip((r_i − μ_group) / (σ_group + eps), -adv_clip, adv_clip)
 
-    The clip is critical on the hard pool where sparse rewards (e.g. 1-of-128
-    correct) produce raw normalised advantages of ~11. Without clipping, a single
-    lucky step causes a proportionally large backbone gradient and an l_trans
-    spike. Clipping to ±5 has no effect at normal reward rates (~25%), but caps
-    the worst-case RL gradient at ~5× instead of ~11×.
+    With G=128 the maximum natural advantage is sqrt(G-1) ≈ 11.3 (at k=1 correct
+    rollout). adv_clip=20 is therefore inert in all practical cases — it only
+    guards against numerical pathologies. Setting it below ~11.3 would break the
+    zero-sum property of GRPO advantages and introduce a systematic negative bias
+    at sparse reward rates.
 
     Args:
         rewards:    flat list of scalar rewards, length = n_problems × group_size.
                     Rollouts for the same problem must be contiguous.
         group_size: G — number of rollouts per problem.
         eps:        numerical stability floor for the std.
-        adv_clip:   symmetric clip range for normalised advantages. Default 5.0.
+        adv_clip:   safety ceiling for normalised advantages. Default 20.0.
 
     Returns:
         List of advantages, same length and ordering as `rewards`.
@@ -1035,7 +1035,7 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     # Single global grad clip — no competing objectives in Phase 1, so no need
     # to protect individual parameter groups from each other.
     grad_clip = float(phase1_cfg.get("grad_clip", 1.0))
-    adv_clip  = float(phase1_cfg.get("adv_clip",  5.0))
+    adv_clip  = float(phase1_cfg.get("adv_clip",  20.0))
 
     chunk_tokens = int(latent_cfg.get("chunk_tokens",  341))
     latent_dim   = int(latent_cfg.get("latent_dim",  LATENT_DIM))

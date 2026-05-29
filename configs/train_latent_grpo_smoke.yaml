@@ -78,5 +78,5 @@ evaluation:
   path: "data/math_level5_hard_pool.jsonl"
 
 phase1_loss:
-  adv_clip: 5.0
+  adv_clip: 20.0
   grad_clip: 1.0
