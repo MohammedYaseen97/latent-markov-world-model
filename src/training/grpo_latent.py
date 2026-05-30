@@ -158,13 +158,7 @@ def _setup_compile(
 
     encoder is optional — pass None for arms that have no latent encoder
     (e.g. baseline, token_markov).
-
-    No-ops silently on CPU — reduce-overhead mode requires CUDA cudagraph trees.
     """
-    if not torch.cuda.is_available():
-        logger.info("  torch.compile skipped (no CUDA device)")
-        return
-
     transformer, lm_head = _get_transformer_and_head(model)
     try:
         # Patch in-place so all callers (including model.generate) see compiled versions
@@ -402,7 +396,7 @@ def _distill_loss(
     del hidden1
 
     z_1      = encoder.encode(repr_1)
-    prefix_1 = encoder.inject(z_1.to(dtype))     # [B, 1, H]
+    prefix_1 = encoder.inject(z_1)
 
     # ── Chunk 2: [prefix_1 | teacher_chunk2] → CE loss + repr_2 ──────────────
     max_c2 = max(c2_lens)
@@ -430,7 +424,7 @@ def _distill_loss(
     del hidden2
 
     z_2      = encoder.encode(repr_2)
-    prefix_2 = encoder.inject(z_2.to(dtype))             # [B, 1, H]
+    prefix_2 = encoder.inject(z_2)
 
     # ── Chunk 3: [prefix_2 | teacher_chunk3] → CE loss ───────────────────────
     max_c3 = max(c3_lens)
