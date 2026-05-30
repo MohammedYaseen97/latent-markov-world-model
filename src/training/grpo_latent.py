@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random as _random
 from pathlib import Path
 from typing import Any
@@ -460,7 +461,11 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
     Config keys consumed (under "phase0"):
         pool_path          — data/math_easy_pool.jsonl
         n_steps            — training steps (default: 400)
-        batch_size         — problems per step (default: 64)
+        batch_size         — problems per student gradient step (default: 64)
+        gen_batch_size     — problems per teacher generate call (default: batch_size).
+                             Set higher (e.g. 512) to fill KV-cache VRAM and reduce
+                             generate call overhead without changing gradient batch size.
+                             Will be rounded down to nearest multiple of batch_size.
         lr_backbone        — backbone learning rate (default: 1e-6)
         lr_encoder         — encoder/injector learning rate (default: 1e-4)
         temperature        — teacher generation temperature (default: 1.0)
@@ -483,6 +488,12 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
 
     n_steps      = int(phase0_cfg.get("n_steps",         400))
     batch_size   = int(phase0_cfg.get("batch_size",       64))
+    # gen_batch_size: how many problems to feed the teacher per generate call.
+    # Independent of training batch_size — larger values fill VRAM with KV cache
+    # and amortise Python/CUDA sync overhead across fewer calls.
+    # Must be a multiple of batch_size; defaults to batch_size (no change).
+    _gen_bs_raw  = int(phase0_cfg.get("gen_batch_size", batch_size))
+    gen_batch_size = max(batch_size, (_gen_bs_raw // batch_size) * batch_size)
     lr_backbone  = float(phase0_cfg.get("lr_backbone",    1e-6))
     lr_encoder   = float(phase0_cfg.get("lr_encoder",     1e-4))
     temperature  = float(phase0_cfg.get("temperature",    1.0))
@@ -498,10 +509,31 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Phase 0 (distill) — device: %s  batch=%d  lr_bb=%.1e  lr_enc=%.1e",
-                device, batch_size, lr_backbone, lr_encoder)
+    logger.info(
+        "Phase 0 (distill) — device: %s  train_batch=%d  gen_batch=%d  lr_bb=%.1e  lr_enc=%.1e",
+        device, batch_size, gen_batch_size, lr_backbone, lr_encoder,
+    )
+
+    # Tokenizer is shared by teacher and student — load once here.
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, revision=revision, trust_remote_code=True, padding_side="left",
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # ── Problem pool ──────────────────────────────────────────────────────────
+    with open(pool_path, encoding="utf-8") as f:
+        problems = [json.loads(line) for line in f if line.strip()]
+    logger.info("Phase 0 pool: %d problems from %s", len(problems), pool_path)
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "resolved_config.json").write_text(json.dumps(config, indent=2))
 
     # ── Load teacher (frozen original backbone) ────────────────────────────────
+    # Student, encoder, and optimizer are intentionally NOT loaded yet — they
+    # would occupy ~15 GB (weights + fp32 AdamW states) of VRAM for nothing
+    # during teacher generation.  They are initialised only after the teacher
+    # is deleted below.
     logger.info("Loading teacher %s @ %s ...", model_id, revision)
     teacher = AutoModelForCausalLM.from_pretrained(
         model_id, revision=revision,
@@ -514,7 +546,53 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
     _setup_compile(teacher)
     logger.info("  teacher loaded, frozen and compiled")
 
+    # ── Pre-generate ALL teacher outputs ──────────────────────────────────────
+    # Teacher generates in large batches of gen_batch_size (≥ batch_size) to
+    # maximise KV-cache GPU utilisation and minimise Python/CUDA overhead per
+    # call.  Each large batch is then split into batch_size sub-batches for the
+    # student training loop.  Chunks are stored as CPU tensors so buffering all
+    # steps costs only ~120 MB of system RAM.  After pre-generation the teacher
+    # is deleted, freeing its ~3 GB of VRAM for student training.
+    gen_per_train = gen_batch_size // batch_size   # training batches per gen call
+    n_gen_calls   = math.ceil(n_steps / gen_per_train)
+
+    pool_order: list[int] = []
+    batches: list[tuple[list[dict], list]] = []
+
+    logger.info(
+        "Pre-generating teacher chunks: %d gen calls × batch=%d → %d training batches of %d",
+        n_gen_calls, gen_batch_size, n_steps, batch_size,
+    )
+    gen_bar = tqdm(total=n_gen_calls, desc="teacher_gen", unit="gen-batch", dynamic_ncols=True)
+    for _ in range(n_gen_calls):
+        if len(batches) >= n_steps:
+            break
+        while len(pool_order) < gen_batch_size:
+            order = list(range(len(problems)))
+            _random.shuffle(order)
+            pool_order.extend(order)
+        gen_problems = [problems[pool_order.pop(0)] for _ in range(gen_batch_size)]
+        gen_chunks   = _generate_teacher_chunks(
+            teacher, tokenizer, gen_problems,
+            chunk_tokens=chunk_tokens,
+            temperature=temperature, top_p=top_p, device=device,
+        )
+        for j in range(0, gen_batch_size, batch_size):
+            if len(batches) < n_steps:
+                batches.append((gen_problems[j:j + batch_size], gen_chunks[j:j + batch_size]))
+        gen_bar.update(1)
+    gen_bar.close()
+
+    del teacher
+    torch.cuda.empty_cache()
+    logger.info(
+        "Teacher done — %d training batches cached on CPU (gen_batch=%d).  Teacher VRAM freed.",
+        len(batches), gen_batch_size,
+    )
+
     # ── Load student backbone (trainable, low lr) ─────────────────────────────
+    # Loaded here — after teacher is gone — so student weights (~3 GB) and
+    # fp32 AdamW moments (~12 GB) never share VRAM with the teacher.
     logger.info("Loading student backbone %s @ %s ...", model_id, revision)
     student = AutoModelForCausalLM.from_pretrained(
         model_id, revision=revision,
@@ -522,12 +600,6 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
         attn_implementation=attn_impl,
     )
     student.train()
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id, revision=revision, trust_remote_code=True, padding_side="left",
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
     logger.info("  student backbone loaded")
 
     if training_cfg.get("gradient_checkpointing", False):
@@ -542,54 +614,21 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
     logger.info("  encoder initialised (%.2fM params)",
                 sum(p.numel() for p in encoder.parameters()) / 1e6)
 
-    # ── torch.compile (skip for smoke profiles — overhead exceeds benefit) ─────
+    # ── torch.compile ─────────────────────────────────────────────────────────
     if config.get("experiment", {}).get("profile") != "smoke":
         _setup_compile(student, encoder)
 
     # ── Optimiser — two param groups, fused CUDA kernel ───────────────────────
+    # AdamW with fused=True stores exp_avg and exp_avg_sq in fp32 regardless of
+    # parameter dtype.  This is intentional: Adam's running second moments
+    # accumulate squared gradients over thousands of steps and bf16's limited
+    # dynamic range causes underflow.  The fp32 overhead (~12 GB for 1.5B
+    # params) is acceptable and never overlaps with teacher VRAM.
     _fused = {"fused": True} if torch.cuda.is_available() else {}
     optimizer = torch.optim.AdamW([
         {"params": student.parameters(), "lr": lr_backbone},
         {"params": encoder.parameters(), "lr": lr_encoder},
     ], **_fused)
-
-    # ── Problem pool ──────────────────────────────────────────────────────────
-    with open(pool_path, encoding="utf-8") as f:
-        problems = [json.loads(line) for line in f if line.strip()]
-    logger.info("Phase 0 pool: %d problems from %s", len(problems), pool_path)
-
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "resolved_config.json").write_text(json.dumps(config, indent=2))
-
-    # ── Pre-generate ALL teacher outputs ──────────────────────────────────────
-    # Teacher runs uninterrupted over the full epoch before student training
-    # starts.  Chunks are returned as CPU tensors by _generate_teacher_chunks,
-    # so buffering all 400 batches costs ~120 MB of system RAM — negligible.
-    # After pre-generation the teacher is deleted, freeing ~3 GB of VRAM for
-    # the student training phase.
-    pool_order: list[int] = []
-    batches: list[tuple[list[dict], list]] = []
-
-    logger.info("Pre-generating teacher chunks for %d steps (batch=%d) …", n_steps, batch_size)
-    gen_bar = tqdm(total=n_steps, desc="teacher_gen", unit="step", dynamic_ncols=True)
-    for _ in range(n_steps):
-        while len(pool_order) < batch_size:
-            order = list(range(len(problems)))
-            _random.shuffle(order)
-            pool_order.extend(order)
-        step_problems = [problems[pool_order.pop(0)] for _ in range(batch_size)]
-        teacher_chunks = _generate_teacher_chunks(
-            teacher, tokenizer, step_problems,
-            chunk_tokens=chunk_tokens,
-            temperature=temperature, top_p=top_p, device=device,
-        )
-        batches.append((step_problems, teacher_chunks))
-        gen_bar.update(1)
-    gen_bar.close()
-
-    del teacher
-    torch.cuda.empty_cache()
-    logger.info("Teacher done — %d batches cached on CPU.  Teacher VRAM freed.", n_steps)
 
     # ── Student training ───────────────────────────────────────────────────────
     log_history: list[dict] = []
