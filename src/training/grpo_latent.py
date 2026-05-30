@@ -227,10 +227,10 @@ def _last_token_repr(
         last_positions: [B] int tensor — 0-indexed position of last real token
 
     Returns:
-        repr_h: [B, hidden_dim]  fp32
+        repr_h: [B, hidden_dim]  — same dtype as hidden
     """
     B = hidden.shape[0]
-    return hidden[torch.arange(B, device=hidden.device), last_positions, :].float()
+    return hidden[torch.arange(B, device=hidden.device), last_positions, :]
 
 
 # ── Phase 0: teacher-forced distillation pretraining ──────────────────────────
