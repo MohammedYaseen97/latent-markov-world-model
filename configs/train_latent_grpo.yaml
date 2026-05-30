@@ -11,10 +11,8 @@
 #   Pure L_RL. 200 steps × 4 problems × 128 rollouts = 102 400 traces.
 #
 # VRAM budget (96 GB):
-#   Phase 0 teacher gen: teacher (3 GB) + student (3 GB) + AdamW (12 GB)
-#     + KV cache gen_batch=512 × seq~1323 tok (~19 GB) ≈ 44 GB.
-#   Phase 0 student train: teacher freed (~3 GB back) + logits batch=64 (~6.6 GB)
-#     + activations (~3.8 GB) ≈ 28 GB — very comfortable.
+#   Phase 0: teacher (3 GB frozen) + student (3 GB) + AdamW moments (12 GB)
+#     + activations for batch=64 × 3 chunks (~21 GB) ≈ 39 GB — very comfortable.
 #   Phase 1 rollout: model (3 GB) + KV cache for 512 seqs × ~542 tok ≈ 32 GB total.
 #   Phase 1 train:   model (3 GB) + AdamW (15 GB) + logits/activations for
 #     micro_batch=128 × 3 chunks ≈ 40 GB → 58 GB total.
@@ -66,12 +64,7 @@ phase0:
   pool_path: "data/math_easy_pool.jsonl"       # L1–L4 only
 
   n_steps: 400
-  batch_size: 64             # problems per student gradient step (gradient dynamics)
-  # gen_batch_size: teacher generate call batch.  Must be a multiple of batch_size.
-  # Larger values fill the spare KV-cache VRAM and reduce Python/CUDA overhead
-  # per call.  512 → ~44 GB peak during teacher gen (fits in 96 GB comfortably).
-  # Reduces teacher_gen calls from 400 → 50 (8× fewer calls, ~4–6× wall-clock speedup).
-  gen_batch_size: 512
+  batch_size: 64             # problems per step; each generates 3 teacher chunks
 
   # Learning rates (two param groups)
   lr_backbone: 1.0e-6        # backbone: low — learns to use z without forgetting
