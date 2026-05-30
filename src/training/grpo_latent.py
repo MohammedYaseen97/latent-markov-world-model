@@ -1,38 +1,26 @@
-"""Latent Markov GRPO — v2 design: online Phase 0 + on-policy Phase 1.
+"""Latent Markov GRPO v3 — teacher-forced Phase 0 + strict Markov Phase 1.
 
 Design reference: reports/latent_markov_design.md
 
-Architecture: deterministic encoder. z_h = μ_h always. No sampling, no logvar.
+Phase 0 — Teacher-Forced Distillation Pretraining
+───────────────────────────────────────────────────
+Teacher: original frozen Qwen, full context per chunk.
+Student: backbone (low lr) + encoder + injector (higher lr).
+Loss: CE(student_logits, teacher_tokens) on chunks 2 and 3.
+Context: strict Markov — student sees [z_prefix | teacher_chunk_h], never raw prior chunks.
+No reward needed. Dense token-level signal every step.
 
-Phase 0 — Online Encoder Pretraining
+Phase 1 — On-Policy GRPO (pure L_RL)
 ──────────────────────────────────────
-Backbone FROZEN for weight updates; gradients still pass through activations.
-Encoder + ZInjector + OutcomeHead optimised jointly.
-Each step:
-  1. [no_grad] generate G=128 rollouts per problem → chunk_ids + reward
-  2. [with_grad] re-run full 3-chunk pipeline → live repr_h, z_h (= μ_h)
-  3. losses: λ_trans × L_trans + λ_out × L_out
-  4. step Encoder+ZInjector+OutcomeHead optimizer; backbone grads zeroed, NOT stepped.
-
-Phase 1 — Joint RL Training (pure L_RL)
-─────────────────────────────────────────
-Backbone UNFROZEN. Encoder + ZInjector loaded from Phase 0 checkpoint.
-On-policy GRPO loop (200 steps): every step =
-  1. [no_grad] collect G=128 fresh rollouts → chunk_ids + reward
-  2. compute GRPO advantages per-problem-group (safety ceiling ±adv_clip=20, inert in practice)
-  3. [with_grad] re-run full 3-chunk pipeline → live repr_h, z_h, log_π
-  4. loss: L_RL only
-  5. single global grad clip (max_norm=1.0), step all optimizers
-
-G=128 matches eval pass@128 scale. IS = 1 exactly. z_h = μ_h (deterministic).
-
-See reports/latent_markov_design.md for full design rationale.
+Strict Markov generation: [z_prefix | generate], no crutch.
+Generation and training forward pass use identical context — IS = 1 exactly.
+Loss: L_RL = -advantage × log_π (GRPO; G=128 per problem).
+Backbone + encoder + injector all receive gradient via live repr_h graph.
 """
 from __future__ import annotations
 
 import json
 import logging
-import math
 import random as _random
 from pathlib import Path
 from typing import Any
@@ -40,44 +28,27 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.models.vae_state_encoder import (
-    HIDDEN_DIM,
-    LATENT_DIM,
-    N_CHUNKS,
-    OutcomeHead,
-    VAEStateEncoder,
-    ZInjector,
-)
+from src.models.vae_state_encoder import HIDDEN_DIM, LATENT_DIM, LatentStateEncoder
 from src.training.grpo_baseline import SYSTEM_PROMPT, answers_equivalent, extract_answer
 
 logger = logging.getLogger(__name__)
 
+# ── Global CUDA performance flags ─────────────────────────────────────────────
+# TF32: fp32 matmuls use tensor-core acceleration (Ampere+).
+# bf16 reduction: faster reductions with negligible precision impact.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32       = True
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+torch.set_float32_matmul_precision("high")
 
-# ---------------------------------------------------------------------------
-# Helpers — unchanged from v2
-# ---------------------------------------------------------------------------
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-def lambda_trans_schedule(
-    step: int, max_steps: int = 400, floor: float = 0.1, peak: float = 3.0
-) -> float:
-    """Return the transition loss weight λ_t for the current training step.
+N_CHUNKS = 3  # fixed; 3 chunks × 341 tokens = 1023 ≈ 1024 token budget
 
-    Schedule: linear warmup floor → peak over steps 0 … max_steps//2,
-    then constant at peak.
 
-    Phase 0 default (max_steps=400, peak=3.0): aggressive Markov training.
-    Phase 1 default (peak=0.3): maintenance only — transition already well-trained.
-
-    Both phases share this schedule; peak is overridable via config.
-    """
-    halfway = max_steps // 2
-    if step >= halfway:
-        return peak
-    return floor + (peak - floor) * (step / halfway)
-
+# ── GRPO utilities ─────────────────────────────────────────────────────────────
 
 def compute_grpo_advantages(
     rewards: list[float],
@@ -87,24 +58,10 @@ def compute_grpo_advantages(
 ) -> list[float]:
     """Normalise rewards into GRPO advantages within each group of G rollouts.
 
-    For each group of `group_size` consecutive rollouts belonging to the same
-    problem:  A_i = clip((r_i − μ_group) / (σ_group + eps), -adv_clip, adv_clip)
+    A_i = clip((r_i − μ_group) / (σ_group + eps), -adv_clip, adv_clip)
 
-    With G=128 the maximum natural advantage is sqrt(G-1) ≈ 11.3 (at k=1 correct
-    rollout). adv_clip=20 is therefore inert in all practical cases — it only
-    guards against numerical pathologies. Setting it below ~11.3 would break the
-    zero-sum property of GRPO advantages and introduce a systematic negative bias
-    at sparse reward rates.
-
-    Args:
-        rewards:    flat list of scalar rewards, length = n_problems × group_size.
-                    Rollouts for the same problem must be contiguous.
-        group_size: G — number of rollouts per problem.
-        eps:        numerical stability floor for the std.
-        adv_clip:   safety ceiling for normalised advantages. Default 20.0.
-
-    Returns:
-        List of advantages, same length and ordering as `rewards`.
+    With G=128, max natural advantage ≈ 11.3 (k=1 correct rollout).
+    adv_clip=20 is inert in practice — guards against numerical pathologies only.
     """
     assert len(rewards) % group_size == 0, (
         f"len(rewards)={len(rewards)} not divisible by group_size={group_size}"
@@ -132,156 +89,579 @@ def format_prompt(problem: dict, tokenizer: AutoTokenizer) -> list[int]:
     return tokenizer(text, return_tensors="pt").input_ids[0].tolist()
 
 
-# ---------------------------------------------------------------------------
-# Backbone forward helper — hook-based last-hidden extraction
-# ---------------------------------------------------------------------------
+# ── Backbone forward helpers ───────────────────────────────────────────────────
 
-class _HiddenCapture:
-    """Forward hook that captures the final layer-norm output.
+def _get_transformer_and_head(
+    model: AutoModelForCausalLM,
+) -> tuple[torch.nn.Module, torch.nn.Module]:
+    """Return (base_transformer, lm_head) for both PEFT and non-PEFT models.
 
-    Registered on model.model.norm so that only the last layer's hidden states
-    are held as a tensor reference — avoids materialising all 28 intermediate
-    layers' activations via output_hidden_states=True.
+    Non-PEFT:  model.model = Qwen2Model,           model.lm_head = Linear
+    PEFT:      model.model = Qwen2ForCausalLM,     model.model.model = Qwen2Model
+               model.model.lm_head = Linear
+
+    Detected by whether model.model itself has an lm_head attribute.
     """
-    __slots__ = ("val",)
-
-    def __init__(self) -> None:
-        self.val: torch.Tensor | None = None
-
-    def __call__(self, module: Any, inp: Any, out: torch.Tensor) -> None:  # noqa: ARG002
-        self.val = out
+    inner = model.model
+    if hasattr(inner, "lm_head"):
+        # PEFT: inner is the base CausalLM; go one level deeper for the transformer
+        return inner.model, inner.lm_head
+    return inner, model.lm_head
 
 
-def _fwd_with_hidden(
+def _fwd(
     model: AutoModelForCausalLM,
     *,
     input_ids: torch.Tensor | None = None,
     inputs_embeds: torch.Tensor | None = None,
     attention_mask: torch.Tensor | None = None,
-    need_logits: bool = True,
+    bypass_lm_head: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
-    """Model forward that returns (logits | None, last_hidden_states).
+    """Hook-free backbone forward returning (logits | None, last_hidden_states).
 
-    When need_logits=False (Phase 0 — no L_RL), calls model.model(...) directly,
-    completely bypassing lm_head.  For B=128 seqs × vocab=151,936 this skips a
-    ~26 GB peak allocation per chunk (3 chunks → ~79 GB saved over one step).
+    Calls the base transformer directly then optionally applies lm_head.
+    No Python-level hooks — fully compatible with torch.compile.
 
-    When need_logits=True (Phase 1 — L_RL needs log π), uses a hook on the final
-    layer norm to capture hidden states while the full model forward runs.
-
-    Handles PEFT wrapping (hook path only):
-      Non-PEFT: model.model → Qwen2Model          → .norm
-      PEFT:     model.model → Qwen2ForCausalLM    → .model.norm
+    When bypass_lm_head=True: skips lm_head entirely.
+    Saves [B × seq × vocab × 2 bytes] per call — critical for chunk-1 forward
+    in Phase 0 where no CE loss is needed (~10 GB at B=64).
 
     Returns:
-        logits:      (B, seq_len, vocab_size)  or None when need_logits=False
-        last_hidden: (B, seq_len, hidden_dim)  — output of final layer norm
+        logits:      [B, seq, vocab]  or  None when bypassed
+        last_hidden: [B, seq, hidden_dim]
     """
-    if not need_logits:
-        # Call the base transformer directly — lm_head is never invoked.
-        # model.model is Qwen2Model which returns last_hidden_state directly.
-        out = model.model(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-        )
-        return None, out.last_hidden_state
+    transformer, lm_head = _get_transformer_and_head(model)
+    out         = transformer(
+        input_ids=input_ids,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+    )
+    last_hidden = out.last_hidden_state
+    if bypass_lm_head:
+        return None, last_hidden
+    return lm_head(last_hidden), last_hidden
 
-    cap = _HiddenCapture()
-    inner = model.model
-    if hasattr(inner, "norm"):
-        norm_layer = inner.norm                      # plain Qwen2Model
-    elif hasattr(inner, "model") and hasattr(inner.model, "norm"):
-        norm_layer = inner.model.norm                # PEFT: LoRA-wrapped Qwen2ForCausalLM
-    else:
-        raise AttributeError(
-            f"Cannot locate final layer norm. model.model is {type(inner).__name__}. "
-            "Expected Qwen2Model (norm) or Qwen2ForCausalLM (model.norm)."
-        )
-    handle = norm_layer.register_forward_hook(cap)
+
+def _setup_compile(
+    model: AutoModelForCausalLM,
+    encoder: LatentStateEncoder | None = None,
+) -> None:
+    """Apply torch.compile to the backbone transformer, lm_head, and optionally encoder.
+
+    Compiles the sub-modules that are called in the hot path (every forward step
+    and every generation decode step). Uses dynamic=True so variable sequence
+    lengths don't trigger recompilation.
+
+    model.generate() benefits automatically: HF's generate() calls self.model()
+    and self.lm_head() internally — since we replace those with compiled versions
+    on the model object, every decode step goes through compiled kernels.
+
+    encoder is optional — pass None for arms that have no latent encoder
+    (e.g. baseline, token_markov).
+    """
+    transformer, lm_head = _get_transformer_and_head(model)
     try:
-        out = model(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+        # Patch in-place so all callers (including model.generate) see compiled versions
+        inner = model.model
+        if hasattr(inner, "lm_head"):
+            inner.model   = torch.compile(transformer, dynamic=True, mode="reduce-overhead")
+            inner.lm_head = torch.compile(lm_head,    dynamic=True, mode="reduce-overhead")
+        else:
+            model.model   = torch.compile(transformer, dynamic=True, mode="reduce-overhead")
+            model.lm_head = torch.compile(lm_head,    dynamic=True, mode="reduce-overhead")
+
+        if encoder is not None:
+            encoder.encoder  = torch.compile(encoder.encoder,  dynamic=True, mode="reduce-overhead")
+            encoder.injector = torch.compile(encoder.injector, dynamic=True, mode="reduce-overhead")
+
+        logger.info("  torch.compile applied (reduce-overhead, dynamic=True)")
+    except Exception as exc:
+        logger.warning("  torch.compile not applied (falling back to eager): %s", exc)
+
+
+def _build_prefix_embeds(
+    embed_layer: torch.nn.Embedding,
+    z_prefix: torch.Tensor,
+    chunk_ids_list: list[torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    """Build inputs_embeds = [z_prefix | chunk_tokens], right-padded.
+
+    Args:
+        embed_layer:    model.get_input_embeddings()
+        z_prefix:       [B, 1, hidden_dim]
+        chunk_ids_list: list of B CPU tensors (variable length)
+
+    Returns:
+        inputs_embeds:  [B, 1 + max_len, hidden_dim]
+        attention_mask: [B, 1 + max_len]
+        chunk_lens:     list of int — actual lengths of each chunk
+    """
+    B        = z_prefix.shape[0]
+    chunk_lens = [c.shape[0] for c in chunk_ids_list]
+    max_len  = max(chunk_lens)
+    H        = z_prefix.shape[-1]
+
+    ie = torch.zeros(B, 1 + max_len, H, dtype=dtype, device=device)
+    am = torch.zeros(B, 1 + max_len, dtype=torch.long, device=device)
+
+    ie[:, 0, :] = z_prefix[:, 0, :].to(dtype)
+    am[:, 0]    = 1
+
+    for i, (cids, L) in enumerate(zip(chunk_ids_list, chunk_lens)):
+        ie[i, 1:1 + L, :] = embed_layer(cids.to(device))
+        am[i, 1:1 + L]    = 1
+
+    return ie, am, chunk_lens
+
+
+def _last_token_repr(
+    hidden: torch.Tensor,
+    last_positions: torch.Tensor,
+) -> torch.Tensor:
+    """Extract the hidden state at the last real token for each sequence.
+
+    Args:
+        hidden:         [B, seq_len, hidden_dim]
+        last_positions: [B] int tensor — 0-indexed position of last real token
+
+    Returns:
+        repr_h: [B, hidden_dim]  fp32
+    """
+    B = hidden.shape[0]
+    return hidden[torch.arange(B, device=hidden.device), last_positions, :].float()
+
+
+# ── Phase 0: teacher-forced distillation pretraining ──────────────────────────
+
+@torch.no_grad()
+def _generate_teacher_chunks(
+    teacher: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    problems: list[dict],
+    chunk_tokens: int,
+    temperature: float,
+    top_p: float,
+    device: torch.device,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Teacher generates 3 chunks per problem with full context.
+
+    The teacher is the original frozen Qwen with access to all prior tokens:
+        chunk1: generate([sys_prompt | problem])
+        chunk2: generate([sys_prompt | problem | chunk1])
+        chunk3: generate([sys_prompt | problem | chunk1 | chunk2])
+
+    Args:
+        teacher:  original frozen backbone in eval mode.
+        problems: list of B problem dicts.
+
+    Returns:
+        List of B tuples (chunk1_ids, chunk2_ids, chunk3_ids), all CPU tensors.
+        Lengths are ≤ chunk_tokens (shorter if EOS fired early).
+    """
+    pad_id = tokenizer.eos_token_id
+    B      = len(problems)
+
+    # ── Chunk 1 ───────────────────────────────────────────────────────────────
+    prompt_ids_list = [format_prompt(p, tokenizer) for p in problems]
+    max_prompt      = max(len(p) for p in prompt_ids_list)
+
+    input_ids = torch.full((B, max_prompt), pad_id, dtype=torch.long, device=device)
+    attn_mask = torch.zeros(B, max_prompt, dtype=torch.long, device=device)
+    for i, pids in enumerate(prompt_ids_list):
+        off = max_prompt - len(pids)      # left-pad
+        input_ids[i, off:] = torch.tensor(pids, dtype=torch.long, device=device)
+        attn_mask[i, off:] = 1
+
+    gen1 = teacher.generate(
+        input_ids, attention_mask=attn_mask,
+        max_new_tokens=chunk_tokens, do_sample=(temperature > 0),
+        temperature=temperature if temperature > 0 else 1.0,
+        top_p=top_p, pad_token_id=pad_id,
+    )
+    chunk1_ids = [gen1[i, max_prompt:].cpu() for i in range(B)]
+    del gen1, input_ids, attn_mask
+
+    # ── Chunk 2: full context [prompt | chunk1] ───────────────────────────────
+    prompt_lens = [len(p) for p in prompt_ids_list]
+    c1_lens     = [c.shape[0] for c in chunk1_ids]
+    full2_lens  = [prompt_lens[i] + c1_lens[i] for i in range(B)]
+    max_full2   = max(full2_lens)
+
+    ctx2      = torch.full((B, max_full2), pad_id, dtype=torch.long, device=device)
+    ctx2_mask = torch.zeros(B, max_full2, dtype=torch.long, device=device)
+    for i in range(B):
+        off = max_full2 - full2_lens[i]   # left-pad
+        p   = torch.tensor(prompt_ids_list[i], dtype=torch.long, device=device)
+        c1  = chunk1_ids[i].to(device)
+        ctx2[i, off:off + prompt_lens[i]] = p
+        ctx2[i, off + prompt_lens[i]:off + full2_lens[i]] = c1
+        ctx2_mask[i, off:off + full2_lens[i]] = 1
+
+    gen2 = teacher.generate(
+        ctx2, attention_mask=ctx2_mask,
+        max_new_tokens=chunk_tokens, do_sample=(temperature > 0),
+        temperature=temperature if temperature > 0 else 1.0,
+        top_p=top_p, pad_token_id=pad_id,
+    )
+    chunk2_ids = [gen2[i, max_full2:].cpu() for i in range(B)]
+    del gen2, ctx2, ctx2_mask
+
+    # ── Chunk 3: full context [prompt | chunk1 | chunk2] ─────────────────────
+    c2_lens    = [c.shape[0] for c in chunk2_ids]
+    full3_lens = [full2_lens[i] + c2_lens[i] for i in range(B)]
+    max_full3  = max(full3_lens)
+
+    ctx3      = torch.full((B, max_full3), pad_id, dtype=torch.long, device=device)
+    ctx3_mask = torch.zeros(B, max_full3, dtype=torch.long, device=device)
+    for i in range(B):
+        off  = max_full3 - full3_lens[i]   # left-pad
+        seqi = torch.cat([
+            torch.tensor(prompt_ids_list[i], dtype=torch.long, device=device),
+            chunk1_ids[i].to(device),
+            chunk2_ids[i].to(device),
+        ])
+        ctx3[i, off:off + full3_lens[i]] = seqi
+        ctx3_mask[i, off:off + full3_lens[i]] = 1
+
+    gen3 = teacher.generate(
+        ctx3, attention_mask=ctx3_mask,
+        max_new_tokens=chunk_tokens, do_sample=(temperature > 0),
+        temperature=temperature if temperature > 0 else 1.0,
+        top_p=top_p, pad_token_id=pad_id,
+    )
+    chunk3_ids = [gen3[i, max_full3:].cpu() for i in range(B)]
+    del gen3, ctx3, ctx3_mask
+
+    return list(zip(chunk1_ids, chunk2_ids, chunk3_ids))
+
+
+def _distill_loss(
+    student: AutoModelForCausalLM,
+    encoder: LatentStateEncoder,
+    tokenizer: AutoTokenizer,
+    problems: list[dict],
+    teacher_chunks: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute CE distillation loss for chunks 2 and 3 (teacher-forced).
+
+    Student context is strictly Markov: chunk h uses [z_{h-1}_prefix | teacher_chunk_h].
+    No raw prior chunk tokens are visible to the student.
+
+    Gradient flows:
+        loss_2 → backbone (chunk 2 logits) → prefix_1 → injector → z_1 → encoder → backbone (chunk 1 hidden)
+        loss_3 → backbone (chunk 3 logits) → prefix_2 → injector → z_2 → encoder → backbone (chunk 2 hidden)
+
+    Returns:
+        loss: scalar tensor (loss_2 + loss_3), differentiable.
+    """
+    B           = len(problems)
+    dtype       = next(student.parameters()).dtype
+    embed_layer = student.get_input_embeddings()
+    vocab_size  = student.config.vocab_size
+
+    prompt_ids_list = [format_prompt(p, tokenizer) for p in problems]
+    prompt_lens     = [len(p) for p in prompt_ids_list]
+    c1_ids_list     = [teacher_chunks[i][0] for i in range(B)]
+    c2_ids_list     = [teacher_chunks[i][1] for i in range(B)]
+    c3_ids_list     = [teacher_chunks[i][2] for i in range(B)]
+    c1_lens         = [c.shape[0] for c in c1_ids_list]
+    c2_lens         = [c.shape[0] for c in c2_ids_list]
+    c3_lens         = [c.shape[0] for c in c3_ids_list]
+
+    # ── Chunk 1: [prompt | teacher_chunk1] → repr_1 (no CE loss) ─────────────
+    full1_lens = [prompt_lens[i] + c1_lens[i] for i in range(B)]
+    max_full1  = max(full1_lens)
+
+    fi1 = torch.zeros(B, max_full1, dtype=torch.long, device=device)
+    fa1 = torch.zeros(B, max_full1, dtype=torch.long, device=device)
+    for i in range(B):
+        L = full1_lens[i]
+        seq = torch.cat([
+            torch.tensor(prompt_ids_list[i], dtype=torch.long),
+            c1_ids_list[i],
+        ]).to(device)
+        fi1[i, :L] = seq
+        fa1[i, :L] = 1
+
+    # bypass lm_head — no CE loss on chunk 1
+    _, hidden1 = _fwd(student, input_ids=fi1, attention_mask=fa1, bypass_lm_head=True)
+    del fi1, fa1
+
+    # last real token = last token of teacher_chunk1 (not prompt)
+    last1 = torch.tensor([full1_lens[i] - 1 for i in range(B)], device=device)
+    repr_1 = _last_token_repr(hidden1, last1)
+    del hidden1
+
+    z_1      = encoder.encode(repr_1)
+    prefix_1 = encoder.inject(z_1.to(dtype))     # [B, 1, H]
+
+    # ── Chunk 2: [prefix_1 | teacher_chunk2] → CE loss + repr_2 ──────────────
+    max_c2 = max(c2_lens)
+    ie2, am2, _ = _build_prefix_embeds(embed_layer, prefix_1, c2_ids_list, device, dtype)
+
+    logits2, hidden2 = _fwd(student, inputs_embeds=ie2, attention_mask=am2)
+    del ie2, am2
+
+    # logits2[:, j, :] predicts teacher_chunk2_token[j]  (j = 0 .. max_c2-1)
+    tgt2 = torch.full((B, max_c2), -100, dtype=torch.long, device=device)
+    for i in range(B):
+        tgt2[i, :c2_lens[i]] = c2_ids_list[i].to(device)
+
+    loss_2 = F.cross_entropy(
+        logits2[:, :max_c2, :].reshape(B * max_c2, vocab_size),
+        tgt2.reshape(B * max_c2),
+        ignore_index=-100,
+    )
+    del logits2
+
+    # repr_2 = last real token of chunk2 in [prefix | chunk2] sequence
+    # prefix at position 0, chunk tokens at positions 1..c2_len
+    last2  = torch.tensor(c2_lens, device=device)       # position = c2_len (0-indexed)
+    repr_2 = _last_token_repr(hidden2, last2)
+    del hidden2
+
+    z_2      = encoder.encode(repr_2)
+    prefix_2 = encoder.inject(z_2.to(dtype))             # [B, 1, H]
+
+    # ── Chunk 3: [prefix_2 | teacher_chunk3] → CE loss ───────────────────────
+    max_c3 = max(c3_lens)
+    ie3, am3, _ = _build_prefix_embeds(embed_layer, prefix_2, c3_ids_list, device, dtype)
+
+    logits3, _ = _fwd(student, inputs_embeds=ie3, attention_mask=am3)
+    del ie3, am3
+
+    tgt3 = torch.full((B, max_c3), -100, dtype=torch.long, device=device)
+    for i in range(B):
+        tgt3[i, :c3_lens[i]] = c3_ids_list[i].to(device)
+
+    loss_3 = F.cross_entropy(
+        logits3[:, :max_c3, :].reshape(B * max_c3, vocab_size),
+        tgt3.reshape(B * max_c3),
+        ignore_index=-100,
+    )
+    del logits3
+
+    return loss_2 + loss_3
+
+
+def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
+    """Phase 0: teacher-forced distillation pretraining on L1–L4 pool.
+
+    Trains encoder + injector from scratch. Backbone updated at low lr so it
+    learns to attend to z prefixes without drifting from pretrained capability.
+
+    Config keys consumed (under "phase0"):
+        pool_path          — data/math_easy_pool.jsonl
+        n_steps            — training steps (default: 400)
+        batch_size         — problems per step (default: 64)
+        lr_backbone        — backbone learning rate (default: 1e-6)
+        lr_encoder         — encoder/injector learning rate (default: 1e-4)
+        temperature        — teacher generation temperature (default: 1.0)
+        top_p              — teacher nucleus sampling (default: 1.0)
+        logging_steps, save_steps
+
+    run_dir is the phase0 artifact directory
+    (artifacts/<arm>/<run_id>/phase0/).  Checkpoints are written directly there;
+    no checkpoint_path config key is needed.
+    """
+    primary      = config["primary"]
+    phase0_cfg   = config["phase0"]
+    training_cfg = config["training"]
+    latent_cfg   = config["latent_markov"]
+
+    model_id  = primary["huggingface_repo_id"]
+    revision  = primary.get("revision", "main")
+    dtype     = getattr(torch, primary.get("dtype", "bfloat16"))
+    attn_impl = primary.get("attn_implementation", "sdpa")
+
+    n_steps      = int(phase0_cfg.get("n_steps",         400))
+    batch_size   = int(phase0_cfg.get("batch_size",       64))
+    lr_backbone  = float(phase0_cfg.get("lr_backbone",    1e-6))
+    lr_encoder   = float(phase0_cfg.get("lr_encoder",     1e-4))
+    temperature  = float(phase0_cfg.get("temperature",    1.0))
+    top_p        = float(phase0_cfg.get("top_p",          1.0))
+    chunk_tokens = int(latent_cfg.get("chunk_tokens",     341))
+    latent_dim   = int(latent_cfg.get("latent_dim",  LATENT_DIM))
+    hidden_dim   = int(latent_cfg.get("hidden_dim",  HIDDEN_DIM))
+    log_steps    = int(phase0_cfg.get("logging_steps",    10))
+    save_steps   = int(phase0_cfg.get("save_steps",       50))
+    pool_path    = Path(phase0_cfg.get("pool_path",        "data/math_easy_pool.jsonl"))
+    seed         = int(training_cfg.get("seed", 42))
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Phase 0 (distill) — device: %s  batch=%d  lr_bb=%.1e  lr_enc=%.1e",
+                device, batch_size, lr_backbone, lr_encoder)
+
+    # ── Load teacher (frozen original backbone) ────────────────────────────────
+    logger.info("Loading teacher %s @ %s ...", model_id, revision)
+    teacher = AutoModelForCausalLM.from_pretrained(
+        model_id, revision=revision,
+        torch_dtype=dtype, device_map="auto",
+        attn_implementation=attn_impl,
+    )
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    logger.info("  teacher loaded and frozen")
+
+    # ── Load student backbone (trainable, low lr) ─────────────────────────────
+    logger.info("Loading student backbone %s @ %s ...", model_id, revision)
+    student = AutoModelForCausalLM.from_pretrained(
+        model_id, revision=revision,
+        torch_dtype=dtype, device_map="auto",
+        attn_implementation=attn_impl,
+    )
+    student.train()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, revision=revision, trust_remote_code=True, padding_side="left",
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    logger.info("  student backbone loaded")
+
+    if training_cfg.get("gradient_checkpointing", False):
+        student.config.use_cache = False
+        student.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
         )
-    finally:
-        handle.remove()
-    return out.logits, cap.val
+        logger.info("  gradient checkpointing enabled")
+
+    # ── Encoder + injector ────────────────────────────────────────────────────
+    encoder = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device)
+    logger.info("  encoder initialised (%.2fM params)",
+                sum(p.numel() for p in encoder.parameters()) / 1e6)
+
+    # ── torch.compile (skip for smoke profiles — overhead exceeds benefit) ─────
+    if config.get("experiment", {}).get("profile") != "smoke":
+        _setup_compile(student, encoder)
+
+    # ── Optimiser — two param groups, fused CUDA kernel ───────────────────────
+    _fused = {"fused": True} if torch.cuda.is_available() else {}
+    optimizer = torch.optim.AdamW([
+        {"params": student.parameters(), "lr": lr_backbone},
+        {"params": encoder.parameters(), "lr": lr_encoder},
+    ], **_fused)
+
+    # ── Problem pool ──────────────────────────────────────────────────────────
+    with open(pool_path, encoding="utf-8") as f:
+        problems = [json.loads(line) for line in f if line.strip()]
+    logger.info("Phase 0 pool: %d problems from %s", len(problems), pool_path)
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "resolved_config.json").write_text(json.dumps(config, indent=2))
+
+    log_history: list[dict] = []
+    pending:     dict[str, float] = {}
+    pool_order:  list[int] = []
+
+    step_bar = tqdm(total=n_steps, desc="phase0_distill", unit="step", dynamic_ncols=True)
+
+    for global_step in range(n_steps):
+        # Reshuffle pool when exhausted
+        while len(pool_order) < batch_size:
+            order = list(range(len(problems)))
+            _random.shuffle(order)
+            pool_order.extend(order)
+        step_problems = [problems[pool_order.pop(0)] for _ in range(batch_size)]
+
+        # ── Teacher generates all 3 chunks, full context ───────────────────────
+        teacher_chunks = _generate_teacher_chunks(
+            teacher, tokenizer, step_problems,
+            chunk_tokens=chunk_tokens,
+            temperature=temperature, top_p=top_p, device=device,
+        )
+
+        # ── Student distillation forward ───────────────────────────────────────
+        student.train(); encoder.train()
+        optimizer.zero_grad()
+
+        loss = _distill_loss(
+            student, encoder, tokenizer,
+            step_problems, teacher_chunks, device,
+        )
+        loss.backward()
+
+        all_params = list(student.parameters()) + list(encoder.parameters())
+        torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+        optimizer.step()
+
+        loss_val = loss.detach().item()
+
+        # ── Logging ───────────────────────────────────────────────────────────
+        pending["loss"] = pending.get("loss", 0.0) + loss_val
+
+        if (global_step + 1) % log_steps == 0:
+            n = log_steps
+            entry = {
+                "step": global_step + 1,
+                "loss": pending.get("loss", 0.0) / n,
+            }
+            log_history.append(entry)
+            pending = {}
+            logger.info("step %d | distill_loss=%.4f", entry["step"], entry["loss"])
+
+        if (global_step + 1) % save_steps == 0:
+            _save_phase0_checkpoint(
+                run_dir / f"checkpoint-{global_step + 1}",
+                student, encoder, global_step + 1, log_history, tokenizer,
+            )
+
+        step_bar.set_postfix(loss=f"{loss_val:.4f}")
+        step_bar.update(1)
+
+    step_bar.close()
+
+    _save_phase0_checkpoint(run_dir, student, encoder, n_steps, log_history, tokenizer)
+    logger.info("Phase 0 complete. Checkpoint → %s", run_dir)
 
 
-# ---------------------------------------------------------------------------
-# Rollout generation — shared by Phase 0 and Phase 1
-# ---------------------------------------------------------------------------
+# ── Phase 1: on-policy GRPO ────────────────────────────────────────────────────
 
 @torch.no_grad()
 def generate_latent_traces(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
-    vae: VAEStateEncoder,
-    z_injector: ZInjector,
+    encoder: LatentStateEncoder,
     problems: list[dict],
     n_rollouts: int,
     chunk_tokens: int,
     temperature: float,
     top_p: float,
     device: torch.device,
-    n_chunks: int = N_CHUNKS,
 ) -> list[dict]:
-    """Generate G chunked rollouts per problem with z_h prefix injection.
+    """Collect G rollouts per problem with strict Markov z injection.
 
-    Runs entirely under torch.no_grad() (enforced by decorator — callers do
-    not need their own context manager).  Computes repr_h and z_h internally
-    to inject z prefixes between chunks, but does NOT store them in the
-    returned traces.  Only chunk_ids, prompt_ids, and reward are stored.
+    Generation uses [z_prefix | generate] exclusively — no prior chunk tokens
+    are visible. z is the only cross-chunk information carrier.
 
-    The training step (_run_pipeline_with_grad) re-runs the full pipeline with
-    gradient to obtain live repr_h, z_h, and log_π from the same chunk_ids.
+    Chunk 1: generate([prompt])
+    Chunk 2: generate([z_1_prefix])   ← strict Markov
+    Chunk 3: generate([z_2_prefix])   ← strict Markov
 
-    Generation per rollout:
-        Chunk 1: generate(prompt)  →  chunk1_ids
-                 forward([prompt|chunk1]) → repr_1 → z_1 → prefix_1
-        Chunk 2: generate([prefix_1|chunk1]) → chunk2_ids        (crutch: chunk1 kept for generation quality)
-                 forward([prefix_1|chunk2])       → repr_2 → z_2 → prefix_2  (strict Markov)
-        Chunk 3: generate([prefix_2|chunk2]) → chunk3_ids        (crutch: chunk2 kept for generation quality)
-                 grade(chunk1+chunk2+chunk3) → reward
-        (No chunk-3 repr forward here — z_3 not needed for prefix injection;
-         repr_3 → z_3 is computed in _run_pipeline_with_grad with strict Markov
-         context [prefix_2|chunk3].)
+    Repr computation (for prefix injection between chunks):
+        repr_h = backbone([z_{h-1}_prefix | chunk_h_tokens])[-1 token hidden state]
 
-    Args:
-        model:       backbone in eval mode.
-        tokenizer:   Qwen tokenizer (padding_side="left").
-        vae:         VAEStateEncoder in eval mode.
-        z_injector:  ZInjector in eval mode.
-        problems:    list of problem dicts (keys: "prompt", "ground_truth").
-        n_rollouts:  G — rollouts per problem.
-        chunk_tokens: new tokens per chunk (config value).
-        temperature: sampling temperature.
-        top_p:       nucleus sampling cutoff.
-        device:      CUDA device.
-        n_chunks:    always 3 (forward-compat arg).
+    IS guarantee: generation context and training forward context are identical.
 
     Returns:
         Flat list of trace dicts, length = len(problems) × n_rollouts.
-        Rollouts for the same problem are contiguous (required by
-        compute_grpo_advantages).
+        Rollouts for the same problem are contiguous.
 
-        Each dict:
-            "problem_id"  : str
-            "rollout_idx" : int  (0 … G-1)
-            "ground_truth": str
-            "completion"  : str  (full decoded, all 3 chunks)
-            "reward"      : int  (0 or 1)
-            "prompt_ids"  : Tensor (prompt_len,)  on CPU
-            "chunk_ids"   : list[Tensor]  — [c1, c2, c3] on CPU
+        Each dict keys:
+            problem_id, rollout_idx, ground_truth, completion, reward,
+            prompt_ids (CPU Tensor), chunk_ids (list of 3 CPU Tensors)
     """
     pad_id      = tokenizer.eos_token_id
     embed_layer = model.get_input_embeddings()
     model_dtype = embed_layer.weight.dtype
-    hidden_dim  = vae.hidden_dim
 
-    # Build flat list: each problem repeated n_rollouts times (contiguous).
     all_prompt_ids:   list[list[int]] = []
     all_gt:           list[str]       = []
     all_problem_ids:  list[str]       = []
@@ -299,714 +679,238 @@ def generate_latent_traces(
     prompt_lengths = [len(p) for p in all_prompt_ids]
     max_prompt_len = max(prompt_lengths)
 
-    # ── Chunk 1 generation — left-padded token IDs ────────────────────────
+    # ── Chunk 1: generate from [prompt] ───────────────────────────────────────
     input_ids = torch.full((B, max_prompt_len), pad_id, dtype=torch.long, device=device)
     attn_mask = torch.zeros(B, max_prompt_len, dtype=torch.long, device=device)
     for i, pids in enumerate(all_prompt_ids):
-        off = max_prompt_len - len(pids)
+        off = max_prompt_len - len(pids)     # left-pad
         input_ids[i, off:] = torch.tensor(pids, dtype=torch.long, device=device)
         attn_mask[i, off:] = 1
 
     gen1 = model.generate(
         input_ids, attention_mask=attn_mask,
-        max_new_tokens=chunk_tokens, do_sample=True,
-        temperature=temperature, top_p=top_p,
-        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
+        max_new_tokens=chunk_tokens, do_sample=(temperature > 0),
+        temperature=temperature if temperature > 0 else 1.0,
+        top_p=top_p, pad_token_id=pad_id,
     )
-    chunk1_ids_list = [gen1[i, max_prompt_len:].cpu() for i in range(B)]
+    chunk1_ids = [gen1[i, max_prompt_len:].cpu() for i in range(B)]
     del gen1, input_ids, attn_mask
-    torch.cuda.empty_cache()
 
-    # Forward [prompt | chunk1] for repr_1 → z_1 → prefix_1 (right-padded)
-    full_seqs1 = [
-        torch.cat([
-            torch.tensor(all_prompt_ids[i], dtype=torch.long, device=device),
-            chunk1_ids_list[i].to(device),
-        ])
-        for i in range(B)
-    ]
-    max_full1 = max(s.shape[0] for s in full_seqs1)
-    fi1 = torch.full((B, max_full1), pad_id, dtype=torch.long, device=device)
+    # ── Repr 1: [prompt | chunk1] → last-token hidden → z_1 → prefix_1 ───────
+    full1_lens = [prompt_lengths[i] + chunk1_ids[i].shape[0] for i in range(B)]
+    max_full1  = max(full1_lens)
+
+    fi1 = torch.zeros(B, max_full1, dtype=torch.long, device=device)
     fa1 = torch.zeros(B, max_full1, dtype=torch.long, device=device)
-    for i, seq in enumerate(full_seqs1):
-        L = seq.shape[0]; fi1[i, :L] = seq; fa1[i, :L] = 1
-
-    # need_logits=False: logits are never used during generation — skipping lm_head
-    # saves the (B, seq, 151936) tensor (~6.6 GB at B=32) on every forward call.
-    _, hidden1 = _fwd_with_hidden(model, input_ids=fi1, attention_mask=fa1,
-                                  need_logits=False)
-
-    repr_1_list: list[torch.Tensor] = []
     for i in range(B):
-        pl = prompt_lengths[i]; rl = chunk1_ids_list[i].shape[0]
-        repr_1_list.append(hidden1[i, pl:pl + rl, :].mean(0))
-    del fi1, fa1, hidden1
-    torch.cuda.empty_cache()
+        L   = full1_lens[i]
+        seq = torch.cat([
+            torch.tensor(all_prompt_ids[i], dtype=torch.long),
+            chunk1_ids[i],
+        ]).to(device)
+        fi1[i, :L] = seq
+        fa1[i, :L] = 1
 
-    # VAE → z_1: z = μ always (deterministic encoder).
-    # Rollout-to-rollout diversity comes from different chunk1 tokens producing
-    # different repr_1 → different μ_1 per rollout.
-    # .float(): backbone runs in bf16; VAE MLP weights are fp32.
-    repr_1_batch = torch.stack(repr_1_list).float()   # (B, hidden) fp32
-    z_1_batch = vae.encode(repr_1_batch)               # z = μ always
-    del repr_1_batch
-    torch.cuda.empty_cache()
+    _, hidden1 = _fwd(model, input_ids=fi1, attention_mask=fa1, bypass_lm_head=True)
+    del fi1, fa1
 
-    # ── Chunk 2 generation — left-padded inputs_embeds [z_pfx | chunk1] ──
-    z_pfx1   = z_injector.get_prefix_embedding(z_1_batch)   # (B, 1, H)
-    c1_lens  = [c.shape[0] for c in chunk1_ids_list]
-    max_c1   = max(c1_lens)
-    emb_len2 = 1 + max_c1
-    pad_emb  = embed_layer(torch.tensor([pad_id], dtype=torch.long, device=device))
+    last1  = torch.tensor([full1_lens[i] - 1 for i in range(B)], device=device)
+    repr_1 = _last_token_repr(hidden1, last1)
+    del hidden1
 
-    ie2 = torch.zeros(B, emb_len2, hidden_dim, dtype=model_dtype, device=device)
-    am2 = torch.zeros(B, emb_len2, dtype=torch.long, device=device)
-    for i in range(B):
-        L1 = c1_lens[i]; off = max_c1 - L1
-        if off > 0:
-            ie2[i, :off, :] = pad_emb
-        ie2[i, off, :]            = z_pfx1[i, 0, :]
-        ie2[i, off + 1:off + 1 + L1, :] = embed_layer(chunk1_ids_list[i].to(device))
-        am2[i, off:] = 1
+    z_1      = encoder.encode(repr_1)
+    prefix_1 = encoder.inject(z_1.to(model_dtype))    # [B, 1, H]
 
-    gen2 = model.generate(
-        inputs_embeds=ie2, attention_mask=am2,
-        max_new_tokens=chunk_tokens, do_sample=True,
-        temperature=temperature, top_p=top_p,
-        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
+    # ── Chunk 2: generate from [z_1_prefix] only — strict Markov ─────────────
+    am_pfx = torch.ones(B, 1, dtype=torch.long, device=device)
+    gen2   = model.generate(
+        inputs_embeds=prefix_1, attention_mask=am_pfx,
+        max_new_tokens=chunk_tokens, do_sample=(temperature > 0),
+        temperature=temperature if temperature > 0 else 1.0,
+        top_p=top_p, pad_token_id=pad_id,
     )
-    chunk2_ids_list = [
-        (gen2[i, emb_len2:] if gen2.shape[1] > chunk_tokens else gen2[i]).cpu()
-        for i in range(B)
-    ]
-    del gen2, ie2, am2
-    torch.cuda.empty_cache()
+    # gen2[:, 0] is placeholder for the prefix embedding position; skip it
+    chunk2_ids = [gen2[i, 1:].cpu() for i in range(B)]
+    del gen2
 
-    # Forward [z_pfx1 | chunk2] for repr_2 → z_2 → prefix_2
-    # Strict Markov: same as _run_pipeline_with_grad — chunk-1 raw tokens dropped.
-    # The z_2 injected for chunk-3 generation is computed under the same context
-    # as the z_2 in the training pass, keeping generation and training consistent.
-    c2_lens  = [c.shape[0] for c in chunk2_ids_list]
-    max_fwd2 = max(1 + c2_lens[i] for i in range(B))
-    fe2 = torch.zeros(B, max_fwd2, hidden_dim, dtype=model_dtype, device=device)
-    fa2 = torch.zeros(B, max_fwd2, dtype=torch.long, device=device)
-    for i in range(B):
-        L2 = c2_lens[i]; tot = 1 + L2
-        fe2[i, 0, :]        = z_pfx1[i, 0, :]
-        fe2[i, 1:1 + L2, :] = embed_layer(chunk2_ids_list[i].to(device))
-        fa2[i, :tot] = 1
+    # ── Repr 2: [prefix_1 | chunk2] → last-token hidden → z_2 → prefix_2 ─────
+    c2_lens = [c.shape[0] for c in chunk2_ids]
+    ie2, am2, _ = _build_prefix_embeds(embed_layer, prefix_1, chunk2_ids, device, model_dtype)
 
-    _, hidden2 = _fwd_with_hidden(model, inputs_embeds=fe2, attention_mask=fa2,
-                                  need_logits=False)
+    _, hidden2 = _fwd(model, inputs_embeds=ie2, attention_mask=am2, bypass_lm_head=True)
+    del ie2, am2
 
-    repr_2_list: list[torch.Tensor] = []
-    for i in range(B):
-        L2 = c2_lens[i]
-        repr_2_list.append(hidden2[i, 1:1 + L2, :].mean(0))
-    del fe2, fa2, hidden2, z_pfx1
-    torch.cuda.empty_cache()
+    last2  = torch.tensor(c2_lens, device=device)
+    repr_2 = _last_token_repr(hidden2, last2)
+    del hidden2
 
-    # VAE → z_2: z = μ always
-    repr_2_batch = torch.stack(repr_2_list).float()   # bf16→fp32 for VAE
-    z_2_batch = vae.encode(repr_2_batch)               # z = μ always
-    del repr_2_batch
-    torch.cuda.empty_cache()
+    z_2      = encoder.encode(repr_2)
+    prefix_2 = encoder.inject(z_2.to(model_dtype))    # [B, 1, H]
+    del prefix_1
 
-    # ── Chunk 3 generation — left-padded inputs_embeds [z_pfx2 | chunk2] ─
-    z_pfx2   = z_injector.get_prefix_embedding(z_2_batch)   # (B, 1, H)
-    max_c2   = max(c2_lens)
-    emb_len3 = 1 + max_c2
-
-    ie3 = torch.zeros(B, emb_len3, hidden_dim, dtype=model_dtype, device=device)
-    am3 = torch.zeros(B, emb_len3, dtype=torch.long, device=device)
-    for i in range(B):
-        L2 = c2_lens[i]; off = max_c2 - L2
-        if off > 0:
-            ie3[i, :off, :] = pad_emb
-        ie3[i, off, :]            = z_pfx2[i, 0, :]
-        ie3[i, off + 1:off + 1 + L2, :] = embed_layer(chunk2_ids_list[i].to(device))
-        am3[i, off:] = 1
-
+    # ── Chunk 3: generate from [z_2_prefix] only — strict Markov ─────────────
     gen3 = model.generate(
-        inputs_embeds=ie3, attention_mask=am3,
-        max_new_tokens=chunk_tokens, do_sample=True,
-        temperature=temperature, top_p=top_p,
-        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
+        inputs_embeds=prefix_2, attention_mask=am_pfx,
+        max_new_tokens=chunk_tokens, do_sample=(temperature > 0),
+        temperature=temperature if temperature > 0 else 1.0,
+        top_p=top_p, pad_token_id=pad_id,
     )
-    chunk3_ids_list = [
-        (gen3[i, emb_len3:] if gen3.shape[1] > chunk_tokens else gen3[i]).cpu()
-        for i in range(B)
-    ]
-    del gen3, ie3, am3, z_pfx2, z_1_batch, z_2_batch
-    torch.cuda.empty_cache()
+    chunk3_ids = [gen3[i, 1:].cpu() for i in range(B)]
+    del gen3, prefix_2, am_pfx
 
-    # ── Grade and assemble traces ──────────────────────────────────────────
-    trajectories: list[dict] = []
+    # ── Grade and assemble traces ──────────────────────────────────────────────
+    traces: list[dict] = []
     for i in range(B):
-        all_chunk_ids = torch.cat([
-            chunk1_ids_list[i], chunk2_ids_list[i], chunk3_ids_list[i]
-        ])
-        completion = tokenizer.decode(all_chunk_ids, skip_special_tokens=True)
-        pred   = extract_answer(completion)
-        reward = int(pred is not None and answers_equivalent(pred, all_gt[i]))
+        all_chunk_ids = torch.cat([chunk1_ids[i], chunk2_ids[i], chunk3_ids[i]])
+        completion    = tokenizer.decode(all_chunk_ids, skip_special_tokens=True)
+        pred          = extract_answer(completion)
+        reward        = int(pred is not None and answers_equivalent(pred, all_gt[i]))
 
-        trajectories.append({
+        traces.append({
             "problem_id":   all_problem_ids[i],
             "rollout_idx":  all_rollout_idxs[i],
             "ground_truth": all_gt[i],
             "completion":   completion,
             "reward":       reward,
             "prompt_ids":   torch.tensor(all_prompt_ids[i], dtype=torch.long),
-            "chunk_ids":    [chunk1_ids_list[i], chunk2_ids_list[i], chunk3_ids_list[i]],
+            "chunk_ids":    [chunk1_ids[i], chunk2_ids[i], chunk3_ids[i]],
         })
 
-    return trajectories
+    return traces
 
 
-# ---------------------------------------------------------------------------
-# Shared training-time forward pass — Phase 0 and Phase 1
-# ---------------------------------------------------------------------------
-
-def _run_pipeline_with_grad(
+def _pipeline_with_grad(
     model: AutoModelForCausalLM,
-    vae: VAEStateEncoder,
-    z_injector: ZInjector,
+    encoder: LatentStateEncoder,
     traces: list[dict],
     device: torch.device,
-    *,
-    compute_log_pi: bool = True,
 ) -> dict[str, Any]:
-    """Re-run the full 3-chunk pipeline WITH gradient for all traces.
+    """Re-run the 3-chunk pipeline WITH gradient.
 
-    Used by both Phase 0 training step (no L_RL) and Phase 1 training step.
-    All repr_h and z_h are LIVE in the computation graph.
+    Strict Markov: each chunk forward pass uses [z_prefix | chunk_tokens] only.
+    Identical context to generate_latent_traces — IS = 1 exactly.
 
-    Chunk 1: right-padded [prompt|chunk1] → repr_1 LIVE → z_1 → prefix_1
-    Chunk 2: right-padded [prefix_1|chunk2] → repr_2 LIVE → z_2 → prefix_2
-    Chunk 3: right-padded [prefix_2|chunk3] → repr_3 LIVE → z_3
-
-    log_π per chunk: gathered from logits at the causal-LM shifted positions.
-    When compute_log_pi=False (Phase 0), lm_head is bypassed entirely — saves
-    ~26 GB per chunk (B=128 × seq≈683 × vocab=151,936 × 2 B).
-
-    Args:
-        model, vae, z_injector: all in training mode.
-        traces: output of generate_latent_traces() for this step.
-        device: CUDA device.
-        compute_log_pi: set False for Phase 0 (L_RL not used; logits not needed).
-
-    Returns dict with:
-        "repr_list"    : list[3 × Tensor (B, hidden)]  — LIVE
-        "z_list"       : list[3 × Tensor (B, latent)]  — LIVE (z_h = μ_h)
-        "log_pi_chunks": list[3 × list[B × Tensor(chunk_len,)]]  — empty when compute_log_pi=False
-
+    Returns:
+        z_list:         list of 3 tensors [B, latent_dim]  — LIVE
+        log_pi_chunks:  list of 3 lists, each B tensors [chunk_len]  — LIVE
     """
-    pad_id      = 0  # pad value for token-id inputs; actual vocab doesn't matter
+    pad_id      = 0
     embed_layer = model.get_input_embeddings()
     model_dtype = embed_layer.weight.dtype
     B           = len(traces)
 
-    prompt_ids_list  = [t["prompt_ids"]    for t in traces]
-    chunk1_ids_list  = [t["chunk_ids"][0]  for t in traces]
-    chunk2_ids_list  = [t["chunk_ids"][1]  for t in traces]
-    chunk3_ids_list  = [t["chunk_ids"][2]  for t in traces]
-    prompt_lengths   = [p.shape[0] for p in prompt_ids_list]
-    c1_lens          = [c.shape[0] for c in chunk1_ids_list]
-    c2_lens          = [c.shape[0] for c in chunk2_ids_list]
-    c3_lens          = [c.shape[0] for c in chunk3_ids_list]
+    prompt_ids_list = [t["prompt_ids"]   for t in traces]
+    c1_ids_list     = [t["chunk_ids"][0] for t in traces]
+    c2_ids_list     = [t["chunk_ids"][1] for t in traces]
+    c3_ids_list     = [t["chunk_ids"][2] for t in traces]
+    prompt_lens     = [p.shape[0] for p in prompt_ids_list]
+    c1_lens         = [c.shape[0] for c in c1_ids_list]
+    c2_lens         = [c.shape[0] for c in c2_ids_list]
+    c3_lens         = [c.shape[0] for c in c3_ids_list]
 
-    # ── Chunk 1: [prompt | chunk1] right-padded ────────────────────────────
-    full_seqs1 = [
-        torch.cat([p.to(device), c.to(device)])
-        for p, c in zip(prompt_ids_list, chunk1_ids_list)
-    ]
-    max_f1 = max(s.shape[0] for s in full_seqs1)
-    fi1 = torch.zeros(B, max_f1, dtype=torch.long, device=device)
-    fa1 = torch.zeros(B, max_f1, dtype=torch.long, device=device)
-    for i, seq in enumerate(full_seqs1):
-        L = seq.shape[0]; fi1[i, :L] = seq; fa1[i, :L] = 1
+    # ── Chunk 1: [prompt | chunk1] ─────────────────────────────────────────────
+    full1_lens = [prompt_lens[i] + c1_lens[i] for i in range(B)]
+    max_full1  = max(full1_lens)
 
-    logits1, hidden1 = _fwd_with_hidden(
-        model, input_ids=fi1, attention_mask=fa1, need_logits=compute_log_pi
-    )
+    fi1 = torch.zeros(B, max_full1, dtype=torch.long, device=device)
+    fa1 = torch.zeros(B, max_full1, dtype=torch.long, device=device)
+    for i in range(B):
+        L   = full1_lens[i]
+        seq = torch.cat([prompt_ids_list[i].to(device), c1_ids_list[i].to(device)])
+        fi1[i, :L] = seq
+        fa1[i, :L] = 1
+
+    logits1, hidden1 = _fwd(model, input_ids=fi1, attention_mask=fa1)
     del fi1, fa1
 
-    repr_1_batch = torch.stack([
-        hidden1[i, prompt_lengths[i]:prompt_lengths[i] + c1_lens[i], :].mean(0)
-        for i in range(B)
-    ]).float()                                               # (B, hidden) LIVE fp32
-    del hidden1
-
+    # log π for chunk 1 tokens: logits at causal-shifted positions
     log_pi_1: list[torch.Tensor] = []
-    if compute_log_pi:
-        for i in range(B):
-            pl = prompt_lengths[i]; rl = c1_lens[i]
-            sl = logits1[i, pl - 1:pl + rl - 1, :]          # (rl, vocab) — causal shift
-            c1 = chunk1_ids_list[i].to(device)
-            lp = sl.gather(1, c1.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
-            log_pi_1.append(lp)
+    for i in range(B):
+        pl = prompt_lens[i]; rl = c1_lens[i]
+        sl = logits1[i, pl - 1:pl + rl - 1, :]     # (rl, vocab)
+        c1 = c1_ids_list[i].to(device)
+        lp = sl.gather(1, c1.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
+        log_pi_1.append(lp)
     del logits1
 
-    z_1_batch = vae.encode(repr_1_batch)                      # (B, latent) LIVE; z = μ always
-    prefix_1  = z_injector.get_prefix_embedding(z_1_batch)   # (B, 1, H) LIVE
+    last1  = torch.tensor([full1_lens[i] - 1 for i in range(B)], device=device)
+    repr_1 = _last_token_repr(hidden1, last1)
+    del hidden1
 
-    # ── Chunk 2: [z_pfx1 | chunk2] right-padded ───────────────────────────
-    # Strict Markov: chunk-1 raw tokens are dropped. repr_2 is conditioned only
-    # on z_1 (the Markov state) + chunk-2 tokens. The backbone cannot attend to
-    # raw chunk-1 history, forcing z_1 to actually carry the necessary context.
-    # Generation still uses [z_pfx1 | chunk1] as a quality crutch during Phase 0;
-    # for Phase 1 generation should be updated to [z_pfx1] only for full consistency.
-    max_f2 = max(1 + c2_lens[i] for i in range(B))
-    fe2 = torch.zeros(B, max_f2, model.config.hidden_size, dtype=model_dtype, device=device)
-    fa2 = torch.zeros(B, max_f2, dtype=torch.long, device=device)
-    for i in range(B):
-        L2 = c2_lens[i]; tot = 1 + L2
-        fe2[i, 0, :]        = prefix_1[i, 0, :]
-        fe2[i, 1:1 + L2, :] = embed_layer(chunk2_ids_list[i].to(device))
-        fa2[i, :tot] = 1
+    z_1      = encoder.encode(repr_1)
+    prefix_1 = encoder.inject(z_1.to(model_dtype))
 
-    logits2, hidden2 = _fwd_with_hidden(
-        model, inputs_embeds=fe2, attention_mask=fa2, need_logits=compute_log_pi
-    )
-    del fe2, fa2
+    # ── Chunk 2: [prefix_1 | chunk2] ──────────────────────────────────────────
+    ie2, am2, _ = _build_prefix_embeds(embed_layer, prefix_1, c2_ids_list, device, model_dtype)
 
-    repr_2_batch = torch.stack([
-        hidden2[i, 1:1 + c2_lens[i], :].mean(0)
-        for i in range(B)
-    ]).float()                                               # (B, hidden) LIVE fp32
-    del hidden2
+    logits2, hidden2 = _fwd(model, inputs_embeds=ie2, attention_mask=am2)
+    del ie2, am2
 
+    # logits2[:, j, :] predicts c2_token[j] (prefix at position 0, tokens at 1..L)
     log_pi_2: list[torch.Tensor] = []
-    if compute_log_pi:
-        for i in range(B):
-            L2 = c2_lens[i]
-            sl = logits2[i, 0:L2, :]   # pos 0 (z_pfx1) predicts c2[0], pos 1 predicts c2[1]…
-            c2 = chunk2_ids_list[i].to(device)
-            lp = sl.gather(1, c2.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
-            log_pi_2.append(lp)
+    for i in range(B):
+        L  = c2_lens[i]
+        sl = logits2[i, :L, :]
+        c2 = c2_ids_list[i].to(device)
+        lp = sl.gather(1, c2.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
+        log_pi_2.append(lp)
     del logits2
 
-    z_2_batch = vae.encode(repr_2_batch)                      # (B, latent) LIVE; z = μ always
-    prefix_2  = z_injector.get_prefix_embedding(z_2_batch)   # (B, 1, H) LIVE
+    last2  = torch.tensor(c2_lens, device=device)
+    repr_2 = _last_token_repr(hidden2, last2)
+    del hidden2
 
-    # ── Chunk 3: [z_pfx2 | chunk3] right-padded ───────────────────────────
-    # Same strict Markov logic: chunk-2 raw tokens dropped. repr_3 conditioned
-    # only on z_2 + chunk-3 tokens. Symmetric with chunk-2 treatment above.
-    max_f3 = max(1 + c3_lens[i] for i in range(B))
-    fe3 = torch.zeros(B, max_f3, model.config.hidden_size, dtype=model_dtype, device=device)
-    fa3 = torch.zeros(B, max_f3, dtype=torch.long, device=device)
-    for i in range(B):
-        L3 = c3_lens[i]; tot = 1 + L3
-        fe3[i, 0, :]        = prefix_2[i, 0, :]
-        fe3[i, 1:1 + L3, :] = embed_layer(chunk3_ids_list[i].to(device))
-        fa3[i, :tot] = 1
+    z_2      = encoder.encode(repr_2)
+    prefix_2 = encoder.inject(z_2.to(model_dtype))
 
-    logits3, hidden3 = _fwd_with_hidden(
-        model, inputs_embeds=fe3, attention_mask=fa3, need_logits=compute_log_pi
-    )
-    del fe3, fa3
+    # ── Chunk 3: [prefix_2 | chunk3] ──────────────────────────────────────────
+    ie3, am3, _ = _build_prefix_embeds(embed_layer, prefix_2, c3_ids_list, device, model_dtype)
 
-    repr_3_batch = torch.stack([
-        hidden3[i, 1:1 + c3_lens[i], :].mean(0)
-        for i in range(B)
-    ]).float()                                               # (B, hidden) LIVE fp32
-    del hidden3
+    logits3, hidden3 = _fwd(model, inputs_embeds=ie3, attention_mask=am3)
+    del ie3, am3
 
     log_pi_3: list[torch.Tensor] = []
-    if compute_log_pi:
-        for i in range(B):
-            L3 = c3_lens[i]
-            sl = logits3[i, 0:L3, :]   # pos 0 (z_pfx2) predicts c3[0], pos 1 predicts c3[1]…
-            c3 = chunk3_ids_list[i].to(device)
-            lp = sl.gather(1, c3.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
-            log_pi_3.append(lp)
+    for i in range(B):
+        L  = c3_lens[i]
+        sl = logits3[i, :L, :]
+        c3 = c3_ids_list[i].to(device)
+        lp = sl.gather(1, c3.unsqueeze(1)).squeeze(1) - torch.logsumexp(sl, dim=-1)
+        log_pi_3.append(lp)
     del logits3
 
-    z_3_batch = vae.encode(repr_3_batch)                      # (B, latent) LIVE; z = μ always
+    last3  = torch.tensor(c3_lens, device=device)
+    repr_3 = _last_token_repr(hidden3, last3)
+    del hidden3
+
+    z_3 = encoder.encode(repr_3)
 
     return {
-        "repr_list":     [repr_1_batch, repr_2_batch, repr_3_batch],
-        "z_list":        [z_1_batch,    z_2_batch,    z_3_batch],
-        "log_pi_chunks": [log_pi_1,     log_pi_2,     log_pi_3],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Phase 0 — Online VAE Pretraining
-# ---------------------------------------------------------------------------
-
-def pretrain_vae_online(config: dict[str, Any], run_dir: Path) -> None:
-    """Train StateEncoder, ZInjector, and OutcomeHead online with frozen backbone.
-
-    Each step:
-      1. [no_grad] generate G rollouts per problem → chunk_ids + reward
-      2. [with_grad] re-run full pipeline → live repr_h, z_h (= μ_h)
-      3. losses: λ_trans × L_trans + λ_out × L_out
-      4. step Encoder+ZInjector+OutcomeHead; backbone grads zeroed (not stepped)
-
-    Config keys consumed (under "phase0"):
-        model_id / revision / dtype  — backbone (from "primary")
-        pool_path                    — data/math_easy_pool.jsonl (L1–L4)
-        n_steps                      — training steps (default: 400)
-        num_generations              — G total rollouts per problem across Phase 0 (default: 128)
-        learning_rate                — AdamW lr for Encoder/ZInj/OutcomeHead (default: 3e-4)
-        lambda_trans_peak, lambda_trans_warmup_steps — λ_t schedule (peak and initial zero phase)
-        lambda_out — L_out loss weight
-        temperature, top_p           — sampling params (from training.*)
-        chunk_tokens                 — tokens per chunk (from latent_markov.*)
-        checkpoint_path              — where to save phase0_encoder.pt
-        logging_steps, save_steps
-    """
-    primary      = config["primary"]
-    phase0_cfg   = config["phase0"]
-    training_cfg = config["training"]
-    latent_cfg   = config["latent_markov"]
-
-    model_id  = primary["huggingface_repo_id"]
-    revision  = primary.get("revision", "main")
-    dtype     = getattr(torch, primary.get("dtype", "bfloat16"))
-
-    n_steps          = int(phase0_cfg.get("n_steps",          400))
-    G                = int(phase0_cfg.get("num_generations",  128))  # total rollouts per problem
-    micro_batch_size = int(phase0_cfg.get("micro_batch_size",  32))
-    seqs_per_step    = G                                              # 128 seqs/step (memory budget)
-    lr               = float(phase0_cfg.get("learning_rate",  3e-4))
-    lambda_trans_peak        = float(phase0_cfg.get("lambda_trans_peak",        3.0))
-    lambda_trans_warmup_steps = int(phase0_cfg.get("lambda_trans_warmup_steps", 50))
-    lambda_out               = float(phase0_cfg.get("lambda_out",               5.0))
-    temperature   = float(training_cfg.get("temperature",  1.0))
-    top_p         = float(training_cfg.get("top_p",        1.0))
-    chunk_tokens  = int(latent_cfg.get("chunk_tokens",     341))
-    latent_dim    = int(latent_cfg.get("latent_dim",  LATENT_DIM))
-    hidden_dim    = int(latent_cfg.get("hidden_dim",  HIDDEN_DIM))
-    log_steps     = int(phase0_cfg.get("logging_steps",    10))
-    save_steps    = int(phase0_cfg.get("save_steps",       50))
-    pool_path     = Path(phase0_cfg.get("pool_path",
-                                        "data/math_easy_pool.jsonl"))
-    ckpt_path     = Path(phase0_cfg.get("checkpoint_path",
-                                        str(run_dir / "phase0_encoder.pt")))
-    seed          = int(training_cfg.get("seed", 42))
-
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Phase 0 (online) — device: %s", device)
-
-    # ------------------------------------------------------------------
-    # Backbone — loaded but NOT added to any optimizer
-    # requires_grad=True so that L_trans → ZInjector gradient flows
-    # through backbone activations.  No .step() called on backbone.
-    # ------------------------------------------------------------------
-    attn_impl = primary.get("attn_implementation", "sdpa")
-    logger.info("Loading backbone %s @ %s  attn=%s ...", model_id, revision, attn_impl)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, revision=revision, torch_dtype=dtype, device_map="auto",
-        attn_implementation=attn_impl,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id, revision=revision, trust_remote_code=True, padding_side="left",
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    logger.info("  backbone loaded (grad-enabled, optimizer NOT stepped)")
-
-    # ------------------------------------------------------------------
-    # VAE / ZInjector / OutcomeHead
-    # ------------------------------------------------------------------
-    vae          = VAEStateEncoder(hidden_dim=hidden_dim, latent_dim=latent_dim).to(device)
-    z_injector   = ZInjector(latent_dim=latent_dim, hidden_dim=hidden_dim).to(device)
-    outcome_head = OutcomeHead(latent_dim=latent_dim).to(device)
-
-    vae_params = (
-        list(vae.parameters())
-        + list(z_injector.parameters())
-        + list(outcome_head.parameters())
-    )
-    optimizer = torch.optim.AdamW(vae_params, lr=lr)
-
-    if training_cfg.get("gradient_checkpointing", False):
-        model.config.use_cache = False
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
-        logger.info("  gradient checkpointing enabled")
-
-    # ------------------------------------------------------------------
-    # Problem pool
-    # ------------------------------------------------------------------
-    with open(pool_path, encoding="utf-8") as f:
-        problems = [json.loads(line) for line in f if line.strip()]
-    logger.info("Phase 0 pool: %d problems from %s", len(problems), pool_path)
-
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "resolved_config.json").write_text(json.dumps(config, indent=2))
-
-    # ------------------------------------------------------------------
-    # Pre-shuffled assignment list
-    # n_problems = n_steps × seqs_per_step / G = n_steps (when seqs_per_step = G).
-    # Each of the n_steps problems gets exactly G rollout slots spread across
-    # all 400 training steps, giving ~110 unique problems per step (maximum
-    # diversity for L_out) while every problem accumulates G total rollouts
-    # (consistent with the pass@128 evaluation metric).
-    # ------------------------------------------------------------------
-    n_problems = min(n_steps, len(problems))
-    sampled_problems = _random.sample(problems, n_problems)
-    flat_assignments: list[dict] = [
-        p for p in sampled_problems for _ in range(G)
-    ]
-    _random.shuffle(flat_assignments)
-    logger.info(
-        "Phase 0 assignment: %d problems × %d rollouts = %d total "
-        "(~%.0f unique problems/step)",
-        n_problems, G, len(flat_assignments),
-        n_problems * (1 - (1 - 1 / n_problems) ** seqs_per_step),
-    )
-
-    log_history: list[dict] = []
-    pending:     dict[str, float] = {}
-
-    step_bar = tqdm(total=n_steps, desc="phase0", unit="step", dynamic_ncols=True)
-
-    for global_step in range(n_steps):
-        # Warm-start: hold λ_t = 0 for the first `lambda_trans_warmup_steps` steps
-        # so L_out (outcome prediction) can establish a signal before the transition
-        # loss ramp competes for gradient budget.  After warmup the normal linear
-        # ramp resumes, offsetting the step index so the full ramp still completes.
-        if global_step < lambda_trans_warmup_steps:
-            lambda_t = 0.0
-        else:
-            effective_step = global_step - lambda_trans_warmup_steps
-            effective_max  = n_steps    - lambda_trans_warmup_steps
-            lambda_t = lambda_trans_schedule(effective_step, effective_max, peak=lambda_trans_peak)
-
-        # Slice this step's seqs_per_step problem-assignments from the flat list.
-        # Each entry is a problem dict; duplicates of the same problem within a
-        # step are rare (~1%) and harmless (they count as independent rollouts).
-        step_start   = global_step * seqs_per_step
-        step_problems = flat_assignments[step_start : step_start + seqs_per_step]
-
-        # ── Rollout collection (no gradient) ──────────────────────────────
-        with torch.no_grad():
-            model.eval(); vae.eval(); z_injector.eval()
-            # n_rollouts=1: one rollout per slot.  B = seqs_per_step = 128 simultaneous
-            # sequences — same memory budget as before; contents are now ~110 distinct
-            # problems rather than 1 problem × 128.
-            traces = generate_latent_traces(
-                model=model, tokenizer=tokenizer,
-                vae=vae, z_injector=z_injector,
-                problems=step_problems, n_rollouts=1,
-                chunk_tokens=chunk_tokens,
-                temperature=temperature, top_p=top_p,
-                device=device,
-            )
-
-        model.train(); vae.train(); z_injector.train(); outcome_head.train()
-
-        # Shuffle traces to avoid any ordering artifacts within the step before
-        # micro-batching (flat_assignments is pre-shuffled across steps; this
-        # ensures uniform mixing within each step's micro-batches as well).
-        _random.shuffle(traces)
-
-        # ── Training step (with gradient) ─────────────────────────────────
-        # Zero backbone grads from previous step (backbone is NOT in optimizer).
-        model.zero_grad(set_to_none=True)
-        optimizer.zero_grad()
-
-        # Micro-batch loop: split traces into chunks of micro_batch_size.
-        # Each chunk's loss is scaled by 1/n_micro and backward() is called
-        # immediately, releasing that chunk's computation graph before the
-        # next chunk is processed.  Mathematically identical to one full-batch
-        # backward.  Advantages are not used in Phase 0 (no L_RL), so there is
-        # no group-normalization dependency across micro-batches.
-        n_total = len(traces)
-        n_micro = math.ceil(n_total / micro_batch_size)
-        l_trans_acc = l_out_acc = total_acc = 0.0
-
-        for mb_start in range(0, n_total, micro_batch_size):
-            mb_traces  = traces[mb_start : mb_start + micro_batch_size]
-            rewards_mb = torch.tensor(
-                [float(t["reward"]) for t in mb_traces],
-                dtype=torch.float32, device=device,
-            ).unsqueeze(-1)                                  # (mb, 1)
-
-            # Phase 0: no L_RL → lm_head bypassed → saves ~26 GB per chunk.
-            pipe = _run_pipeline_with_grad(
-                model, vae, z_injector, mb_traces, device, compute_log_pi=False
-            )
-
-            # pos_weight = n_neg / n_pos balances the incorrect/correct split.
-            pos_rate   = rewards_mb.mean().clamp(min=0.05)
-            pos_weight = ((1.0 - pos_rate) / pos_rate).clamp(max=20.0)
-
-            l_trans = vae.compute_transition_loss(pipe["z_list"])
-            l_out   = F.binary_cross_entropy_with_logits(
-                outcome_head(pipe["z_list"][-1]).view(-1),
-                rewards_mb.view(-1),
-                pos_weight=pos_weight,
-            )
-
-            total_mb: torch.Tensor = (
-                lambda_t * l_trans + lambda_out * l_out
-            ) / n_micro
-            total_mb.backward()  # release this micro-batch's computation graph
-
-            l_trans_acc += l_trans.detach().item() / n_micro
-            l_out_acc   += l_out.detach().item()   / n_micro
-            total_acc   += total_mb.detach().item()
-
-        torch.nn.utils.clip_grad_norm_(vae_params, max_norm=1.0)
-        optimizer.step()
-        # Backbone grads accumulated during backward — zero now to prevent
-        # stale accumulation across steps (backbone is never stepped).
-        model.zero_grad(set_to_none=True)
-
-        # ── Logging ───────────────────────────────────────────────────────
-        for k, v in (("loss",  total_acc),
-                     ("trans", l_trans_acc),
-                     ("out",   l_out_acc)):
-            pending[k] = pending.get(k, 0.0) + v
-        reward_rate = sum(t["reward"] for t in traces) / len(traces)
-        pending["reward_rate"] = pending.get("reward_rate", 0.0) + reward_rate
-
-        if (global_step + 1) % log_steps == 0:
-            n = log_steps
-            entry = {
-                "step":     global_step + 1,
-                "lambda_t": round(lambda_t, 4),
-                **{k: pending.get(k, 0.0) / n
-                   for k in ("loss", "trans", "out", "reward_rate")},
-            }
-            log_history.append(entry)
-            pending = {}
-            logger.info(
-                "step %d | λ_t=%.2f | loss=%.4f trans=%.4f out=%.4f | reward=%.1f%%",
-                entry["step"], entry["lambda_t"],
-                entry["loss"], entry["trans"], entry["out"],
-                entry["reward_rate"] * 100,
-            )
-
-        if (global_step + 1) % save_steps == 0:
-            _save_phase0_checkpoint(
-                run_dir / f"checkpoint-{global_step + 1}",
-                vae, z_injector, outcome_head, global_step + 1, log_history,
-            )
-
-        step_bar.set_postfix(
-            loss=f"{total_acc:.4f}",
-            trans=f"{l_trans_acc:.4f}",
-            rwd=f"{reward_rate:.0%}",
-        )
-        step_bar.update(1)
-
-    step_bar.close()
-
-    _save_phase0_checkpoint(
-        ckpt_path.parent, vae, z_injector, outcome_head, n_steps, log_history
-    )
-    logger.info("Phase 0 complete. Checkpoint → %s", ckpt_path.parent)
-
-
-
-
-
-def _save_phase0_checkpoint(
-    directory: Path,
-    vae: VAEStateEncoder,
-    z_injector: ZInjector,
-    outcome_head: OutcomeHead,
-    step: int,
-    log_history: list[dict],
-) -> None:
-    """Save VAE + ZInjector + OutcomeHead weights and trainer state."""
-    directory.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "vae":          vae.state_dict(),
-            "z_injector":   z_injector.state_dict(),
-            "outcome_head": outcome_head.state_dict(),
-            "step":         step,
-        },
-        directory / "phase0_encoder.pt",
-    )
-    (directory / "trainer_state.json").write_text(
-        json.dumps({"global_step": step, "log_history": log_history}, indent=2)
-    )
-
-
-# ---------------------------------------------------------------------------
-# Phase 1 — Joint RL Training
-# ---------------------------------------------------------------------------
-
-def latent_training_step(
-    model: AutoModelForCausalLM,
-    vae: VAEStateEncoder,
-    z_injector: ZInjector,
-    traces: list[dict],
-    advantages: list[float],
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    """Compute the Phase 1 loss for one training step: pure L_RL (GRPO).
-
-    L_RL = -mean_{i,h,t} [ advantage_i × log π_θ(token_t | context_{h,i}) ]
-
-    IS = 1 exactly (on-policy: rollout collected from current policy, one
-    gradient step per rollout batch, no multiple epochs).
-    Markov structure is enforced architecturally: each chunk's forward pass sees
-    only [z_h_prefix ‖ chunk_{h+1}], never raw token history.
-
-    Args:
-        model:      backbone in training mode (UNFROZEN).
-        vae:        VAEStateEncoder in training mode.
-        z_injector: ZInjector in training mode.
-        traces:     output of generate_latent_traces() for this step.
-        advantages: aligned GRPO advantages (clipped to ±adv_clip by caller).
-        device:     CUDA device.
-
-    Returns:
-        Dict with backward-able scalar "total" and detached scalar "l_rl".
-    """
-    pipe = _run_pipeline_with_grad(model, vae, z_injector, traces, device)
-
-    adv = [float(a) for a in advantages]
-    rl_sum   = torch.zeros(1, device=device)
-    n_tokens = 0
-    for lp_chunk in pipe["log_pi_chunks"]:      # 3 chunks
-        for i, lp in enumerate(lp_chunk):        # B×G traces
-            rl_sum   = rl_sum + (-adv[i] * lp.sum())
-            n_tokens += lp.shape[0]
-    l_rl = rl_sum / max(n_tokens, 1)
-
-    return {
-        "total": l_rl,
-        "l_rl":  l_rl.detach(),
+        "z_list":        [z_1,     z_2,     z_3],
+        "log_pi_chunks": [log_pi_1, log_pi_2, log_pi_3],
     }
 
 
 def train_latent(config: dict[str, Any], run_dir: Path) -> None:
-    """Phase 1: joint GRPO training with live backbone and z injection.
+    """Phase 1: pure L_RL GRPO with live backbone + encoder + z injection.
 
-    Loads Phase 0 encoder + ZInjector checkpoint, unfreezes backbone, and runs
-    the on-policy GRPO loop for max_steps steps.
+    Loads Phase 0 backbone and encoder checkpoint, then runs on-policy GRPO
+    for max_steps steps on the Level 5 hard pool.
 
-    Every training step:
-      1. [no_grad] collect G=128 rollouts for B=4 problems → 512 sequences
-      2. compute GRPO advantages per-problem-group (no interleaving)
-      3. [with_grad] re-run full pipeline → L_RL
-         (micro-batched for memory; advantages pre-computed → GRPO math unchanged)
-      4. step all optimizers (backbone lr=1e-6, encoder lr=3e-4)
+    Every step:
+      1. [no_grad]  collect G=128 rollouts for B=4 problems → 512 sequences
+      2.            compute GRPO advantages per-problem-group (clipped to ±20)
+      3. [with_grad] re-run full 3-chunk pipeline → L_RL
+      4.            single global grad clip + step all params
 
     Config keys consumed:
         primary.*              — backbone model ID, revision, dtype
-        phase0.checkpoint_path — path to phase0_encoder.pt (encoder + ZInjector)
         latent_markov.*        — latent_dim, hidden_dim, chunk_tokens
-        training.*             — seed, learning_rate, num_generations,
-                                 batch_size, max_steps, temperature, top_p,
-                                 gradient_checkpointing, logging_steps, save_steps
+        training.*             — seed, learning_rate (backbone), num_generations,
+                                 batch_size, micro_batch_size, max_steps,
+                                 temperature, top_p, gradient_checkpointing,
+                                 logging_steps, save_steps
         phase1_loss.*          — adv_clip, grad_clip
-        evaluation.path        — Level 5 hard pool JSONL for RL training
+        evaluation.path        — Level 5 hard pool path
     """
     primary      = config["primary"]
     training_cfg = config["training"]
@@ -1014,68 +918,51 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     phase0_cfg   = config["phase0"]
     phase1_cfg   = config.get("phase1_loss", {})
 
-    # Phase 1: pure L_RL.
+    model_id  = primary["huggingface_repo_id"]
+    revision  = primary.get("revision", "main")
+    dtype     = getattr(torch, primary.get("dtype", "bfloat16"))
+    attn_impl = primary.get("attn_implementation", "sdpa")
 
-    model_id     = primary["huggingface_repo_id"]
-    revision     = primary.get("revision", "main")
-    dtype        = getattr(torch, primary.get("dtype", "bfloat16"))
-    is_smoke     = (config.get("experiment") or {}).get("profile") == "smoke"
-
-    seed             = int(training_cfg.get("seed", 42))
-    lr_backbone      = float(training_cfg.get("learning_rate", 1e-6))
-    lr_vae           = 3e-4    # VAE/ZInjector trained at Phase 0 rate throughout
+    seed             = int(training_cfg.get("seed",              42))
+    lr_backbone      = float(training_cfg.get("learning_rate",   1e-6))
+    lr_encoder       = float(phase0_cfg.get("lr_encoder",        1e-4))
     G                = int(training_cfg.get("num_generations",   128))
     batch_size       = int(training_cfg.get("batch_size",          4))
-    micro_batch_size = int(training_cfg.get("micro_batch_size",   32))
+    micro_batch_size = int(training_cfg.get("micro_batch_size",  128))
     max_steps        = int(training_cfg.get("max_steps",         200))
-    temperature  = float(training_cfg.get("temperature",   1.0))
-    top_p        = float(training_cfg.get("top_p",         1.0))
-    log_steps    = int(training_cfg.get("logging_steps",   10))
-    save_steps   = int(training_cfg.get("save_steps",      50))
-    # Single global grad clip — no competing objectives in Phase 1, so no need
-    # to protect individual parameter groups from each other.
-    grad_clip = float(phase1_cfg.get("grad_clip", 1.0))
-    adv_clip  = float(phase1_cfg.get("adv_clip",  20.0))
+    temperature      = float(training_cfg.get("temperature",     1.0))
+    top_p            = float(training_cfg.get("top_p",           1.0))
+    log_steps        = int(training_cfg.get("logging_steps",      10))
+    save_steps       = int(training_cfg.get("save_steps",         50))
+    grad_clip        = float(phase1_cfg.get("grad_clip",          1.0))
+    adv_clip         = float(phase1_cfg.get("adv_clip",          20.0))
+    chunk_tokens     = int(latent_cfg.get("chunk_tokens",         341))
+    latent_dim       = int(latent_cfg.get("latent_dim",     LATENT_DIM))
+    hidden_dim       = int(latent_cfg.get("hidden_dim",     HIDDEN_DIM))
 
-    chunk_tokens = int(latent_cfg.get("chunk_tokens",  341))
-    latent_dim   = int(latent_cfg.get("latent_dim",  LATENT_DIM))
-    hidden_dim   = int(latent_cfg.get("hidden_dim",  HIDDEN_DIM))
-
-    vae0_path    = Path(phase0_cfg.get("checkpoint_path", run_dir / "phase0_encoder.pt"))
-    pool_path    = Path(config["evaluation"]["path"])
-    ckpt_path    = run_dir / "phase1"
+    # Phase 0 artifacts live at  run_dir/phase0/  (written by pretrain_distill).
+    # run_dir is the parent shared by both phases:  artifacts/<arm>/<run_id>/
+    phase0_dir = run_dir / "phase0"
+    pool_path  = Path(config["evaluation"]["path"])
+    ckpt_path  = run_dir / "phase1"
 
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Phase 1 — device: %s  adv_clip=%.1f  grad_clip=%.2f  (pure L_RL)",
-                device, adv_clip, grad_clip)
+    logger.info("Phase 1 — device: %s  G=%d  adv_clip=%.1f  grad_clip=%.2f",
+                device, G, adv_clip, grad_clip)
 
-    # ------------------------------------------------------------------
-    # Backbone
-    # ------------------------------------------------------------------
-    attn_impl = primary.get("attn_implementation", "sdpa")
-    logger.info("Loading backbone %s @ %s  attn=%s ...", model_id, revision, attn_impl)
-    if is_smoke:
-        from transformers import BitsAndBytesConfig
-        from peft import LoraConfig, get_peft_model
-
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=dtype,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
+    # ── Backbone: load from Phase 0 checkpoint directory ──────────────────────
+    backbone_dir = phase0_dir / "backbone"
+    if backbone_dir.is_dir():
+        logger.info("Loading backbone from Phase 0 checkpoint: %s", backbone_dir)
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, revision=revision,
-            quantization_config=bnb_config, device_map="auto",
+            str(backbone_dir),
+            torch_dtype=dtype, device_map="auto",
+            attn_implementation=attn_impl,
         )
-        lora_cfg = LoraConfig(
-            task_type="CAUSAL_LM", r=8, lora_alpha=16,
-            target_modules="all-linear", lora_dropout=0.05,
-        )
-        model = get_peft_model(model, lora_cfg)
     else:
+        logger.info("Phase 0 backbone dir not found; loading from HF: %s", model_id)
         model = AutoModelForCausalLM.from_pretrained(
             model_id, revision=revision,
             torch_dtype=dtype, device_map="auto",
@@ -1084,24 +971,13 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     model.train()
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_id, revision=revision, trust_remote_code=True, padding_side="left",
+        str(backbone_dir) if backbone_dir.is_dir() else model_id,
+        revision=None if backbone_dir.is_dir() else revision,
+        trust_remote_code=True, padding_side="left",
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     logger.info("  backbone ready")
-
-    # ------------------------------------------------------------------
-    # VAE + ZInjector — loaded from Phase 0 checkpoint
-    # ------------------------------------------------------------------
-    vae        = VAEStateEncoder(hidden_dim=hidden_dim, latent_dim=latent_dim).to(device)
-    z_injector = ZInjector(latent_dim=latent_dim, hidden_dim=hidden_dim).to(device)
-
-    logger.info("Loading Phase 0 checkpoint from %s ...", vae0_path)
-    ckpt = torch.load(vae0_path, weights_only=False, map_location=device)
-    vae.load_state_dict(ckpt["vae"])
-    z_injector.load_state_dict(ckpt["z_injector"])
-    vae.train(); z_injector.train()
-    logger.info("  VAE + ZInjector loaded (step %d)", ckpt.get("step", 0))
 
     if training_cfg.get("gradient_checkpointing", False):
         model.config.use_cache = False
@@ -1110,26 +986,34 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
         )
         logger.info("  gradient checkpointing enabled")
 
-    # ------------------------------------------------------------------
-    # Optimizer — two learning rates: backbone low, VAE/ZInjector higher
-    # ------------------------------------------------------------------
-    vae_params = list(vae.parameters()) + list(z_injector.parameters())
-    optimizer  = torch.optim.AdamW([
-        {"params": model.parameters(), "lr": lr_backbone},
-        {"params": vae_params,          "lr": lr_vae},
-    ])
+    # ── Encoder: load from Phase 0 checkpoint ─────────────────────────────────
+    encoder    = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device)
+    enc_ckpt   = phase0_dir / "phase0_encoder.pt"
+    if enc_ckpt.is_file():
+        ckpt = torch.load(enc_ckpt, weights_only=False, map_location=device)
+        encoder.load_state_dict(ckpt["encoder"])
+        logger.info("  encoder loaded from Phase 0 (step %d)", ckpt.get("step", 0))
+    else:
+        logger.warning("  Phase 0 encoder checkpoint not found at %s; using random init", enc_ckpt)
+    encoder.train()
 
-    # ------------------------------------------------------------------
-    # Training pool (Level 5 hard pool)
-    # ------------------------------------------------------------------
-    logger.info("Loading training pool from %s ...", pool_path)
+    # ── torch.compile (skip for smoke profiles) ────────────────────────────────
+    if config.get("experiment", {}).get("profile") != "smoke":
+        _setup_compile(model, encoder)
+
+    # ── Optimiser: two param groups, fused CUDA kernel ─────────────────────────
+    _fused = {"fused": True} if torch.cuda.is_available() else {}
+    optimizer = torch.optim.AdamW([
+        {"params": model.parameters(),   "lr": lr_backbone},
+        {"params": encoder.parameters(), "lr": lr_encoder},
+    ], **_fused)
+
+    # ── Training pool ─────────────────────────────────────────────────────────
     with open(pool_path, encoding="utf-8") as f:
         problems = [json.loads(line) for line in f if line.strip()]
-    logger.info("  %d problems in training pool", len(problems))
+    logger.info("Phase 1 pool: %d problems from %s", len(problems), pool_path)
 
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
+    # ── Training loop ─────────────────────────────────────────────────────────
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "resolved_config.json").write_text(json.dumps(config, indent=2))
 
@@ -1140,80 +1024,74 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     step_bar = tqdm(total=max_steps, desc="phase1", unit="step", dynamic_ncols=True)
 
     for global_step in range(max_steps):
-        # Sample batch_size problems (reshuffle when pool exhausted).
+        # Reshuffle pool when exhausted
         while len(pool_order) < batch_size:
             order = list(range(len(problems)))
             _random.shuffle(order)
             pool_order.extend(order)
         step_problems = [problems[pool_order.pop(0)] for _ in range(batch_size)]
 
-        # ── Rollout collection (no gradient) ──────────────────────────────
+        # ── Rollout collection (no gradient, strict Markov) ────────────────────
         with torch.no_grad():
-            model.eval(); vae.eval(); z_injector.eval()
+            model.eval(); encoder.eval()
             traces = generate_latent_traces(
-                model=model, tokenizer=tokenizer,
-                vae=vae, z_injector=z_injector,
+                model=model, tokenizer=tokenizer, encoder=encoder,
                 problems=step_problems, n_rollouts=G,
                 chunk_tokens=chunk_tokens,
                 temperature=temperature, top_p=top_p,
                 device=device,
             )
 
-        model.train(); vae.train(); z_injector.train()
+        model.train(); encoder.train()
 
         rewards    = [float(t["reward"]) for t in traces]
         advantages = compute_grpo_advantages(rewards, group_size=G, adv_clip=adv_clip)
 
-        # ── Training step (with gradient) ─────────────────────────────────
+        # ── Training step: micro-batched L_RL ──────────────────────────────────
         optimizer.zero_grad()
 
-        # Micro-batch loop over the B×G traces.
-        # Advantages are pre-computed over the FULL group (above) → GRPO
-        # group normalization is correct regardless of how we partition the
-        # backward passes.  Scaling each micro-batch's loss by 1/n_micro and
-        # calling backward() immediately is mathematically identical to one
-        # full-batch backward.
-        n_total_p1 = len(traces)
-        n_micro_p1 = math.ceil(n_total_p1 / micro_batch_size)
-        metrics_acc: dict[str, float] = {"total": 0.0, "l_rl": 0.0}
+        n_total = len(traces)
+        n_micro = -(-n_total // micro_batch_size)   # ceil division
+        l_rl_acc = 0.0
 
-        for mb_start in range(0, n_total_p1, micro_batch_size):
+        for mb_start in range(0, n_total, micro_batch_size):
             mb_traces = traces    [mb_start : mb_start + micro_batch_size]
             mb_adv    = advantages[mb_start : mb_start + micro_batch_size]
 
-            metrics_mb = latent_training_step(
-                model=model, vae=vae, z_injector=z_injector,
-                traces=mb_traces, advantages=mb_adv,
-                device=device,
-            )
+            pipe = _pipeline_with_grad(model, encoder, mb_traces, device)
 
-            (metrics_mb["total"] / n_micro_p1).backward()  # release graph immediately
+            rl_sum = torch.zeros(1, device=device)
+            n_tok  = 0
+            for lp_chunk in pipe["log_pi_chunks"]:
+                for i, lp in enumerate(lp_chunk):
+                    rl_sum = rl_sum + (-mb_adv[i] * lp.sum())
+                    n_tok += lp.shape[0]
+            l_rl = rl_sum / max(n_tok, 1)
 
-            for k in ("total", "l_rl"):
-                metrics_acc[k] += metrics_mb[k].item() / n_micro_p1
+            (l_rl / n_micro).backward()
+            l_rl_acc += l_rl.detach().item() / n_micro
 
-        all_params = list(model.parameters()) + vae_params
+        all_params = list(model.parameters()) + list(encoder.parameters())
         torch.nn.utils.clip_grad_norm_(all_params, grad_clip)
         optimizer.step()
 
-        # ── Logging ───────────────────────────────────────────────────────
-        for k in ("total", "l_rl"):
-            pending[k] = pending.get(k, 0.0) + metrics_acc[k]
-        pending["reward_rate"] = (
-            pending.get("reward_rate", 0.0) + sum(rewards) / len(rewards)
-        )
+        # ── Logging ───────────────────────────────────────────────────────────
+        reward_rate = sum(rewards) / len(rewards)
+        for k, v in (("total", l_rl_acc), ("l_rl", l_rl_acc), ("reward_rate", reward_rate)):
+            pending[k] = pending.get(k, 0.0) + v
 
         if (global_step + 1) % log_steps == 0:
-            n = log_steps
+            n     = log_steps
             entry = {
-                "step": global_step + 1,
-                **{k: pending.get(k, 0.0) / n
-                   for k in ("total", "l_rl", "reward_rate")},
+                "step":        global_step + 1,
+                "total":       pending.get("total",       0.0) / n,
+                "l_rl":        pending.get("l_rl",        0.0) / n,
+                "reward_rate": pending.get("reward_rate", 0.0) / n,
             }
             log_history.append(entry)
             pending = {}
             logger.info(
-                "step %d | total=%.4f rl=%.4f | reward=%.1f%%",
+                "step %d | total=%.4f rl=%.4f | reward=%.3f%%",
                 entry["step"], entry["total"], entry["l_rl"],
                 entry["reward_rate"] * 100,
             )
@@ -1221,43 +1099,63 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
         if (global_step + 1) % save_steps == 0:
             _save_phase1_checkpoint(
                 ckpt_path / f"checkpoint-{global_step + 1}",
-                model, vae, z_injector, optimizer, global_step + 1, log_history,
-                tokenizer=tokenizer,
+                model, encoder, optimizer, global_step + 1, log_history, tokenizer,
             )
 
         step_bar.set_postfix(
-            loss=f"{metrics_acc['total']:.4f}",
-            rl=f"{metrics_acc['l_rl']:.4f}",
+            rl=f"{l_rl_acc:.4f}",
+            rwd=f"{reward_rate:.3%}",
         )
         step_bar.update(1)
 
     step_bar.close()
-
     _save_phase1_checkpoint(
-        ckpt_path / "final", model, vae, z_injector,
-        optimizer, max_steps, log_history, tokenizer=tokenizer,
+        ckpt_path / "final", model, encoder,
+        optimizer, max_steps, log_history, tokenizer,
     )
     logger.info("Phase 1 complete. Checkpoint → %s", ckpt_path / "final")
 
 
+# ── Checkpointing ──────────────────────────────────────────────────────────────
+
+def _save_phase0_checkpoint(
+    directory: Path,
+    model: AutoModelForCausalLM,
+    encoder: LatentStateEncoder,
+    step: int,
+    log_history: list[dict],
+    tokenizer: AutoTokenizer | None = None,
+) -> None:
+    """Save Phase 0 backbone + encoder weights and trainer state."""
+    directory.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {"encoder": encoder.state_dict(), "step": step},
+        directory / "phase0_encoder.pt",
+    )
+    model.save_pretrained(str(directory / "backbone"))
+    if tokenizer is not None:
+        tokenizer.save_pretrained(str(directory / "backbone"))
+    (directory / "trainer_state.json").write_text(
+        json.dumps({"global_step": step, "log_history": log_history}, indent=2)
+    )
+
+
 def _save_phase1_checkpoint(
     directory: Path,
-    model: "AutoModelForCausalLM",
-    vae: "VAEStateEncoder",
-    z_injector: "ZInjector",
+    model: AutoModelForCausalLM,
+    encoder: LatentStateEncoder,
     optimizer: torch.optim.Optimizer,
     step: int,
     log_history: list[dict],
-    tokenizer=None,
+    tokenizer: AutoTokenizer | None = None,
 ) -> None:
-    """Save backbone, VAE, ZInjector, and optimizer state."""
+    """Save Phase 1 backbone + encoder + optimizer and trainer state."""
     directory.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "vae":        vae.state_dict(),
-            "z_injector": z_injector.state_dict(),
-            "optimizer":  optimizer.state_dict(),
-            "step":       step,
+            "encoder":   encoder.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step":      step,
         },
         directory / "phase1_latent.pt",
     )

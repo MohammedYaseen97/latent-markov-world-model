@@ -23,9 +23,10 @@ See ``configs/eval_math_beyond.yaml`` and ``PROJECT_CONTRACT.md`` (Phase 2).
 from __future__ import annotations
 
 import argparse
+import gc
 import json
-import sys
 import math
+import sys
 from math import comb
 from pathlib import Path
 from typing import Any
@@ -41,7 +42,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.utils.config_loader import load_yaml_with_extends
 from src.training.grpo_baseline import SYSTEM_PROMPT, answers_equivalent, extract_answer
-from src.models.vae_state_encoder import VAEStateEncoder, ZInjector
+from src.models.vae_state_encoder import HIDDEN_DIM, LATENT_DIM, LatentStateEncoder
+from src.training.grpo_latent import generate_latent_traces, _setup_compile
+from src.training.grpo_token_markov import generate_delethink_trace, make_tm_system_prompt
 
 
 def parse_args() -> argparse.Namespace:
@@ -312,6 +315,8 @@ def _estimate_pass_at_k_metrics(
             device_map="auto",
         )
         model.eval()
+        if eval_cfg.get("compile_model", True):
+            _setup_compile(model)
 
         for prompt_text, problem in tqdm(
             zip(prompts, problems), total=len(problems), desc="Evaluating", unit="problem"
@@ -350,11 +355,93 @@ def _estimate_pass_at_k_metrics(
     }
 
 
-# _last_hidden_via_hook and _generate_latent_eval_batch have been deleted.
-# Both latent eval functions now call generate_latent_traces() directly from
-# src.training.grpo_latent — the same function used by Phase 0 and Phase 1
-# training — so any fix to the training pipeline is automatically reflected
-# in eval without manual mirroring.
+def _load_latent_backbone(
+    backbone_dir: Path,
+    primary_cfg: dict[str, Any],
+    device: torch.device,
+) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
+    """Load backbone and tokenizer for latent arm eval.
+
+    Tries backbone_dir first (saved by _save_phase0/1_checkpoint); falls back
+    to the original HF model ID if the directory doesn't exist or has no chat
+    template (e.g. checkpoints saved before tokenizer was included).
+    """
+    attn_impl  = primary_cfg.get("attn_implementation", "sdpa")
+    model_id   = primary_cfg["huggingface_repo_id"]
+    revision   = primary_cfg.get("revision", "main")
+    src        = str(backbone_dir) if backbone_dir.is_dir() else model_id
+
+    model = AutoModelForCausalLM.from_pretrained(
+        src, torch_dtype=torch.bfloat16, device_map="auto",
+        attn_implementation=attn_impl,
+    )
+    model.eval()
+
+    tok = AutoTokenizer.from_pretrained(src, trust_remote_code=True, padding_side="left")
+    if tok.chat_template is None:
+        tok = AutoTokenizer.from_pretrained(
+            model_id, revision=revision, trust_remote_code=True, padding_side="left",
+        )
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    return model, tok
+
+
+def _latent_eval_loop(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    encoder: LatentStateEncoder,
+    problems: list[dict[str, Any]],
+    n_samples: int,
+    chunk_tokens: int,
+    temperature: float,
+    top_p: float,
+    device: torch.device,
+    eval_cfg: dict[str, Any],
+    ks: list[int],
+    desc: str = "latent eval",
+) -> dict[str, float]:
+    """Shared evaluation loop for all latent arm modes.
+
+    Calls generate_latent_traces() — the same function used during training —
+    so the generation pipeline is identical by construction. Rewards are
+    pre-computed inside generate_latent_traces; no separate grading needed.
+    """
+    n_per_problem = int(eval_cfg.get("latent_eval_n_per_problem",      8))
+    p_batch       = int(eval_cfg.get("latent_eval_problem_batch_size", 32))
+    n_iters       = math.ceil(n_samples / n_per_problem)
+
+    per_problem_correct: list[int] = [0] * len(problems)
+    per_problem_total:   list[int] = [0] * len(problems)
+
+    n_pb = math.ceil(len(problems) / p_batch)
+    for it in tqdm(range(n_iters), desc=desc, unit="iter"):
+        this_n = min(n_per_problem, n_samples - it * n_per_problem)
+        for pb_start in tqdm(range(0, len(problems), p_batch), total=n_pb,
+                             desc=f"  iter {it+1}/{n_iters} batches", unit="batch",
+                             leave=False):
+            pb_end   = min(len(problems), pb_start + p_batch)
+            traces   = generate_latent_traces(
+                model=model, tokenizer=tokenizer, encoder=encoder,
+                problems=problems[pb_start:pb_end], n_rollouts=this_n,
+                chunk_tokens=chunk_tokens,
+                temperature=temperature, top_p=top_p, device=device,
+            )
+            P_batch = pb_end - pb_start
+            for p_idx in range(P_batch):
+                abs_idx = pb_start + p_idx
+                for r_idx in range(this_n):
+                    per_problem_correct[abs_idx] += traces[p_idx * this_n + r_idx]["reward"]
+                    per_problem_total[abs_idx]   += 1
+
+    return {
+        f"pass@{k}": sum(
+            _unbiased_pass_at_k(per_problem_total[i], per_problem_correct[i], k)
+            for i in range(len(problems))
+        ) / len(problems)
+        for k in ks
+    }
 
 
 def _estimate_pass_at_k_metrics_latent(
@@ -365,229 +452,80 @@ def _estimate_pass_at_k_metrics_latent(
     eval_cfg: dict[str, Any],
     train_cfg: dict[str, Any],
 ) -> dict[str, float]:
-    """Compute pass@k for the latent Markov arm using chunked z-injection inference.
-
-    Loads the Phase 1 checkpoint (backbone + VAE + ZInjector), then drives
-    generation through generate_latent_traces() — the same function used by
-    Phase 0 and Phase 1 training — so the eval pipeline is identical to the
-    training pipeline by construction.
-
-    Does NOT support vLLM (z-injection inputs_embeds is incompatible with
-    vLLM's offline engine).  HF generate only.
-
-    Memory knobs (from eval_cfg):
-        latent_eval_n_per_problem       N samples generated per problem per call
-        latent_eval_problem_batch_size  P problems per generate_latent_traces call
-        → B = P × N sequences per model.generate() call.
-    """
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from src.models.vae_state_encoder import VAEStateEncoder, ZInjector
-    from src.training.grpo_latent import generate_latent_traces
-
+    """pass@k for the Phase 1 latent Markov arm (backbone + trained encoder)."""
     latent_cfg   = train_cfg["latent_markov"]
     primary_cfg  = train_cfg["primary"]
-    chunk_tokens = int(latent_cfg.get("chunk_tokens", 341))
-    latent_dim   = int(latent_cfg.get("latent_dim", 64))
-    hidden_dim   = int(latent_cfg.get("hidden_dim", 1536))
-    temperature  = float(eval_cfg.get("temperature", 1.0))
-    top_p        = float(eval_cfg.get("top_p", 1.0))
-    n_samples    = max(ks)
+    chunk_tokens = int(latent_cfg.get("chunk_tokens",  341))
+    latent_dim   = int(latent_cfg.get("latent_dim",    LATENT_DIM))
+    hidden_dim   = int(latent_cfg.get("hidden_dim",    HIDDEN_DIM))
+    temperature  = float(eval_cfg.get("temperature",   1.0))
+    top_p        = float(eval_cfg.get("top_p",         1.0))
+    device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # ── Load backbone ──────────────────────────────────────────────────
-    # _save_phase1_checkpoint writes backbone to <checkpoint>/backbone/
-    # and latent state to <checkpoint>/phase1_latent.pt.
     ckpt_dir     = Path(checkpoint)
-    backbone_dir = ckpt_dir / "backbone"
-    attn_impl    = primary_cfg.get("attn_implementation", "sdpa")
-    model = AutoModelForCausalLM.from_pretrained(
-        str(backbone_dir), torch_dtype=torch.bfloat16, device_map="auto",
-        attn_implementation=attn_impl,
-    )
-    model.eval()
+    model, tokenizer = _load_latent_backbone(ckpt_dir / "backbone", primary_cfg, device)
+
+    p1_ckpt = torch.load(ckpt_dir / "phase1_latent.pt", weights_only=False, map_location=device)
+    encoder = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device)
+    encoder.load_state_dict(p1_ckpt["encoder"])
+    encoder.eval()
+
     if eval_cfg.get("compile_model", True):
-        model = torch.compile(model, mode="reduce-overhead")
+        _setup_compile(model, encoder)
 
-    # Try loading tokenizer from saved backbone; fall back to original model ID
-    # for checkpoints saved before the tokenizer was included.
-    _tok_src       = str(backbone_dir)
-    _tok_candidate = AutoTokenizer.from_pretrained(
-        _tok_src, trust_remote_code=True, padding_side="left",
+    return _latent_eval_loop(
+        model, tokenizer, encoder, problems,
+        n_samples=max(ks), chunk_tokens=chunk_tokens,
+        temperature=temperature, top_p=top_p,
+        device=device, eval_cfg=eval_cfg, ks=ks,
+        desc="latent eval",
     )
-    if _tok_candidate.chat_template is None:
-        _tok_src  = primary_cfg["huggingface_repo_id"]
-        tokenizer = AutoTokenizer.from_pretrained(
-            _tok_src, trust_remote_code=True, padding_side="left",
-        )
-    else:
-        tokenizer = _tok_candidate
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # ── Load Phase 1 VAE + ZInjector ──────────────────────────────────
-    p1_ckpt_path = ckpt_dir / "phase1_latent.pt"
-    p1_ckpt = torch.load(p1_ckpt_path, weights_only=False, map_location=device)
-
-    vae = VAEStateEncoder(hidden_dim=hidden_dim, latent_dim=latent_dim).to(device)
-    vae.load_state_dict(p1_ckpt["vae"])
-    vae.eval()
-
-    z_injector = ZInjector(latent_dim=latent_dim, hidden_dim=hidden_dim).to(device)
-    z_injector.load_state_dict(p1_ckpt["z_injector"])
-    z_injector.eval()
-
-    # ── Eval loop ─────────────────────────────────────────────────────
-    # generate_latent_traces is already decorated @torch.no_grad(); no wrapper needed.
-    # Rewards come pre-computed in each trace (same grading as training).
-    n_per_problem = int(eval_cfg.get("latent_eval_n_per_problem", 8))
-    p_batch       = int(eval_cfg.get("latent_eval_problem_batch_size", 32))
-    n_iters       = math.ceil(n_samples / n_per_problem)
-
-    per_problem_correct: list[int] = [0] * len(problems)
-    per_problem_total:   list[int] = [0] * len(problems)
-
-    n_pb = math.ceil(len(problems) / p_batch)
-    for it in tqdm(range(n_iters), desc="latent eval", unit="iter"):
-        this_n = min(n_per_problem, n_samples - it * n_per_problem)
-        for pb_start in tqdm(range(0, len(problems), p_batch), total=n_pb,
-                             desc=f"  iter {it+1}/{n_iters} prob-batches", unit="batch",
-                             leave=False):
-            pb_end   = min(len(problems), pb_start + p_batch)
-            pb_probs = problems[pb_start:pb_end]
-            traces   = generate_latent_traces(
-                model=model, tokenizer=tokenizer,
-                vae=vae, z_injector=z_injector,
-                problems=pb_probs, n_rollouts=this_n,
-                chunk_tokens=chunk_tokens,
-                temperature=temperature, top_p=top_p,
-                device=device,
-            )
-            # traces is flat: [prob0_r0, ..., prob0_r{this_n-1}, prob1_r0, ...]
-            P_batch = pb_end - pb_start
-            for p_idx in range(P_batch):
-                abs_idx = pb_start + p_idx
-                for r_idx in range(this_n):
-                    t = traces[p_idx * this_n + r_idx]
-                    per_problem_correct[abs_idx] += t["reward"]
-                    per_problem_total[abs_idx]   += 1
-
-    return {
-        f"pass@{k}": sum(
-            _unbiased_pass_at_k(per_problem_total[i], per_problem_correct[i], k)
-            for i in range(len(problems))
-        ) / len(problems)
-        for k in ks
-    }
 
 
 def _estimate_pass_at_k_metrics_latent_pretrained(
     *,
     problems: list[dict[str, Any]],
+    checkpoint: str,
     ks: list[int],
     eval_cfg: dict[str, Any],
     train_cfg: dict[str, Any],
 ) -> dict[str, float]:
-    """Compute pass@k for the controlled latent baseline (latent_grpo_pretrained).
+    """pass@k for the controlled latent baseline (Phase 0 backbone + encoder).
 
-    Loads the original pretrained backbone directly from HF (no LoRA, no Phase 1
-    updates) together with the Phase 0 VAE checkpoint and a freshly initialised
-    ZInjector.  Establishes the capability floor under the latent generation
-    regime — the equivalent of baseline_pretrained for the latent arm.
+    checkpoint should point to the Phase 0 artifact directory
+    (artifacts/<arm>/<run_id>/phase0/).
 
-    Uses generate_latent_traces() from training for generation, so the forward
-    pass (prompt encoding, Markov repr computation, z injection) is byte-for-byte
-    identical to Phase 0 and Phase 1 training.
+    Establishes the capability floor before Phase 1 RL — the equivalent of
+    baseline_pretrained for the latent arm.
     """
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from src.models.vae_state_encoder import VAEStateEncoder, ZInjector
-    from src.training.grpo_latent import generate_latent_traces
+    latent_cfg  = train_cfg["latent_markov"]
+    primary_cfg = train_cfg["primary"]
+    chunk_tokens = int(latent_cfg.get("chunk_tokens",  341))
+    latent_dim   = int(latent_cfg.get("latent_dim",    LATENT_DIM))
+    hidden_dim   = int(latent_cfg.get("hidden_dim",    HIDDEN_DIM))
+    temperature  = float(eval_cfg.get("temperature",   1.0))
+    top_p        = float(eval_cfg.get("top_p",         1.0))
+    device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    primary_cfg  = train_cfg["primary"]
-    latent_cfg   = train_cfg["latent_markov"]
-    phase0_cfg   = train_cfg["phase0"]
+    phase0_dir = Path(checkpoint)
+    model, tokenizer = _load_latent_backbone(phase0_dir / "backbone", primary_cfg, device)
 
-    model_id     = primary_cfg["huggingface_repo_id"]
-    revision     = primary_cfg.get("revision", "main")
-    chunk_tokens = int(latent_cfg.get("chunk_tokens", 341))
-    latent_dim   = int(latent_cfg.get("latent_dim", 64))
-    hidden_dim   = int(latent_cfg.get("hidden_dim", 1536))
-    temperature  = float(eval_cfg.get("temperature", 1.0))
-    top_p        = float(eval_cfg.get("top_p", 1.0))
-    n_samples    = max(ks)
+    enc_ckpt = phase0_dir / "phase0_encoder.pt"
+    ckpt     = torch.load(str(enc_ckpt), weights_only=False, map_location=device)
+    encoder  = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device)
+    encoder.load_state_dict(ckpt["encoder"])
+    encoder.eval()
 
-    vae0_path = Path(phase0_cfg.get("checkpoint_path", "runs/latent_grpo/phase0_encoder.pt"))
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    attn_impl = primary_cfg.get("attn_implementation", "sdpa")
-    print(f"[latent_markov_pretrained] Loading backbone {model_id} @ {revision} …",
-          file=sys.stderr)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, revision=revision, torch_dtype=torch.bfloat16,
-        device_map="auto", attn_implementation=attn_impl,
-    )
-    model.eval()
     if eval_cfg.get("compile_model", True):
-        model = torch.compile(model, mode="reduce-overhead")
+        _setup_compile(model, encoder)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id, revision=revision, trust_remote_code=True, padding_side="left",
+    return _latent_eval_loop(
+        model, tokenizer, encoder, problems,
+        n_samples=max(ks), chunk_tokens=chunk_tokens,
+        temperature=temperature, top_p=top_p,
+        device=device, eval_cfg=eval_cfg, ks=ks,
+        desc="latent_pretrained eval",
     )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    print(f"[latent_markov_pretrained] Loading Phase 0 VAE from {vae0_path} …", file=sys.stderr)
-    ckpt = torch.load(str(vae0_path), weights_only=False, map_location=device)
-    vae = VAEStateEncoder(hidden_dim=hidden_dim, latent_dim=latent_dim).to(device)
-    vae.load_state_dict(ckpt["vae"])
-    vae.eval()
-
-    z_injector = ZInjector(latent_dim=latent_dim, hidden_dim=hidden_dim).to(device)
-    if "z_injector" in ckpt:
-        z_injector.load_state_dict(ckpt["z_injector"])
-    z_injector.eval()
-
-    # generate_latent_traces is @torch.no_grad(); rewards pre-computed per trace.
-    n_per_problem = int(eval_cfg.get("latent_eval_n_per_problem", 8))
-    p_batch       = int(eval_cfg.get("latent_eval_problem_batch_size", 32))
-    n_iters       = math.ceil(n_samples / n_per_problem)
-
-    per_problem_correct: list[int] = [0] * len(problems)
-    per_problem_total:   list[int] = [0] * len(problems)
-
-    n_pb = math.ceil(len(problems) / p_batch)
-    for it in tqdm(range(n_iters), desc="latent_pretrained eval", unit="iter"):
-        this_n = min(n_per_problem, n_samples - it * n_per_problem)
-        for pb_start in tqdm(range(0, len(problems), p_batch), total=n_pb,
-                             desc=f"  iter {it+1}/{n_iters} prob-batches", unit="batch",
-                             leave=False):
-            pb_end   = min(len(problems), pb_start + p_batch)
-            pb_probs = problems[pb_start:pb_end]
-            traces   = generate_latent_traces(
-                model=model, tokenizer=tokenizer,
-                vae=vae, z_injector=z_injector,
-                problems=pb_probs, n_rollouts=this_n,
-                chunk_tokens=chunk_tokens,
-                temperature=temperature, top_p=top_p,
-                device=device,
-            )
-            P_batch = pb_end - pb_start
-            for p_idx in range(P_batch):
-                abs_idx = pb_start + p_idx
-                for r_idx in range(this_n):
-                    t = traces[p_idx * this_n + r_idx]
-                    per_problem_correct[abs_idx] += t["reward"]
-                    per_problem_total[abs_idx]   += 1
-
-    return {
-        f"pass@{k}": sum(
-            _unbiased_pass_at_k(per_problem_total[i], per_problem_correct[i], k)
-            for i in range(len(problems))
-        ) / len(problems)
-        for k in ks
-    }
 
 
 def _estimate_pass_at_k_metrics_token_markov(
@@ -624,9 +562,6 @@ def _estimate_pass_at_k_metrics_token_markov(
     HF generate (smoke / no-vLLM fallback):
       Sequential, one trace at a time (already memory-efficient).
     """
-    import gc
-    import math
-
     n_samples = max(ks)
     temperature = eval_cfg.get("temperature", 1.0)
     top_p = eval_cfg.get("top_p", 1.0)
@@ -644,7 +579,6 @@ def _estimate_pass_at_k_metrics_token_markov(
     I = int(tm_cfg["iteration_cap"])
     P = int(tm_cfg["planning_prefix_tokens"])
 
-    from src.training.grpo_token_markov import make_tm_system_prompt
     tm_system_prompt = make_tm_system_prompt(m)
 
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
@@ -814,14 +748,14 @@ def _estimate_pass_at_k_metrics_token_markov(
     else:
         # ── HF sequential fallback (smoke / no-vLLM) ─────────────────────────
         # One trace at a time — already bounded RAM, no grouping needed.
-        from src.training.grpo_token_markov import generate_delethink_trace
-
         model = AutoModelForCausalLM.from_pretrained(
             checkpoint,
             dtype=torch.bfloat16,
             device_map="auto",
         )
         model.eval()
+        if eval_cfg.get("compile_model", True):
+            _setup_compile(model)
 
         for problem in tqdm(problems, desc="Evaluating (token-Markov HF)", unit="problem"):
             messages = [
@@ -910,9 +844,15 @@ def main() -> None:
                 "--train-config is required for --generation-mode latent_markov_pretrained. "
                 "Pass e.g. configs/train_latent_grpo.yaml."
             )
+        if args.checkpoint is None:
+            raise ValueError(
+                "--checkpoint is required for --generation-mode latent_markov_pretrained. "
+                "Pass the Phase 0 artifact directory: artifacts/<arm>/<run_id>/phase0/"
+            )
         train_cfg = load_yaml_with_extends(args.train_config.resolve(), root=REPO_ROOT)
         metrics = _estimate_pass_at_k_metrics_latent_pretrained(
             problems=problems,
+            checkpoint=args.checkpoint,
             ks=ks,
             eval_cfg=eval_cfg,
             train_cfg=train_cfg,

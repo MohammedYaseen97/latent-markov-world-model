@@ -1,17 +1,13 @@
-# Latent Markov arm — smoke profile for RTX 4060 8 GB (pipeline verification).
+# Latent Markov arm — smoke profile for pipeline verification.
 #
-# Goal: confirm the full Phase 0 + Phase 1 pipeline runs end-to-end without
-#       error on a small machine.  2 steps, 2 problems — NO meaningful signal;
-#       validates plumbing only.
-#
-# NFR3: must run end-to-end in < 10 min on the 4060.
+# 2 Phase 0 steps + 2 Phase 1 steps. No meaningful learning signal.
+# Purpose: confirm the full v3 pipeline (distillation + strict Markov GRPO)
+# runs end-to-end without error on a small machine or CI environment.
 #
 # Usage:
-#   # Phase 0 (online, smoke)
 #   python scripts/train_latent.py \
 #       --config configs/train_latent_grpo_smoke.yaml --phase 0
 #
-#   # Phase 1 (smoke)
 #   python scripts/train_latent.py \
 #       --config configs/train_latent_grpo_smoke.yaml --phase 1
 
@@ -22,57 +18,48 @@ experiment:
   profile: "smoke"
   state_mode: "latent_markov"
 
-# ---------------------------------------------------------------------------
-# Latent arm architecture
-# ---------------------------------------------------------------------------
 latent_markov:
   latent_dim: 64
   hidden_dim: 1536
   n_chunks: 3
   chunk_tokens: 341
 
-# ---------------------------------------------------------------------------
-# Phase 0 — Online encoder pretraining (smoke)
-# ---------------------------------------------------------------------------
 phase0:
   pool_path: "data/math_easy_pool.jsonl"
-  checkpoint_path: "runs/latent_grpo_smoke/phase0_encoder.pt"
 
   n_steps: 2
   batch_size: 2
-  num_generations: 2
 
-  learning_rate: 3.0e-4
-  lambda_trans_peak: 3.0
-  lambda_out: 5.0
+  lr_backbone: 1.0e-6
+  lr_encoder:  1.0e-4
+
+  temperature: 1.0
+  top_p: 1.0
 
   logging_steps: 1
   save_steps: 10
 
-# ---------------------------------------------------------------------------
-# NFR6 diagnostic
-# ---------------------------------------------------------------------------
-nfr6:
-  output_dir: "runs/latent_grpo_smoke/plots"
-  method: "tsne"
+phase0_sanity:
+  n_val_problems: 2
+  ce_loss_threshold: 20.0    # very loose for smoke — just checking it runs
+  z_variance_threshold: 0.0
+  n_z_problems: 2
 
-# ---------------------------------------------------------------------------
-# Phase 1 (smoke)
-# ---------------------------------------------------------------------------
 training:
   seed: 42
   learning_rate: 1.0e-6
   num_generations: 2
   batch_size: 2
-  grad_accum_steps: 1
-  max_completion_length: 1024
+  micro_batch_size: 4
+  use_vllm: false
+  vllm_gpu_memory_utilization: ~
+  vllm_max_model_len: ~
+  gradient_checkpointing: false
   temperature: 1.0
   top_p: 1.0
   max_steps: 2
-  num_epochs: 1
-  gradient_checkpointing: true
   logging_steps: 1
-  save_steps: 5
+  save_steps: 10
 
 evaluation:
   path: "data/math_level5_hard_pool.jsonl"

@@ -2,10 +2,10 @@
 """Calibration check: pass@k on a candidate Phase 0 pretraining pool.
 
 Runs the model on each problem with n=k samples and reports whether the
-pool provides enough positive training examples for L_outcome.
+pool has enough solvable problems for meaningful distillation signal.
 
 Rule of thumb: if ≥ 20% of problems are solved at pass@8, the pool is usable.
-If < 5%, switch to an easier pool or increase G during pretraining.
+If < 5%, switch to an easier pool.
 
 Default k:    8  (mirrors G=8 rollouts used during Phase 0 pretraining)
 Default seed: 42 (fully reproducible generations)
@@ -207,13 +207,13 @@ def main() -> None:
     print("Interpretation for Phase 0:")
     if pct_problems_solved >= 20:
         print(f"  GOOD — {pct_problems_solved:.0f}% of problems solved at n={args.n_samples}.")
-        print("  L_outcome will see positive training examples. Phase 0 design is sound.")
+        print("  Distillation will have enough solvable targets. Phase 0 design is sound.")
     elif pct_problems_solved >= 5:
         print(f"  MARGINAL — {pct_problems_solved:.0f}% of problems solved at n={args.n_samples}.")
         print("  Some positive examples exist. Consider increasing G during pretraining.")
     else:
         print(f"  LOW — only {pct_problems_solved:.0f}% of problems solved at n={args.n_samples}.")
-        print("  L_outcome will be starved of positive examples. Switch to an easier pool.")
+        print("  Too few solvable problems for distillation signal. Switch to an easier pool.")
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

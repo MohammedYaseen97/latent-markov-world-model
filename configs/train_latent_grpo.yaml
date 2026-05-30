@@ -1,69 +1,45 @@
-# Latent Markov arm — full RTX Pro 6000 Blackwell profile (v2 design).
+# Latent Markov arm — full RTX Pro 6000 Blackwell 96 GB profile (v3 design).
 #
-# Phase 0: backbone FROZEN; Encoder + ZInjector + OutcomeHead trained ONLINE.
-#   400 steps × 128 sequences/step = 51 200 on-policy trajectories.
-#   400 problems sampled from the easy pool, each given exactly G=128 rollouts.
-#   Sequences are spread across steps via pre-shuffled assignment (see below).
-# Phase 1: backbone UNFROZEN; on-policy GRPO with live z injection on Level 5 hard pool.
-#   200 steps × 4 problems × 128 rollouts = 102 400 fresh rollouts.
+# Phase 0: teacher-forced distillation pretraining on L1–L4.
+#   Teacher: original frozen Qwen, full context per chunk.
+#   Student: backbone (lr=1e-6) + encoder/injector (lr=1e-4).
+#   Loss: CE distillation on chunks 2 and 3.
+#   No reward needed. No auxiliary losses.
 #
-# Phase 0 generation strategy ("pre-shuffled assignment"):
-#   n_problems = n_steps × seqs_per_step / G = 400 × 128 / 128 = 400 problems.
-#   Build flat list: 400 problems × 128 rollout-slots = 51 200 entries.  Shuffle.
-#   Each step takes a window of 128 entries → ~110 unique problems per step,
-#   each contributing ~1-2 rollout slots.  Generate with n_rollouts=1 per slot.
-#   Effect: (1) every problem gets exactly G=128 rollouts (uniform with eval),
-#           (2) every gradient step sees ~110 diverse problems (L_out generalizes),
-#           (3) same memory as before (128 simultaneous sequences per step).
-#   "batch_size" is no longer a meaningful concept for Phase 0; removed from config.
+# Phase 1: on-policy GRPO on Level 5 hard pool.
+#   Strict Markov generation: [z_prefix | generate], no crutch.
+#   Pure L_RL. 200 steps × 4 problems × 128 rollouts = 102 400 traces.
 #
-# v2 design:
-#   - Deterministic encoder: z_h = μ_h always. No sampling, no logvar.
-#   - Phase 0: L_trans + L_out only (400 steps, frozen backbone)
-#   - Phase 1: pure L_RL (adv_clip=20.0, grad_clip=1.0, matches baseline GRPO)
-#   - Benchmark: MATH Level 5 hard pool (~350 problems), metric: pass@128
+# VRAM budget (96 GB):
+#   Phase 0: teacher (3 GB frozen) + student (3 GB) + AdamW moments (12 GB)
+#     + activations for batch=64 × 3 chunks (~21 GB) ≈ 39 GB — very comfortable.
+#   Phase 1 rollout: model (3 GB) + KV cache for 512 seqs × ~542 tok ≈ 32 GB total.
+#   Phase 1 train:   model (3 GB) + AdamW (15 GB) + logits/activations for
+#     micro_batch=128 × 3 chunks ≈ 40 GB → 58 GB total.
 #
-# Inherits shared training knobs (lr, G, backbone, dtype) from
-# train_baseline_grpo.yaml. Only latent-specific fields are set here.
-#
-# Usage (run in order):
-#   # 0a. Rebuild easy pool (Level 1-4 only, no Level 5)
+# Usage:
+#   # 1. Build pools (one-time)
 #   python scripts/prepare_easy_pool.py --levels 1 2 3 4
+#   python scripts/prepare_math_level5_pool.py
 #
-#   # 0b. Build Level 5 hard pool (one-time; ~2h on RTX Pro 6000)
-#   python scripts/prepare_math_level5_pool.py \
-#       --model-id Qwen/Qwen2.5-1.5B-Instruct \
-#       --output data/math_level5_hard_pool.jsonl
-#
-#   # 1. Phase 0 — online encoder pretraining (~4h for 400 steps)
+#   # 2. Phase 0 — distillation pretraining (~2–3h)
 #   python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 0
 #
-#   # 2. NFR6 gate — MUST pass before Phase 1 (~10 min)
-#   python scripts/run_nfr6_gate.py --config configs/train_latent_grpo.yaml \
-#       --n-problems 200 --n-rollouts 2
+#   # 3. Phase 0 sanity check
+#   python scripts/run_phase0_sanity.py --config configs/train_latent_grpo.yaml
 #
-#   # 3. Controlled latent baseline eval (pretrained backbone + Phase 0 encoder)
-#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   # 4. Controlled latent baseline eval (must be ~0% on L5)
 #   python scripts/eval_passk.py --generation-mode latent_markov_pretrained \
-#       --train-config configs/train_latent_grpo.yaml --arm latent_grpo_pretrained \
-#       --output runs/latent_grpo/eval_pretrained.json
+#       --train-config configs/train_latent_grpo.yaml \
+#       --arm latent_grpo_pretrained
 #
-#   # 4. Phase 1 — joint RL (~2.5h for 200 steps)
+#   # 5. Phase 1 — GRPO (~2–2.5h)
 #   python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 1
 #
-#   # 5. Phase 1 eval
-#   PHASE1_CKPT=$(ls -td artifacts/latent_grpo/*/phase1/final | head -1)
-#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   # 6. Phase 1 eval
 #   python scripts/eval_passk.py --generation-mode latent_markov \
-#       --train-config configs/train_latent_grpo.yaml --checkpoint "$PHASE1_CKPT" \
-#       --arm latent_grpo --output runs/latent_grpo/eval_phase1.json
-#
-#   # 6. E1 + E3 Markov diagnostics
-#   python scripts/eval_markov_diagnostics.py \
-#       --checkpoint "$PHASE1_CKPT" \
-#       --config configs/train_latent_grpo.yaml \
-#       --n-problems 200 --n-rollouts 4 \
-#       --output-dir runs/latent_grpo/diagnostics
+#       --train-config configs/train_latent_grpo.yaml \
+#       --arm latent_grpo
 
 extends: "configs/train_baseline_grpo.yaml"
 
@@ -73,7 +49,7 @@ experiment:
   state_mode: "latent_markov"
 
 # ---------------------------------------------------------------------------
-# Latent arm architecture (shared across Phase 0 and Phase 1)
+# Latent arm architecture (shared Phase 0 and Phase 1)
 # ---------------------------------------------------------------------------
 latent_markov:
   latent_dim: 64            # z_h dimension
@@ -82,85 +58,57 @@ latent_markov:
   chunk_tokens: 341         # tokens per chunk (341 × 3 = 1023 ≈ 1024)
 
 # ---------------------------------------------------------------------------
-# Phase 0 — Online encoder pretraining on frozen backbone (v2)
+# Phase 0 — teacher-forced distillation pretraining
 # ---------------------------------------------------------------------------
 phase0:
-  pool_path: "data/math_easy_pool.jsonl"      # L1–L4 only (mutual exclusivity with L5 hard pool)
-  checkpoint_path: "runs/latent_grpo/phase0_encoder.pt"
+  pool_path: "data/math_easy_pool.jsonl"       # L1–L4 only
 
-  # 400 steps × 128 sequences/step = 51 200 on-policy trajectories.
-  # Extended from 200 (v1): losses were still declining at step 200.
-  # See header comment for full generation strategy rationale.
   n_steps: 400
-  num_generations: 128       # rollouts per problem, total across Phase 0 (not per step)
-  # micro_batch_size: how many of the 128 sequences/step are processed per
-  # forward/backward call.  32 → 4 passes of 32 seqs × 342 tok (Markov context):
-  #   hidden states 32×342×1536×2 = 0.034 GB  (vs 0.14 GB for all 128)
-  #   lm_head bypassed in Phase 0 → no logits cost.
-  # Each micro-batch of 32 sees ~27 unique problems (from ~110/step total),
-  # giving strong cross-problem gradient signal to L_out on every backward call.
-  micro_batch_size: 32
+  batch_size: 64             # problems per step; each generates 3 teacher chunks
 
-  learning_rate: 3.0e-4     # AdamW for Encoder+ZInjector+OutcomeHead; not applied to backbone
+  # Learning rates (two param groups)
+  lr_backbone: 1.0e-6        # backbone: low — learns to use z without forgetting
+  lr_encoder:  1.0e-4        # encoder + injector: higher — learning from scratch
 
-  # Phase 0 gradient budget at peak (step >= 50):
-  #   L_trans × 3.0  →  ~60%   primary: Markov structure
-  #   L_out   × 5.0  →  ~40%   outcome quality signal
-  lambda_trans_peak: 3.0
-  # Warm-start: hold λ_t = 0 for the first 50 steps so L_out can establish a
-  # correctness signal before the transition ramp competes for gradient budget.
-  # After step 50 the normal linear ramp resumes over the remaining 350 steps.
-  lambda_trans_warmup_steps: 50
-  lambda_out: 5.0
+  temperature: 1.0           # teacher generation temperature
+  top_p: 1.0
 
   logging_steps: 10
   save_steps: 50
 
 # ---------------------------------------------------------------------------
-# Phase 1 — joint GRPO on Level 5 hard pool (inherits baseline training block)
+# Phase 1 — on-policy GRPO on Level 5 hard pool
 # ---------------------------------------------------------------------------
 training:
   seed: 11
-  # batch_size: number of PROBLEMS per training step.  B=4 → 4×128=512 sequences/step,
-  # 800 problem-encounters over 200 steps — matches baseline gradient density.
-  # Decoupled from G: changing batch_size only affects problems/step, not rollouts/problem.
-  # GRPO advantage normalisation is per-problem group of G=128 (no interleaving):
-  # traces come back ordered [problem_0 × 128, problem_1 × 128, ...]; advantages
-  # are computed before micro-batching and the ordering is preserved throughout.
+  # backbone lr — locked for cross-arm fairness
+  learning_rate: 1.0e-6
+  # G: rollouts per problem per step
+  num_generations: 128
+  # problems per step: 4 × 128 = 512 sequences/step
   batch_size: 4
-  # micro_batch_size: how many of the B×G=512 traces are processed per forward/backward.
-  # Advantages are pre-computed over the full group, so splitting the backward does
-  # NOT change GRPO correctness — it is pure memory engineering.
-  # At micro_batch_size=32: logits tensor = 32×683×151,936×2 = 6.6 GB
-  #   vs 512 seqs (full batch) = 105 GB.
-  # Total Phase 1 peak: 6.6 + 3 (weights) + 15 (AdamW moments) + 2 (GC) ≈ 27 GB.
-  micro_batch_size: 32
-  # vLLM cannot be used: the 3-chunk loop in grpo_latent.py injects z_h embeddings as
-  # input prefix between chunks. vLLM has no hook for this mid-generation state injection.
-  # The custom loop uses HF model.generate() per chunk. Explicitly override to false.
+  # micro_batch_size for the training forward pass (not rollout generation).
+  # At 128: logits ~13 GB/chunk × 3 chunks + model (3 GB) + AdamW (15 GB) ≈ 58 GB.
+  micro_batch_size: 128
   use_vllm: false
   vllm_gpu_memory_utilization: ~
   vllm_max_model_len: ~
-  # gradient_checkpointing: REQUIRED for Phase 1 (logits bottleneck from vocab=151,936).
-  # At micro_batch_size=32: logits 6.6 GB + GC checkpoints 1.9 GB + weights 3 GB
-  # + AdamW moments 15 GB ≈ 27 GB total → very comfortably within 96 GB.
-  # Without GC, MLP activations (28 layers × 32 × 683 × 8960 intermediate × 2B)
-  # add another ~8.7 GB → 36 GB without GC — still fits, but GC is safe practice.
   gradient_checkpointing: true
+  temperature: 1.0
+  top_p: 1.0
+  max_steps: 200
+  logging_steps: 10
+  save_steps: 50
 
-# Phase 1: pure L_RL. Markov structure is enforced architecturally (each chunk sees
-# only [z_h ‖ chunk_{h+1}], never raw token history), so no auxiliary losses are needed.
-# adv_clip: numerical safety ceiling. With G=128, the maximum natural advantage is
-#   sqrt(G-1) ≈ 11.3 (at k=1 correct rollout). A clip at 20 is inert in all
-#   practical cases — it only guards against numerical pathologies.
-# grad_clip: single global clip (max_norm=1.0), matching baseline GRPO.
 phase1_loss:
   adv_clip: 20.0
   grad_clip: 1.0
 
 # ---------------------------------------------------------------------------
-# NFR6 diagnostic — run_nfr6_gate.py
+# Phase 0 sanity check thresholds — run_phase0_sanity.py
 # ---------------------------------------------------------------------------
-nfr6:
-  output_dir: "runs/latent_grpo/plots"
-  method: "umap"
+phase0_sanity:
+  n_val_problems: 50         # held-out L1–L4 problems for distill loss check
+  ce_loss_threshold: 2.0     # nats; lower is better
+  z_variance_threshold: 0.1  # mean per-dim std across problems
+  n_z_problems: 100          # problems for z variance check

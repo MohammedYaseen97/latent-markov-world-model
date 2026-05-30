@@ -150,7 +150,7 @@ def main() -> None:
                 # Drop answers with \text{...} — catches MCQ letters (\text{(C)}),
                 # word answers (\text{even}), and unit strings (\text{ ft}).
                 # math_verify can't reliably grade these, so they'd give noisy
-                # L_outcome labels. We have enough problems without them.
+                # distillation labels. We have enough problems without them.
                 if r"\text{" in answer:
                     skipped_no_answer += 1  # counts toward skipped total
                     continue
