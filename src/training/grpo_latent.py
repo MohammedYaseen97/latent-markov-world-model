@@ -158,7 +158,13 @@ def _setup_compile(
 
     encoder is optional — pass None for arms that have no latent encoder
     (e.g. baseline, token_markov).
+
+    No-ops silently on CPU — reduce-overhead mode requires CUDA cudagraph trees.
     """
+    if not torch.cuda.is_available():
+        logger.info("  torch.compile skipped (no CUDA device)")
+        return
+
     transformer, lm_head = _get_transformer_and_head(model)
     try:
         # Patch in-place so all callers (including model.generate) see compiled versions
@@ -533,7 +539,7 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
         logger.info("  gradient checkpointing enabled")
 
     # ── Encoder + injector ────────────────────────────────────────────────────
-    encoder = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device)
+    encoder = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device=device, dtype=dtype)
     logger.info("  encoder initialised (%.2fM params)",
                 sum(p.numel() for p in encoder.parameters()) / 1e6)
 
@@ -987,7 +993,7 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
         logger.info("  gradient checkpointing enabled")
 
     # ── Encoder: load from Phase 0 checkpoint ─────────────────────────────────
-    encoder    = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device)
+    encoder    = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device=device, dtype=dtype)
     enc_ckpt   = phase0_dir / "phase0_encoder.pt"
     if enc_ckpt.is_file():
         ckpt = torch.load(enc_ckpt, weights_only=False, map_location=device)

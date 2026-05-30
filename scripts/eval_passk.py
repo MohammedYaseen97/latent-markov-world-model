@@ -466,7 +466,7 @@ def _estimate_pass_at_k_metrics_latent(
     model, tokenizer = _load_latent_backbone(ckpt_dir / "backbone", primary_cfg, device)
 
     p1_ckpt = torch.load(ckpt_dir / "phase1_latent.pt", weights_only=False, map_location=device)
-    encoder = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device)
+    encoder = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device=device, dtype=torch.bfloat16)
     encoder.load_state_dict(p1_ckpt["encoder"])
     encoder.eval()
 
@@ -512,7 +512,7 @@ def _estimate_pass_at_k_metrics_latent_pretrained(
 
     enc_ckpt = phase0_dir / "phase0_encoder.pt"
     ckpt     = torch.load(str(enc_ckpt), weights_only=False, map_location=device)
-    encoder  = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device)
+    encoder  = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device=device, dtype=torch.bfloat16)
     encoder.load_state_dict(ckpt["encoder"])
     encoder.eval()
 

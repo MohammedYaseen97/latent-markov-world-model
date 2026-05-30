@@ -234,7 +234,7 @@ def main() -> None:
     )
     print(f"Loading encoder from {enc_ckpt} ...", flush=True)
     ckpt    = torch.load(str(enc_ckpt), weights_only=False, map_location=device)
-    encoder = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device)
+    encoder = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device=device, dtype=dtype)
     encoder.load_state_dict(ckpt["encoder"])
     encoder.eval()
     _setup_compile(model, encoder)

@@ -261,7 +261,7 @@ def main() -> None:
         p.requires_grad_(False)
 
     # ── Load encoder ───────────────────────────────────────────────────────────
-    encoder = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device)
+    encoder = LatentStateEncoder(hidden_dim=hidden_dim, z_dim=latent_dim).to(device=device, dtype=dtype)
     if enc_ckpt.is_file():
         ckpt = torch.load(enc_ckpt, weights_only=False, map_location=device)
         encoder.load_state_dict(ckpt["encoder"])
