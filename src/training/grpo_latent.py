@@ -161,20 +161,24 @@ def _setup_compile(
     """
     transformer, lm_head = _get_transformer_and_head(model)
     try:
-        # Patch in-place so all callers (including model.generate) see compiled versions
+        # Backbone uses "default" mode — Qwen2.5 creates some CPU-side tensors internally
+        # (RoPE buffers, attention bias) that prevent CUDA graph capture.  "default" still
+        # fuses kernels via Triton and is appropriate for variable-length training sequences.
+        # Encoder uses "reduce-overhead" — it's a small fixed-shape MLP that benefits from
+        # CUDA graph capture (always [B, hidden_dim] input, no CPU-side ops).
         inner = model.model
         if hasattr(inner, "lm_head"):
-            inner.model   = torch.compile(transformer, dynamic=True, mode="reduce-overhead")
-            inner.lm_head = torch.compile(lm_head,    dynamic=True, mode="reduce-overhead")
+            inner.model   = torch.compile(transformer, dynamic=True, mode="default")
+            inner.lm_head = torch.compile(lm_head,    dynamic=True, mode="default")
         else:
-            model.model   = torch.compile(transformer, dynamic=True, mode="reduce-overhead")
-            model.lm_head = torch.compile(lm_head,    dynamic=True, mode="reduce-overhead")
+            model.model   = torch.compile(transformer, dynamic=True, mode="default")
+            model.lm_head = torch.compile(lm_head,    dynamic=True, mode="default")
 
         if encoder is not None:
             encoder.encoder  = torch.compile(encoder.encoder,  dynamic=True, mode="reduce-overhead")
             encoder.injector = torch.compile(encoder.injector, dynamic=True, mode="reduce-overhead")
 
-        logger.info("  torch.compile applied (reduce-overhead, dynamic=True)")
+        logger.info("  torch.compile applied (backbone=default, encoder=reduce-overhead, dynamic=True)")
     except Exception as exc:
         logger.warning("  torch.compile not applied (falling back to eager): %s", exc)
 
@@ -507,7 +511,8 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
-    logger.info("  teacher loaded and frozen")
+    _setup_compile(teacher)
+    logger.info("  teacher loaded, frozen and compiled")
 
     # ── Load student backbone (trainable, low lr) ─────────────────────────────
     logger.info("Loading student backbone %s @ %s ...", model_id, revision)
@@ -553,32 +558,46 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
         problems = [json.loads(line) for line in f if line.strip()]
     logger.info("Phase 0 pool: %d problems from %s", len(problems), pool_path)
 
-    # ── Training loop ─────────────────────────────────────────────────────────
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "resolved_config.json").write_text(json.dumps(config, indent=2))
 
-    log_history: list[dict] = []
-    pending:     dict[str, float] = {}
-    pool_order:  list[int] = []
+    # ── Pre-generate ALL teacher outputs ──────────────────────────────────────
+    # Teacher runs uninterrupted over the full epoch before student training
+    # starts.  Chunks are returned as CPU tensors by _generate_teacher_chunks,
+    # so buffering all 400 batches costs ~120 MB of system RAM — negligible.
+    # After pre-generation the teacher is deleted, freeing ~3 GB of VRAM for
+    # the student training phase.
+    pool_order: list[int] = []
+    batches: list[tuple[list[dict], list]] = []
 
-    step_bar = tqdm(total=n_steps, desc="phase0_distill", unit="step", dynamic_ncols=True)
-
-    for global_step in range(n_steps):
-        # Reshuffle pool when exhausted
+    logger.info("Pre-generating teacher chunks for %d steps (batch=%d) …", n_steps, batch_size)
+    gen_bar = tqdm(total=n_steps, desc="teacher_gen", unit="step", dynamic_ncols=True)
+    for _ in range(n_steps):
         while len(pool_order) < batch_size:
             order = list(range(len(problems)))
             _random.shuffle(order)
             pool_order.extend(order)
         step_problems = [problems[pool_order.pop(0)] for _ in range(batch_size)]
-
-        # ── Teacher generates all 3 chunks, full context ───────────────────────
         teacher_chunks = _generate_teacher_chunks(
             teacher, tokenizer, step_problems,
             chunk_tokens=chunk_tokens,
             temperature=temperature, top_p=top_p, device=device,
         )
+        batches.append((step_problems, teacher_chunks))
+        gen_bar.update(1)
+    gen_bar.close()
 
-        # ── Student distillation forward ───────────────────────────────────────
+    del teacher
+    torch.cuda.empty_cache()
+    logger.info("Teacher done — %d batches cached on CPU.  Teacher VRAM freed.", n_steps)
+
+    # ── Student training ───────────────────────────────────────────────────────
+    log_history: list[dict] = []
+    pending:     dict[str, float] = {}
+
+    step_bar = tqdm(total=n_steps, desc="phase0_distill", unit="step", dynamic_ncols=True)
+
+    for global_step, (step_problems, teacher_chunks) in enumerate(batches):
         student.train(); encoder.train()
         optimizer.zero_grad()
 
