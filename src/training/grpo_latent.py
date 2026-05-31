@@ -144,6 +144,11 @@ def _fwd(
 
 from contextlib import contextmanager as _contextmanager
 
+def _clean_state_dict(sd: dict) -> dict:
+    """Strip ._orig_mod. prefixes that torch.compile injects into state_dict keys."""
+    return {k.replace("._orig_mod.", "."): v for k, v in sd.items()}
+
+
 @_contextmanager
 def _unwrapped_for_save(model: AutoModelForCausalLM):
     """Temporarily restore compiled sub-modules to their originals for save_pretrained.
@@ -1166,7 +1171,7 @@ def _save_phase0_checkpoint(
     """Save Phase 0 backbone + encoder weights and trainer state."""
     directory.mkdir(parents=True, exist_ok=True)
     torch.save(
-        {"encoder": encoder.state_dict(), "step": step},
+        {"encoder": _clean_state_dict(encoder.state_dict()), "step": step},
         directory / "phase0_encoder.pt",
     )
     with _unwrapped_for_save(model) as m:
@@ -1191,7 +1196,7 @@ def _save_phase1_checkpoint(
     directory.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "encoder":   encoder.state_dict(),
+            "encoder":   _clean_state_dict(encoder.state_dict()),
             "optimizer": optimizer.state_dict(),
             "step":      step,
         },
