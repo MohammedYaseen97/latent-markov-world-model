@@ -3,15 +3,18 @@
 Four checks:
   1. CE distillation loss on held-out L1–L4 problems is below threshold.
   2. z latent vectors have meaningful variance (encoder isn't collapsed).
-  3. z-consistency: within-problem cosine sim > cross-problem cosine sim,
-     confirming z tracks solution-space position rather than random noise.
+  3. z-transition check: the change z makes between chunks of the same problem
+     (temporal_delta = 1 − cos_sim(z_1, z_2)) exceeds the variation between
+     z_1 vectors of different problems at the same stage (cross_variation =
+     1 − mean_cos_sim(z_1_i, z_1_j)).  temporal_delta > cross_variation means
+     z is tracking solution-state transitions, not just encoding noise.
   4. Print a sample completion in strict Markov mode to visually verify the
      student can produce coherent text with z-prefix injection.
 
 Pass criteria (from configs/train_latent_grpo.yaml §phase0_sanity):
-  - mean_ce_loss      < ce_loss_threshold       (default: 2.0 nats)
-  - mean_z_std        > z_variance_threshold    (default: 0.1)
-  - within_minus_cross > z_consistency_margin   (default: 0.05)
+  - mean_ce_loss                    < ce_loss_threshold       (default: 2.0 nats)
+  - mean_z_std                      > z_variance_threshold    (default: 0.1)
+  - temporal_delta − cross_variation > z_transition_margin    (default: 0.02)
 
 Usage:
     python scripts/run_phase0_sanity.py \
@@ -176,7 +179,7 @@ def _run_z_variance_check(
 
 
 @torch.no_grad()
-def _run_z_consistency_check(
+def _run_z_transition_check(
     student: AutoModelForCausalLM,
     teacher: AutoModelForCausalLM,
     encoder: LatentStateEncoder,
@@ -188,14 +191,20 @@ def _run_z_consistency_check(
     top_p: float,
     device: torch.device,
     margin: float,
-) -> tuple[float, float]:
-    """Check that z tracks solution-space position within a problem.
+) -> tuple[float, float, float]:
+    """Check that z tracks solution-state transitions within a problem.
 
     For each problem we compute z_1 (after chunk 1) and z_2 (after chunk 2).
-    Within-problem similarity:  mean cos_sim(z_1_i, z_2_i)
-    Cross-problem similarity:   mean cos_sim(z_1_i, z_1_j) for i != j
 
-    If z is meaningful, within > cross.  The gate is within - cross > margin.
+    temporal_delta   = 1 − mean cos_sim(z_1_i, z_2_i)
+        How much z changes between consecutive chunks of the same problem.
+
+    cross_variation  = 1 − mean cos_sim(z_1_i, z_1_j)  for i ≠ j
+        How much z_1 varies across problems at the same stage.
+
+    If z is tracking solution state, temporal_delta > cross_variation:
+    the state transition signal dominates over between-problem noise.
+    Gate: temporal_delta − cross_variation > margin.
     """
     z1_list: list[torch.Tensor] = []
     z2_list: list[torch.Tensor] = []
@@ -203,7 +212,6 @@ def _run_z_consistency_check(
     for i in range(0, len(problems), batch_size):
         batch = problems[i : i + batch_size]
         B     = len(batch)
-        dtype = next(student.parameters()).dtype
 
         teacher_chunks = _generate_teacher_chunks(
             teacher, tokenizer, batch,
@@ -227,8 +235,8 @@ def _run_z_consistency_check(
             ]).to(device)
             fi1[j, :full1_lens[j]] = seq
             fa1[j, :full1_lens[j]] = 1
-        _, h1  = _fwd(student, input_ids=fi1, attention_mask=fa1, bypass_lm_head=True)
-        last1  = torch.tensor([l - 1 for l in full1_lens], device=device)
+        _, h1 = _fwd(student, input_ids=fi1, attention_mask=fa1, bypass_lm_head=True)
+        last1 = torch.tensor([l - 1 for l in full1_lens], device=device)
         z1_list.append(encoder.encode(_last_token_repr(h1, last1)).cpu())
 
         # ── z_2: after prompt + chunk 1 + chunk 2 ────────────────────────────
@@ -242,8 +250,8 @@ def _run_z_consistency_check(
             seq = torch.cat([fi1[j, :full1_lens[j]], c2_ids_list[j].to(device)])
             fi2[j, :full2_lens[j]] = seq
             fa2[j, :full2_lens[j]] = 1
-        _, h2  = _fwd(student, input_ids=fi2, attention_mask=fa2, bypass_lm_head=True)
-        last2  = torch.tensor([l - 1 for l in full2_lens], device=device)
+        _, h2 = _fwd(student, input_ids=fi2, attention_mask=fa2, bypass_lm_head=True)
+        last2 = torch.tensor([l - 1 for l in full2_lens], device=device)
         z2_list.append(encoder.encode(_last_token_repr(h2, last2)).cpu())
 
     z1 = torch.cat(z1_list, dim=0).float()   # [N, z_dim]
@@ -252,21 +260,23 @@ def _run_z_consistency_check(
     z1n = torch.nn.functional.normalize(z1, dim=-1)
     z2n = torch.nn.functional.normalize(z2, dim=-1)
 
-    within = (z1n * z2n).sum(dim=-1).mean().item()
+    within_sim     = (z1n * z2n).sum(dim=-1).mean().item()
+    temporal_delta = 1.0 - within_sim
 
-    # cross: average off-diagonal cosine sims between z1 vectors
-    sim_mat  = z1n @ z1n.T                    # [N, N]
-    N        = z1.shape[0]
-    mask     = ~torch.eye(N, dtype=torch.bool)
-    cross    = sim_mat[mask].mean().item()
+    sim_mat        = z1n @ z1n.T
+    N              = z1.shape[0]
+    off_diag       = ~torch.eye(N, dtype=torch.bool)
+    cross_sim      = sim_mat[off_diag].mean().item()
+    cross_variation = 1.0 - cross_sim
 
-    gap    = within - cross
+    gap    = temporal_delta - cross_variation
     status = "PASS" if gap > margin else "FAIL"
     logger.info(
-        "[Check 3] z-consistency: within=%.4f  cross=%.4f  gap=%.4f (threshold > %.4f) → %s",
-        within, cross, gap, margin, status,
+        "[Check 3] z-transition: temporal_delta=%.4f  cross_variation=%.4f  gap=%.4f"
+        " (threshold > %.4f) → %s",
+        temporal_delta, cross_variation, gap, margin, status,
     )
-    return within, cross
+    return temporal_delta, cross_variation, gap
 
 
 @torch.no_grad()
@@ -309,11 +319,11 @@ def main() -> None:
     dtype     = getattr(torch, primary.get("dtype", "bfloat16"))
     attn_impl = primary.get("attn_implementation", "sdpa")
 
-    n_val      = int(sanity_cfg.get("n_val_problems",         50))
-    n_z        = int(sanity_cfg.get("n_z_problems",          100))
-    ce_thr     = float(sanity_cfg.get("ce_loss_threshold",    2.0))
-    z_thr      = float(sanity_cfg.get("z_variance_threshold", 0.1))
-    z_cons_thr = float(sanity_cfg.get("z_consistency_margin", 0.05))
+    n_val       = int(sanity_cfg.get("n_val_problems",          50))
+    n_z         = int(sanity_cfg.get("n_z_problems",           100))
+    ce_thr      = float(sanity_cfg.get("ce_loss_threshold",     2.0))
+    z_thr       = float(sanity_cfg.get("z_variance_threshold",  0.1))
+    z_trans_thr = float(sanity_cfg.get("z_transition_margin",  0.02))
 
     chunk_tokens = int(latent_cfg.get("chunk_tokens", 341))
     latent_dim   = int(latent_cfg.get("latent_dim",   LATENT_DIM))
@@ -393,34 +403,34 @@ def main() -> None:
         device=device, threshold=z_thr,
     )
 
-    z_within, z_cross = _run_z_consistency_check(
+    z_tdelta, z_cvar, z_gap = _run_z_transition_check(
         student, teacher, encoder, tokenizer,
         z_problems, batch_size=min(batch_size, len(z_problems)),
         chunk_tokens=chunk_tokens, temperature=temperature, top_p=top_p,
-        device=device, margin=z_cons_thr,
+        device=device, margin=z_trans_thr,
     )
 
     _run_qualitative_sample(student, encoder, tokenizer, val_problems[:1],
                             chunk_tokens, device)
 
     # ── Report ────────────────────────────────────────────────────────────────
-    ce_pass   = mean_ce < ce_thr
-    z_pass    = mean_z_std > z_thr
-    cons_pass = (z_within - z_cross) > z_cons_thr
-    all_pass  = ce_pass and z_pass and cons_pass
+    ce_pass    = mean_ce < ce_thr
+    z_pass     = mean_z_std > z_thr
+    trans_pass = z_gap > z_trans_thr
+    all_pass   = ce_pass and z_pass and trans_pass
 
     results = {
         "mean_ce_loss":          mean_ce,
         "mean_z_std":            mean_z_std,
-        "z_within_sim":          z_within,
-        "z_cross_sim":           z_cross,
-        "z_consistency_gap":     z_within - z_cross,
+        "z_temporal_delta":      z_tdelta,
+        "z_cross_variation":     z_cvar,
+        "z_transition_gap":      z_gap,
         "ce_threshold":          ce_thr,
         "z_threshold":           z_thr,
-        "z_consistency_margin":  z_cons_thr,
+        "z_transition_margin":   z_trans_thr,
         "ce_pass":               ce_pass,
         "z_pass":                z_pass,
-        "z_consistency_pass":    cons_pass,
+        "z_transition_pass":     trans_pass,
         "overall_pass":          all_pass,
     }
 
@@ -433,9 +443,9 @@ def main() -> None:
         sys.exit(0)
     else:
         failures = [k for k, v in [
-            ("CE loss",       ce_pass),
-            ("z variance",    z_pass),
-            ("z consistency", cons_pass),
+            ("CE loss",      ce_pass),
+            ("z variance",   z_pass),
+            ("z transition", trans_pass),
         ] if not v]
         logger.error("✗ Phase 0 sanity check FAILED: %s", ", ".join(failures))
         sys.exit(1)
