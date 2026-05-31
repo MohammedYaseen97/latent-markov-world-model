@@ -1,14 +1,17 @@
 """Phase 0 sanity check — run after pretrain_distill before launching Phase 1.
 
-Three checks:
+Four checks:
   1. CE distillation loss on held-out L1–L4 problems is below threshold.
   2. z latent vectors have meaningful variance (encoder isn't collapsed).
-  3. Print a sample completion in strict Markov mode to visually verify the
+  3. z-consistency: within-problem cosine sim > cross-problem cosine sim,
+     confirming z tracks solution-space position rather than random noise.
+  4. Print a sample completion in strict Markov mode to visually verify the
      student can produce coherent text with z-prefix injection.
 
 Pass criteria (from configs/train_latent_grpo.yaml §phase0_sanity):
-  - mean_ce_loss      < ce_loss_threshold   (default: 2.0 nats)
-  - mean_z_std        > z_variance_threshold (default: 0.1)
+  - mean_ce_loss      < ce_loss_threshold       (default: 2.0 nats)
+  - mean_z_std        > z_variance_threshold    (default: 0.1)
+  - within_minus_cross > z_consistency_margin   (default: 0.05)
 
 Usage:
     python scripts/run_phase0_sanity.py \
@@ -173,6 +176,100 @@ def _run_z_variance_check(
 
 
 @torch.no_grad()
+def _run_z_consistency_check(
+    student: AutoModelForCausalLM,
+    teacher: AutoModelForCausalLM,
+    encoder: LatentStateEncoder,
+    tokenizer: AutoTokenizer,
+    problems: list[dict],
+    batch_size: int,
+    chunk_tokens: int,
+    temperature: float,
+    top_p: float,
+    device: torch.device,
+    margin: float,
+) -> tuple[float, float]:
+    """Check that z tracks solution-space position within a problem.
+
+    For each problem we compute z_1 (after chunk 1) and z_2 (after chunk 2).
+    Within-problem similarity:  mean cos_sim(z_1_i, z_2_i)
+    Cross-problem similarity:   mean cos_sim(z_1_i, z_1_j) for i != j
+
+    If z is meaningful, within > cross.  The gate is within - cross > margin.
+    """
+    z1_list: list[torch.Tensor] = []
+    z2_list: list[torch.Tensor] = []
+
+    for i in range(0, len(problems), batch_size):
+        batch = problems[i : i + batch_size]
+        B     = len(batch)
+        dtype = next(student.parameters()).dtype
+
+        teacher_chunks = _generate_teacher_chunks(
+            teacher, tokenizer, batch,
+            chunk_tokens=chunk_tokens,
+            temperature=temperature, top_p=top_p,
+            device=device,
+        )
+
+        prompt_ids_list = [format_prompt(p, tokenizer) for p in batch]
+
+        # ── z_1: after prompt + chunk 1 ───────────────────────────────────────
+        c1_ids_list = [teacher_chunks[j][0] for j in range(B)]
+        full1_lens  = [len(prompt_ids_list[j]) + c1_ids_list[j].shape[0] for j in range(B)]
+        max_f1      = max(full1_lens)
+        fi1 = torch.zeros(B, max_f1, dtype=torch.long, device=device)
+        fa1 = torch.zeros(B, max_f1, dtype=torch.long, device=device)
+        for j in range(B):
+            seq = torch.cat([
+                torch.tensor(prompt_ids_list[j], dtype=torch.long),
+                c1_ids_list[j],
+            ]).to(device)
+            fi1[j, :full1_lens[j]] = seq
+            fa1[j, :full1_lens[j]] = 1
+        _, h1  = _fwd(student, input_ids=fi1, attention_mask=fa1, bypass_lm_head=True)
+        last1  = torch.tensor([l - 1 for l in full1_lens], device=device)
+        z1_list.append(encoder.encode(_last_token_repr(h1, last1)).cpu())
+
+        # ── z_2: after prompt + chunk 1 + chunk 2 ────────────────────────────
+        c2_ids_list = [teacher_chunks[j][1] if len(teacher_chunks[j]) > 1
+                       else teacher_chunks[j][0] for j in range(B)]
+        full2_lens  = [full1_lens[j] + c2_ids_list[j].shape[0] for j in range(B)]
+        max_f2      = max(full2_lens)
+        fi2 = torch.zeros(B, max_f2, dtype=torch.long, device=device)
+        fa2 = torch.zeros(B, max_f2, dtype=torch.long, device=device)
+        for j in range(B):
+            seq = torch.cat([fi1[j, :full1_lens[j]], c2_ids_list[j].to(device)])
+            fi2[j, :full2_lens[j]] = seq
+            fa2[j, :full2_lens[j]] = 1
+        _, h2  = _fwd(student, input_ids=fi2, attention_mask=fa2, bypass_lm_head=True)
+        last2  = torch.tensor([l - 1 for l in full2_lens], device=device)
+        z2_list.append(encoder.encode(_last_token_repr(h2, last2)).cpu())
+
+    z1 = torch.cat(z1_list, dim=0).float()   # [N, z_dim]
+    z2 = torch.cat(z2_list, dim=0).float()   # [N, z_dim]
+
+    z1n = torch.nn.functional.normalize(z1, dim=-1)
+    z2n = torch.nn.functional.normalize(z2, dim=-1)
+
+    within = (z1n * z2n).sum(dim=-1).mean().item()
+
+    # cross: average off-diagonal cosine sims between z1 vectors
+    sim_mat  = z1n @ z1n.T                    # [N, N]
+    N        = z1.shape[0]
+    mask     = ~torch.eye(N, dtype=torch.bool)
+    cross    = sim_mat[mask].mean().item()
+
+    gap    = within - cross
+    status = "PASS" if gap > margin else "FAIL"
+    logger.info(
+        "[Check 3] z-consistency: within=%.4f  cross=%.4f  gap=%.4f (threshold > %.4f) → %s",
+        within, cross, gap, margin, status,
+    )
+    return within, cross
+
+
+@torch.no_grad()
 def _run_qualitative_sample(
     student: AutoModelForCausalLM,
     encoder: LatentStateEncoder,
@@ -212,10 +309,11 @@ def main() -> None:
     dtype     = getattr(torch, primary.get("dtype", "bfloat16"))
     attn_impl = primary.get("attn_implementation", "sdpa")
 
-    n_val   = int(sanity_cfg.get("n_val_problems",         50))
-    n_z     = int(sanity_cfg.get("n_z_problems",          100))
-    ce_thr  = float(sanity_cfg.get("ce_loss_threshold",    2.0))
-    z_thr   = float(sanity_cfg.get("z_variance_threshold", 0.1))
+    n_val      = int(sanity_cfg.get("n_val_problems",         50))
+    n_z        = int(sanity_cfg.get("n_z_problems",          100))
+    ce_thr     = float(sanity_cfg.get("ce_loss_threshold",    2.0))
+    z_thr      = float(sanity_cfg.get("z_variance_threshold", 0.1))
+    z_cons_thr = float(sanity_cfg.get("z_consistency_margin", 0.05))
 
     chunk_tokens = int(latent_cfg.get("chunk_tokens", 341))
     latent_dim   = int(latent_cfg.get("latent_dim",   LATENT_DIM))
@@ -281,7 +379,7 @@ def main() -> None:
     z_problems   = all_problems[:n_z]
 
     # ── Run checks ────────────────────────────────────────────────────────────
-    mean_ce  = _run_distill_loss_check(
+    mean_ce = _run_distill_loss_check(
         student, teacher, encoder, tokenizer,
         val_problems, batch_size=min(batch_size, len(val_problems)),
         chunk_tokens=chunk_tokens, temperature=temperature, top_p=top_p,
@@ -295,22 +393,35 @@ def main() -> None:
         device=device, threshold=z_thr,
     )
 
+    z_within, z_cross = _run_z_consistency_check(
+        student, teacher, encoder, tokenizer,
+        z_problems, batch_size=min(batch_size, len(z_problems)),
+        chunk_tokens=chunk_tokens, temperature=temperature, top_p=top_p,
+        device=device, margin=z_cons_thr,
+    )
+
     _run_qualitative_sample(student, encoder, tokenizer, val_problems[:1],
                             chunk_tokens, device)
 
     # ── Report ────────────────────────────────────────────────────────────────
-    ce_pass  = mean_ce < ce_thr
-    z_pass   = mean_z_std > z_thr
-    all_pass = ce_pass and z_pass
+    ce_pass   = mean_ce < ce_thr
+    z_pass    = mean_z_std > z_thr
+    cons_pass = (z_within - z_cross) > z_cons_thr
+    all_pass  = ce_pass and z_pass and cons_pass
 
     results = {
-        "mean_ce_loss":     mean_ce,
-        "mean_z_std":       mean_z_std,
-        "ce_threshold":     ce_thr,
-        "z_threshold":      z_thr,
-        "ce_pass":          ce_pass,
-        "z_pass":           z_pass,
-        "overall_pass":     all_pass,
+        "mean_ce_loss":          mean_ce,
+        "mean_z_std":            mean_z_std,
+        "z_within_sim":          z_within,
+        "z_cross_sim":           z_cross,
+        "z_consistency_gap":     z_within - z_cross,
+        "ce_threshold":          ce_thr,
+        "z_threshold":           z_thr,
+        "z_consistency_margin":  z_cons_thr,
+        "ce_pass":               ce_pass,
+        "z_pass":                z_pass,
+        "z_consistency_pass":    cons_pass,
+        "overall_pass":          all_pass,
     }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -321,7 +432,11 @@ def main() -> None:
         logger.info("✓ Phase 0 sanity check PASSED. Safe to proceed to Phase 1.")
         sys.exit(0)
     else:
-        failures = [k for k, v in [("CE loss", ce_pass), ("z variance", z_pass)] if not v]
+        failures = [k for k, v in [
+            ("CE loss",       ce_pass),
+            ("z variance",    z_pass),
+            ("z consistency", cons_pass),
+        ] if not v]
         logger.error("✗ Phase 0 sanity check FAILED: %s", ", ".join(failures))
         sys.exit(1)
 

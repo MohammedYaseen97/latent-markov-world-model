@@ -108,7 +108,8 @@ phase1_loss:
 # Phase 0 sanity check thresholds — run_phase0_sanity.py
 # ---------------------------------------------------------------------------
 phase0_sanity:
-  n_val_problems: 50         # held-out L1–L4 problems for distill loss check
-  ce_loss_threshold: 2.0     # nats; lower is better
-  z_variance_threshold: 0.1  # mean per-dim std across problems
-  n_z_problems: 100          # problems for z variance check
+  n_val_problems: 50          # held-out L1–L4 problems for distill loss check
+  ce_loss_threshold: 2.0      # nats; lower is better
+  z_variance_threshold: 0.1   # mean per-dim std across problems
+  n_z_problems: 100           # problems for z variance and z-consistency checks
+  z_consistency_margin: 0.05  # within-problem sim − cross-problem sim must exceed this
