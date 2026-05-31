@@ -347,21 +347,19 @@ def _run_qualitative_samples(
     the problem prompt, all three decoded chunks, and the reward.
     """
     logger.info("[Qualitative] Generating %d full 3-chunk samples …", n_samples)
-    sample_problems = problems[:n_samples]
-    traces = generate_latent_traces(
-        model=student, tokenizer=tokenizer, encoder=encoder,
-        problems=sample_problems, n_rollouts=1,
-        chunk_tokens=chunk_tokens,
-        temperature=1.0, top_p=1.0, device=device,
-    )
-
     records: list[dict] = []
-    for i, problem in enumerate(sample_problems):
-        trace = next((t for t in traces if t.get("problem_idx", i) == i), None)
-        if trace is None and i < len(traces):
-            trace = traces[i]
-        if trace is None:
+
+    for i, problem in enumerate(problems[:n_samples]):
+        # Generate each problem independently — avoids batch index aliasing
+        traces = generate_latent_traces(
+            model=student, tokenizer=tokenizer, encoder=encoder,
+            problems=[problem], n_rollouts=1,
+            chunk_tokens=chunk_tokens,
+            temperature=1.0, top_p=1.0, device=device,
+        )
+        if not traces:
             continue
+        trace = traces[0]
         chunks_decoded = [
             tokenizer.decode(chunk_ids, skip_special_tokens=True)
             for chunk_ids in trace["chunk_ids"]
@@ -374,7 +372,7 @@ def _run_qualitative_samples(
         records.append(record)
         logger.info("  [Sample %d] problem: %s", i + 1, problem["prompt"][:100])
         for j, chunk_text in enumerate(chunks_decoded):
-            logger.info("    chunk %d: %s", j + 1, chunk_text[:180])
+            logger.info("    chunk %d (%d tok): %s", j + 1, len(trace["chunk_ids"][j]), chunk_text[:180])
         logger.info("    reward: %d", record["reward"])
 
     return records

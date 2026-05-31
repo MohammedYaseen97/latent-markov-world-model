@@ -782,10 +782,18 @@ def generate_latent_traces(
     prefix_1 = encoder.inject(z_1.to(model_dtype))    # [B, 1, H]
 
     # ── Chunk 2: generate from [z_1_prefix] only — strict Markov ─────────────
+    # min_new_tokens prevents the backbone (barely adapted during Phase 0 at
+    # lr=1e-6) from sampling EOS immediately when it sees the unfamiliar
+    # z_prefix as its only context.  Without this, teacher-forcing exposure
+    # bias causes the model to collapse chunk 2 to a single EOS token, making
+    # chunk 3 computed from a meaningless repr, and depriving Phase 1 of any
+    # non-chunk-1 reward signal.
     am_pfx = torch.ones(B, 1, dtype=torch.long, device=device)
     gen2   = model.generate(
         inputs_embeds=prefix_1, attention_mask=am_pfx,
-        max_new_tokens=chunk_tokens, do_sample=(temperature > 0),
+        max_new_tokens=chunk_tokens,
+        min_new_tokens=chunk_tokens // 2,
+        do_sample=(temperature > 0),
         temperature=temperature if temperature > 0 else 1.0,
         top_p=top_p, pad_token_id=pad_id,
     )
@@ -811,7 +819,9 @@ def generate_latent_traces(
     # ── Chunk 3: generate from [z_2_prefix] only — strict Markov ─────────────
     gen3 = model.generate(
         inputs_embeds=prefix_2, attention_mask=am_pfx,
-        max_new_tokens=chunk_tokens, do_sample=(temperature > 0),
+        max_new_tokens=chunk_tokens,
+        min_new_tokens=chunk_tokens // 2,
+        do_sample=(temperature > 0),
         temperature=temperature if temperature > 0 else 1.0,
         top_p=top_p, pad_token_id=pad_id,
     )
