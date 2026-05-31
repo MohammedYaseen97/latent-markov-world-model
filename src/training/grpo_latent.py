@@ -35,6 +35,16 @@ from src.training.grpo_baseline import SYSTEM_PROMPT, answers_equivalent, extrac
 
 logger = logging.getLogger(__name__)
 
+# torch.compile with dynamic=True emits verbose shape-guard warnings from
+# symbolic_shapes when Dynamo encounters guards it cannot fully simplify (e.g.
+# disjunctive equality expressions from Qwen's attention conditionals). The
+# guards are still applied correctly; the messages are purely informational
+# noise that flood the terminal and make progress bars unreadable.
+logging.getLogger("torch.fx.experimental.symbolic_shapes").setLevel(logging.ERROR)
+# Recompile-limit hit messages from convert_frame are similarly noisy after
+# the initial warm-up; suppress them at WARNING level too.
+logging.getLogger("torch._dynamo.convert_frame").setLevel(logging.ERROR)
+
 # ── Global CUDA performance flags ─────────────────────────────────────────────
 # TF32: fp32 matmuls use tensor-core acceleration (Ampere+).
 # bf16 reduction: faster reductions with negligible precision impact.
@@ -42,6 +52,14 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32       = True
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch.set_float32_matmul_precision("high")
+
+# Generation sees many distinct sequence lengths (prefill at various prompt
+# lengths + single-token decode steps). The default recompile_limit=8 causes
+# Dynamo to fall back to eager after 8 shape variants, losing all fusion
+# benefits for the rest of the run. 64 covers the realistic shape variety
+# while dynamic=True keeps per-variant compile time low.
+import torch._dynamo
+torch._dynamo.config.recompile_limit = 64
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
