@@ -113,3 +113,6 @@ phase0_sanity:
   z_variance_threshold: 0.1   # mean per-dim std across problems
   n_z_problems: 100           # problems for z variance and z-transition checks
   z_transition_margin: 0.02   # temporal_delta − cross_variation must exceed this
+  n_easy_reward_problems: 20  # easy problems for student reward-rate check
+  easy_reward_rollouts: 4     # rollouts per problem (20 × 4 = 80 total generations)
+  easy_reward_threshold: 0.05 # student must solve > 5% of easy rollouts in Markov mode

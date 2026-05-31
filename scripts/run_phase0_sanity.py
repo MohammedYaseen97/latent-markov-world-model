@@ -50,6 +50,7 @@ from src.training.grpo_latent import (
     format_prompt,
     generate_latent_traces,
 )
+from src.training.grpo_baseline import answers_equivalent, extract_answer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logging.basicConfig(
@@ -280,6 +281,57 @@ def _run_z_transition_check(
 
 
 @torch.no_grad()
+def _run_easy_reward_check(
+    student: AutoModelForCausalLM,
+    encoder: LatentStateEncoder,
+    tokenizer: AutoTokenizer,
+    problems: list[dict],
+    chunk_tokens: int,
+    n_rollouts: int,
+    device: torch.device,
+    threshold: float,
+) -> float:
+    """Check student can still solve easy problems in strict Markov mode.
+
+    Phase 1 RL requires at least some correct generations to produce non-zero
+    rewards and flow gradients. If the student gets 0% even on L1-L4 problems
+    in Markov mode, Phase 1 on L5 will be dead on arrival.
+
+    Returns the reward rate (fraction of rollouts that received reward 1).
+    Gate: reward_rate > threshold.
+    """
+    correct = 0
+    total   = 0
+
+    for problem in problems:
+        traces = generate_latent_traces(
+            model=student, tokenizer=tokenizer, encoder=encoder,
+            problems=[problem], n_rollouts=n_rollouts,
+            chunk_tokens=chunk_tokens,
+            temperature=1.0, top_p=1.0, device=device,
+        )
+        for trace in traces:
+            total += 1
+            # Re-grade via answer extraction in case trace reward wasn't set
+            full_text = tokenizer.decode(
+                [tok for chunk in trace["chunk_ids"] for tok in chunk.tolist()],
+                skip_special_tokens=True,
+            )
+            pred = extract_answer(full_text)
+            if pred is not None and answers_equivalent(pred, problem["ground_truth"]):
+                correct += 1
+
+    reward_rate = correct / max(total, 1)
+    status      = "PASS" if reward_rate > threshold else "FAIL"
+    logger.info(
+        "[Check 4] easy-pool reward rate: %.4f  (%d/%d correct)"
+        " (threshold > %.4f) → %s",
+        reward_rate, correct, total, threshold, status,
+    )
+    return reward_rate
+
+
+@torch.no_grad()
 def _run_qualitative_samples(
     student: AutoModelForCausalLM,
     encoder: LatentStateEncoder,
@@ -343,11 +395,14 @@ def main() -> None:
     dtype     = getattr(torch, primary.get("dtype", "bfloat16"))
     attn_impl = primary.get("attn_implementation", "sdpa")
 
-    n_val       = int(sanity_cfg.get("n_val_problems",          50))
-    n_z         = int(sanity_cfg.get("n_z_problems",           100))
-    ce_thr      = float(sanity_cfg.get("ce_loss_threshold",     2.0))
-    z_thr       = float(sanity_cfg.get("z_variance_threshold",  0.1))
-    z_trans_thr = float(sanity_cfg.get("z_transition_margin",  0.02))
+    n_val          = int(sanity_cfg.get("n_val_problems",           50))
+    n_z            = int(sanity_cfg.get("n_z_problems",            100))
+    ce_thr         = float(sanity_cfg.get("ce_loss_threshold",      2.0))
+    z_thr          = float(sanity_cfg.get("z_variance_threshold",   0.1))
+    z_trans_thr    = float(sanity_cfg.get("z_transition_margin",   0.02))
+    n_easy_reward  = int(sanity_cfg.get("n_easy_reward_problems",   20))
+    easy_rollouts  = int(sanity_cfg.get("easy_reward_rollouts",      4))
+    easy_reward_thr = float(sanity_cfg.get("easy_reward_threshold", 0.05))
 
     chunk_tokens = int(latent_cfg.get("chunk_tokens", 341))
     latent_dim   = int(latent_cfg.get("latent_dim",   LATENT_DIM))
@@ -409,8 +464,9 @@ def main() -> None:
         all_problems = [json.loads(line) for line in f if line.strip()]
     random.shuffle(all_problems)
 
-    val_problems = all_problems[:n_val]
-    z_problems   = all_problems[:n_z]
+    val_problems   = all_problems[:n_val]
+    z_problems     = all_problems[:n_z]
+    easy_problems  = all_problems[:n_easy_reward]
 
     # ── Run checks ────────────────────────────────────────────────────────────
     mean_ce = _run_distill_loss_check(
@@ -434,14 +490,21 @@ def main() -> None:
         device=device, margin=z_trans_thr,
     )
 
+    easy_reward_rate = _run_easy_reward_check(
+        student, encoder, tokenizer,
+        easy_problems, chunk_tokens=chunk_tokens,
+        n_rollouts=easy_rollouts, device=device, threshold=easy_reward_thr,
+    )
+
     qualitative = _run_qualitative_samples(student, encoder, tokenizer, val_problems,
                                            chunk_tokens, device, n_samples=4)
 
     # ── Report ────────────────────────────────────────────────────────────────
-    ce_pass    = mean_ce < ce_thr
-    z_pass     = mean_z_std > z_thr
-    trans_pass = z_gap > z_trans_thr
-    all_pass   = ce_pass and z_pass and trans_pass
+    ce_pass         = mean_ce < ce_thr
+    z_pass          = mean_z_std > z_thr
+    trans_pass      = z_gap > z_trans_thr
+    easy_pass       = easy_reward_rate > easy_reward_thr
+    all_pass        = ce_pass and z_pass and trans_pass and easy_pass
 
     results = {
         "mean_ce_loss":          mean_ce,
@@ -449,12 +512,15 @@ def main() -> None:
         "z_temporal_delta":      z_tdelta,
         "z_cross_variation":     z_cvar,
         "z_transition_gap":      z_gap,
+        "easy_reward_rate":      easy_reward_rate,
         "ce_threshold":          ce_thr,
         "z_threshold":           z_thr,
         "z_transition_margin":   z_trans_thr,
+        "easy_reward_threshold": easy_reward_thr,
         "ce_pass":               ce_pass,
         "z_pass":                z_pass,
         "z_transition_pass":     trans_pass,
+        "easy_reward_pass":      easy_pass,
         "overall_pass":          all_pass,
         "qualitative_samples":   qualitative,
     }
@@ -468,9 +534,10 @@ def main() -> None:
         sys.exit(0)
     else:
         failures = [k for k, v in [
-            ("CE loss",      ce_pass),
-            ("z variance",   z_pass),
-            ("z transition", trans_pass),
+            ("CE loss",         ce_pass),
+            ("z variance",      z_pass),
+            ("z transition",    trans_pass),
+            ("easy reward rate", easy_pass),
         ] if not v]
         logger.error("✗ Phase 0 sanity check FAILED: %s", ", ".join(failures))
         sys.exit(1)
