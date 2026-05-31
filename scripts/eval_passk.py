@@ -801,6 +801,9 @@ def main() -> None:
     base_cfg = load_yaml_with_extends(args.base_model_config.resolve(), root=REPO_ROOT)
     pool_file = _pool_path(eval_cfg, args.pool, args.pool_path)
     problems = _load_jsonl_problems(pool_file)
+    n_problems = eval_cfg.get("n_problems")
+    if n_problems is not None:
+        problems = problems[:int(n_problems)]
 
     checkpoint = args.checkpoint or (base_cfg.get("primary") or {}).get("huggingface_repo_id")
     if not checkpoint:

@@ -1,0 +1,38 @@
+# "Same starting line" gate eval — run after Phase 0 sanity passes, before Phase 1.
+#
+# Checks that the Phase 0 checkpoint has not accidentally learned L5 solving.
+# Expected result: pass@8 ≈ 0% on all 40 problems.
+#
+# 40 problems × 8 rollouts = 320 sequences — completes in ~5 min on RTX Pro 6000.
+#
+# Usage:
+#   python scripts/eval_passk.py \
+#       --eval-config configs/eval_same_start_gate.yaml \
+#       --generation-mode latent_markov_pretrained \
+#       --train-config configs/train_latent_grpo.yaml \
+#       --checkpoint artifacts/latent_grpo/<run_id>/phase0 \
+#       --arm-name latent_grpo_pretrained_gate \
+#       --output artifacts/latent_grpo/<run_id>/eval_same_start_gate.json
+
+evaluation:
+  benchmark: "MATH-Level5-Hard"
+  primary_claim_path: "data/math_level5_hard_pool.jsonl"
+
+  # First 40 problems from the pool (deterministic, same across all arms).
+  n_problems: 40
+
+  metrics: ["pass@1", "pass@8"]
+  claim_metric: "pass@8"
+  n_samples: 8
+
+  temperature: 1.0
+  top_p: 1.0
+  max_new_tokens: 1024
+
+  use_vllm: false
+  gen_batch_size: 128
+  compile_model: true
+
+  # Latent arm HF-path settings.
+  latent_eval_n_per_problem: 8
+  latent_eval_problem_batch_size: 32
