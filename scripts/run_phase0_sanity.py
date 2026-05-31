@@ -280,28 +280,52 @@ def _run_z_transition_check(
 
 
 @torch.no_grad()
-def _run_qualitative_sample(
+def _run_qualitative_samples(
     student: AutoModelForCausalLM,
     encoder: LatentStateEncoder,
     tokenizer: AutoTokenizer,
     problems: list[dict],
     chunk_tokens: int,
     device: torch.device,
-) -> None:
-    """Generate one sample in strict Markov mode and print first chunk."""
-    logger.info("[Check 3] Qualitative sample (strict Markov generation):")
-    problem = problems[0]
-    traces  = generate_latent_traces(
+    n_samples: int = 4,
+) -> list[dict]:
+    """Generate n_samples full 3-chunk traces in strict Markov mode.
+
+    Returns a list of dicts suitable for JSON serialisation, each containing
+    the problem prompt, all three decoded chunks, and the reward.
+    """
+    logger.info("[Qualitative] Generating %d full 3-chunk samples …", n_samples)
+    sample_problems = problems[:n_samples]
+    traces = generate_latent_traces(
         model=student, tokenizer=tokenizer, encoder=encoder,
-        problems=[problem], n_rollouts=1,
+        problems=sample_problems, n_rollouts=1,
         chunk_tokens=chunk_tokens,
         temperature=1.0, top_p=1.0, device=device,
     )
-    if traces:
-        chunk1 = tokenizer.decode(traces[0]["chunk_ids"][0], skip_special_tokens=True)
-        logger.info("  Problem: %s", problem["prompt"][:120])
-        logger.info("  Chunk 1: %s", chunk1[:200])
-        logger.info("  Reward:  %d", traces[0]["reward"])
+
+    records: list[dict] = []
+    for i, problem in enumerate(sample_problems):
+        trace = next((t for t in traces if t.get("problem_idx", i) == i), None)
+        if trace is None and i < len(traces):
+            trace = traces[i]
+        if trace is None:
+            continue
+        chunks_decoded = [
+            tokenizer.decode(chunk_ids, skip_special_tokens=True)
+            for chunk_ids in trace["chunk_ids"]
+        ]
+        record = {
+            "problem":  problem["prompt"],
+            "chunks":   chunks_decoded,
+            "reward":   int(trace["reward"]),
+        }
+        records.append(record)
+        logger.info("  [Sample %d] problem: %s", i + 1, problem["prompt"][:100])
+        for j, chunk_text in enumerate(chunks_decoded):
+            logger.info("    chunk %d: %s", j + 1, chunk_text[:180])
+        logger.info("    reward: %d", record["reward"])
+
+    return records
 
 
 def main() -> None:
@@ -410,8 +434,8 @@ def main() -> None:
         device=device, margin=z_trans_thr,
     )
 
-    _run_qualitative_sample(student, encoder, tokenizer, val_problems[:1],
-                            chunk_tokens, device)
+    qualitative = _run_qualitative_samples(student, encoder, tokenizer, val_problems,
+                                           chunk_tokens, device, n_samples=4)
 
     # ── Report ────────────────────────────────────────────────────────────────
     ce_pass    = mean_ce < ce_thr
@@ -432,6 +456,7 @@ def main() -> None:
         "z_pass":                z_pass,
         "z_transition_pass":     trans_pass,
         "overall_pass":          all_pass,
+        "qualitative_samples":   qualitative,
     }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
