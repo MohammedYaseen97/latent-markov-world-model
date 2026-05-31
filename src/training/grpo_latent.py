@@ -142,9 +142,27 @@ def _fwd(
     return lm_head(last_hidden), last_hidden
 
 
-def _unwrap(model: AutoModelForCausalLM) -> AutoModelForCausalLM:
-    """Return the original un-compiled module so save_pretrained sees clean weight names."""
-    return getattr(model, "_orig_mod", model)
+from contextlib import contextmanager as _contextmanager
+
+@_contextmanager
+def _unwrapped_for_save(model: AutoModelForCausalLM):
+    """Temporarily restore compiled sub-modules to their originals for save_pretrained.
+
+    _setup_compile replaces model.model and model.lm_head with torch.compile wrappers
+    whose parameter names include '_orig_mod', breaking Transformers' tied-weight check.
+    This context manager swaps them out, yields, then restores the compiled versions.
+    """
+    swapped: dict[str, torch.nn.Module] = {}
+    for attr in ("model", "lm_head"):
+        sub = getattr(model, attr, None)
+        if sub is not None and hasattr(sub, "_orig_mod"):
+            swapped[attr] = sub
+            setattr(model, attr, sub._orig_mod)
+    try:
+        yield model
+    finally:
+        for attr, compiled in swapped.items():
+            setattr(model, attr, compiled)
 
 
 def _setup_compile(
@@ -1151,7 +1169,8 @@ def _save_phase0_checkpoint(
         {"encoder": encoder.state_dict(), "step": step},
         directory / "phase0_encoder.pt",
     )
-    _unwrap(model).save_pretrained(str(directory / "backbone"))
+    with _unwrapped_for_save(model) as m:
+        m.save_pretrained(str(directory / "backbone"))
     if tokenizer is not None:
         tokenizer.save_pretrained(str(directory / "backbone"))
     (directory / "trainer_state.json").write_text(
@@ -1178,7 +1197,8 @@ def _save_phase1_checkpoint(
         },
         directory / "phase1_latent.pt",
     )
-    _unwrap(model).save_pretrained(str(directory / "backbone"))
+    with _unwrapped_for_save(model) as m:
+        m.save_pretrained(str(directory / "backbone"))
     if tokenizer is not None:
         tokenizer.save_pretrained(str(directory / "backbone"))
     (directory / "trainer_state.json").write_text(
