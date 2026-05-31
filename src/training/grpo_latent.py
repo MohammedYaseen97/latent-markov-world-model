@@ -189,11 +189,11 @@ def _setup_compile(
     """
     transformer, lm_head = _get_transformer_and_head(model)
     try:
-        # Backbone uses "default" mode — Qwen2.5 creates some CPU-side tensors internally
-        # (RoPE buffers, attention bias) that prevent CUDA graph capture.  "default" still
-        # fuses kernels via Triton and is appropriate for variable-length training sequences.
-        # Encoder uses "reduce-overhead" — it's a small fixed-shape MLP that benefits from
-        # CUDA graph capture (always [B, hidden_dim] input, no CPU-side ops).
+        # Both backbone and encoder use "default" mode.
+        # "reduce-overhead" uses CUDA graphs with static output buffers; the encoder is called
+        # 2-4 times per step and all outputs must stay alive simultaneously — subsequent calls
+        # would overwrite earlier buffers, corrupting z_1/prefix_1 before they are consumed.
+        # "default" still fuses kernels via Triton and avoids this aliasing problem entirely.
         inner = model.model
         if hasattr(inner, "lm_head"):
             inner.model   = torch.compile(transformer, dynamic=True, mode="default")
@@ -203,10 +203,10 @@ def _setup_compile(
             model.lm_head = torch.compile(lm_head,    dynamic=True, mode="default")
 
         if encoder is not None:
-            encoder.encoder  = torch.compile(encoder.encoder,  dynamic=True, mode="reduce-overhead")
-            encoder.injector = torch.compile(encoder.injector, dynamic=True, mode="reduce-overhead")
+            encoder.encoder  = torch.compile(encoder.encoder,  dynamic=True, mode="default")
+            encoder.injector = torch.compile(encoder.injector, dynamic=True, mode="default")
 
-        logger.info("  torch.compile applied (backbone=default, encoder=reduce-overhead, dynamic=True)")
+        logger.info("  torch.compile applied (backbone=default, encoder=default, dynamic=True)")
     except Exception as exc:
         logger.warning("  torch.compile not applied (falling back to eager): %s", exc)
 
