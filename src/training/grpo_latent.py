@@ -142,6 +142,11 @@ def _fwd(
     return lm_head(last_hidden), last_hidden
 
 
+def _unwrap(model: AutoModelForCausalLM) -> AutoModelForCausalLM:
+    """Return the original un-compiled module so save_pretrained sees clean weight names."""
+    return getattr(model, "_orig_mod", model)
+
+
 def _setup_compile(
     model: AutoModelForCausalLM,
     encoder: LatentStateEncoder | None = None,
@@ -1146,7 +1151,7 @@ def _save_phase0_checkpoint(
         {"encoder": encoder.state_dict(), "step": step},
         directory / "phase0_encoder.pt",
     )
-    model.save_pretrained(str(directory / "backbone"))
+    _unwrap(model).save_pretrained(str(directory / "backbone"))
     if tokenizer is not None:
         tokenizer.save_pretrained(str(directory / "backbone"))
     (directory / "trainer_state.json").write_text(
@@ -1173,7 +1178,7 @@ def _save_phase1_checkpoint(
         },
         directory / "phase1_latent.pt",
     )
-    model.save_pretrained(str(directory / "backbone"))
+    _unwrap(model).save_pretrained(str(directory / "backbone"))
     if tokenizer is not None:
         tokenizer.save_pretrained(str(directory / "backbone"))
     (directory / "trainer_state.json").write_text(
