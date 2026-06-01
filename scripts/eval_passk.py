@@ -34,6 +34,7 @@ from typing import Any
 import torch
 import yaml
 from tqdm import tqdm
+from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -362,22 +363,42 @@ def _load_latent_backbone(
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
     """Load backbone and tokenizer for latent arm eval.
 
-    Tries backbone_dir first (saved by _save_phase0/1_checkpoint); falls back
-    to the original HF model ID if the directory doesn't exist or has no chat
-    template (e.g. checkpoints saved before tokenizer was included).
-    """
-    attn_impl  = primary_cfg.get("attn_implementation", "sdpa")
-    model_id   = primary_cfg["huggingface_repo_id"]
-    revision   = primary_cfg.get("revision", "main")
-    src        = str(backbone_dir) if backbone_dir.is_dir() else model_id
+    Handles three cases:
+      1. Phase 0 LoRA checkpoint (adapter_config.json present): load HF base,
+         PeftModel.from_pretrained, merge_and_unload → single merged model.
+      2. Full HF-format checkpoint in backbone_dir: load directly.
+      3. backbone_dir absent: fall back to original HF model_id.
 
-    model = AutoModelForCausalLM.from_pretrained(
-        src, torch_dtype=torch.bfloat16, device_map="auto",
-        attn_implementation=attn_impl,
-    )
+    For case 1, the tokenizer is read from backbone_dir (saved alongside
+    adapter weights by _save_phase0_checkpoint).  For cases 2/3, tokenizer
+    falls back to model_id when the checkpoint has no chat_template.
+    """
+    attn_impl   = primary_cfg.get("attn_implementation", "sdpa")
+    model_id    = primary_cfg["huggingface_repo_id"]
+    revision    = primary_cfg.get("revision", "main")
+    adapter_cfg = backbone_dir / "adapter_config.json"
+
+    if backbone_dir.is_dir() and adapter_cfg.is_file():
+        # Phase 0 LoRA-only checkpoint: merge adapter into base before eval.
+        base = AutoModelForCausalLM.from_pretrained(
+            model_id, revision=revision,
+            torch_dtype=torch.bfloat16, device_map="auto",
+            attn_implementation=attn_impl,
+        )
+        model = PeftModel.from_pretrained(base, str(backbone_dir))
+        model = model.merge_and_unload()
+        tok_src = str(backbone_dir)   # tokenizer saved alongside adapter weights
+    else:
+        src     = str(backbone_dir) if backbone_dir.is_dir() else model_id
+        model   = AutoModelForCausalLM.from_pretrained(
+            src, torch_dtype=torch.bfloat16, device_map="auto",
+            attn_implementation=attn_impl,
+        )
+        tok_src = src
+
     model.eval()
 
-    tok = AutoTokenizer.from_pretrained(src, trust_remote_code=True, padding_side="left")
+    tok = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True, padding_side="left")
     if tok.chat_template is None:
         tok = AutoTokenizer.from_pretrained(
             model_id, revision=revision, trust_remote_code=True, padding_side="left",

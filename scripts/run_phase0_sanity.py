@@ -1,28 +1,66 @@
 """Phase 0 sanity check — run after pretrain_distill before launching Phase 1.
 
-Four checks:
-  1. CE distillation loss on held-out L1–L4 problems is below threshold.
-  2. z latent vectors have meaningful variance (encoder isn't collapsed).
-  3. z-transition check: the change z makes between chunks of the same problem
-     (temporal_delta = 1 − cos_sim(z_1, z_2)) exceeds the variation between
-     z_1 vectors of different problems at the same stage (cross_variation =
-     1 − mean_cos_sim(z_1_i, z_1_j)).  temporal_delta > cross_variation means
-     z is tracking solution-state transitions, not just encoding noise.
-  4. Print a sample completion in strict Markov mode to visually verify the
-     student can produce coherent text with z-prefix injection.
+Objective
+---------
+Phase 0 trains the student (LoRA backbone + encoder + z-injector) to generate
+full 3-chunk reasoning sequences on L1-L4 problems by conditioning only on the
+z-prefix, without ever seeing the preceding chunks directly.  The canonical
+success criterion is:
+
+    student(z_prefix) reward rate  ≥  teacher(full context) × coverage_threshold
+
+If the student can recover a meaningful fraction of the teacher's reward rate
+using *only* the compressed latent state z, the z-prefix mechanism works and
+Phase 1 GRPO on L5 problems has a viable gradient signal.
+
+Check structure
+---------------
+  1. [GATE]  CE distillation loss on held-out L1-L4 problems is below
+             threshold.  Fast training-health proxy.  Low CE is necessary
+             but not sufficient: teacher-forced loss is blind to exposure
+             bias — the model can ace CE while generating incoherently.
+
+  2. [GATE]  z latent vectors have meaningful per-dim variance (encoder isn't
+             collapsed).  Zero variance = encoder is dead; catches catastrophic
+             failure cheaply.
+
+  3. [INFO]  z-transition diagnostic: temporal_delta (how much z changes
+             between chunks of the same problem) vs. cross_variation (how
+             much z_1 varies across problems).  temporal_delta > cross_variation
+             means z tracks solution-state transitions.  Informational only —
+             not a gate because structured z can coexist with broken generation
+             and vice-versa.
+
+  4. [GATE]  Teacher reward baseline: run teacher (standard generation, no z)
+             on the same easy problems × K rollouts to establish what the
+             upper-bound reward rate looks like.  This anchors check 5.
+
+  5. [GATE]  Student vs. teacher reward rate: run student in strict Markov mode
+             (z-prefix only, no chunk context) on the same problems.  Gate:
+               student_rate ≥ teacher_rate × coverage_threshold   (default 0.30)
+               student_rate ≥ min_student_reward                  (default 0.10)
+             Also reports chunk-1 crutch rate: what fraction of student wins
+             are carried by chunk 1 alone (answer already boxed before chunk 2).
+             If > 50% the backbone is ignoring z for chunks 2+3 — still broken.
+
+  6. [INFO]  Qualitative samples: full decoded 3-chunk output per easy problem.
+             Indispensable for visually confirming chunks 2+3 are coherent math.
 
 Pass criteria (from configs/train_latent_grpo.yaml §phase0_sanity):
-  - mean_ce_loss                    < ce_loss_threshold       (default: 2.0 nats)
-  - mean_z_std                      > z_variance_threshold    (default: 0.1)
-  - temporal_delta − cross_variation > z_transition_margin    (default: 0.02)
+  - mean_ce_loss                    < ce_loss_threshold          (default: 2.0 nats)
+  - mean_z_std                      > z_variance_threshold       (default: 0.1)
+  - student_rate                   ≥ teacher_rate × coverage_threshold  (default: 0.30)
+  - student_rate                   ≥ min_student_reward          (default: 0.10)
 
 Usage:
     python scripts/run_phase0_sanity.py \
-        --config configs/train_latent_grpo.yaml
+        --config configs/train_latent_grpo.yaml \
+        --checkpoint artifacts/latent_grpo/<run_id>/phase0
 
     # Quick smoke run:
     python scripts/run_phase0_sanity.py \
-        --config configs/train_latent_grpo_smoke.yaml
+        --config configs/train_latent_grpo_smoke.yaml \
+        --checkpoint artifacts/latent_grpo/<run_id>/phase0
 """
 from __future__ import annotations
 
@@ -52,6 +90,7 @@ from src.training.grpo_latent import (
 )
 from src.training.grpo_baseline import answers_equivalent, extract_answer
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -281,7 +320,57 @@ def _run_z_transition_check(
 
 
 @torch.no_grad()
-def _run_easy_reward_check(
+def _run_teacher_reward_check(
+    teacher: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    problems: list[dict],
+    max_new_tokens: int,
+    n_rollouts: int,
+    temperature: float,
+    top_p: float,
+    device: torch.device,
+) -> float:
+    """Establish teacher reward baseline on easy problems.
+
+    The teacher generates in standard autoregressive mode (no chunking, full
+    context) to produce the upper-bound reward rate that the student should
+    approach.  This anchors the student coverage gate in check 5.
+
+    Returns teacher_rate: fraction of (problem × rollout) pairs graded correct.
+    """
+    correct = 0
+    total   = 0
+
+    for problem in problems:
+        prompt_ids = format_prompt(problem, tokenizer)
+        input_ids  = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+
+        for _ in range(n_rollouts):
+            out = teacher.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=(temperature > 0),
+                temperature=temperature,
+                top_p=top_p,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+            generated = out[0, input_ids.shape[1]:]
+            text      = tokenizer.decode(generated, skip_special_tokens=True)
+            pred      = extract_answer(text)
+            total    += 1
+            if pred is not None and answers_equivalent(pred, problem["ground_truth"]):
+                correct += 1
+
+    teacher_rate = correct / max(total, 1)
+    logger.info(
+        "[Check 4] teacher reward rate (standard generation): %.4f  (%d/%d correct)",
+        teacher_rate, correct, total,
+    )
+    return teacher_rate
+
+
+@torch.no_grad()
+def _run_student_vs_teacher_check(
     student: AutoModelForCausalLM,
     encoder: LatentStateEncoder,
     tokenizer: AutoTokenizer,
@@ -289,19 +378,27 @@ def _run_easy_reward_check(
     chunk_tokens: int,
     n_rollouts: int,
     device: torch.device,
-    threshold: float,
-) -> float:
-    """Check student can still solve easy problems in strict Markov mode.
+    teacher_rate: float,
+    coverage_threshold: float,
+    min_student_reward: float,
+) -> tuple[float, float]:
+    """Check student reward rate against teacher baseline in strict Markov mode.
 
-    Phase 1 RL requires at least some correct generations to produce non-zero
-    rewards and flow gradients. If the student gets 0% even on L1-L4 problems
-    in Markov mode, Phase 1 on L5 will be dead on arrival.
+    The student generates all three chunks using only the z-prefix — no chunk
+    context.  We grade the full concatenated 3-chunk output and also track the
+    chunk-1 crutch rate: the fraction of wins where the answer already appears
+    in chunk 1 alone.  A high crutch rate means chunks 2+3 are still ignored,
+    which means z_prefix conditioning is not working for the later chunks.
 
-    Returns the reward rate (fraction of rollouts that received reward 1).
-    Gate: reward_rate > threshold.
+    Gate:
+      student_rate ≥ teacher_rate × coverage_threshold   (default 0.30)
+      student_rate ≥ min_student_reward                  (default 0.10)
+
+    Returns (student_rate, chunk1_crutch_rate).
     """
-    correct = 0
-    total   = 0
+    correct        = 0
+    chunk1_correct = 0
+    total          = 0
 
     for problem in problems:
         traces = generate_latent_traces(
@@ -312,23 +409,45 @@ def _run_easy_reward_check(
         )
         for trace in traces:
             total += 1
-            # Re-grade via answer extraction in case trace reward wasn't set
+            chunk_ids = trace["chunk_ids"]
+
             full_text = tokenizer.decode(
-                [tok for chunk in trace["chunk_ids"] for tok in chunk.tolist()],
+                [tok for chunk in chunk_ids for tok in chunk.tolist()],
                 skip_special_tokens=True,
             )
             pred = extract_answer(full_text)
             if pred is not None and answers_equivalent(pred, problem["ground_truth"]):
                 correct += 1
+                # Check whether chunk 1 alone already contains the answer
+                c1_text   = tokenizer.decode(chunk_ids[0].tolist(), skip_special_tokens=True)
+                c1_pred   = extract_answer(c1_text)
+                if c1_pred is not None and answers_equivalent(c1_pred, problem["ground_truth"]):
+                    chunk1_correct += 1
 
-    reward_rate = correct / max(total, 1)
-    status      = "PASS" if reward_rate > threshold else "FAIL"
-    logger.info(
-        "[Check 4] easy-pool reward rate: %.4f  (%d/%d correct)"
-        " (threshold > %.4f) → %s",
-        reward_rate, correct, total, threshold, status,
+    student_rate      = correct / max(total, 1)
+    chunk1_crutch_rate = chunk1_correct / max(correct, 1)
+
+    coverage_target = teacher_rate * coverage_threshold
+    rate_pass       = (
+        student_rate >= coverage_target and
+        student_rate >= min_student_reward
     )
-    return reward_rate
+    status = "PASS" if rate_pass else "FAIL"
+
+    logger.info(
+        "[Check 5] student reward rate (Markov): %.4f  (%d/%d correct) → %s",
+        student_rate, correct, total, status,
+    )
+    logger.info(
+        "         teacher rate: %.4f  coverage needed: %.4f (%.0f%% of teacher)  min floor: %.4f",
+        teacher_rate, coverage_target, coverage_threshold * 100, min_student_reward,
+    )
+    crutch_warning = "  ⚠ chunk-1 crutch" if chunk1_crutch_rate > 0.5 else ""
+    logger.info(
+        "         chunk-1 crutch rate: %.4f (wins from chunk-1 alone / total wins)%s",
+        chunk1_crutch_rate, crutch_warning,
+    )
+    return student_rate, chunk1_crutch_rate
 
 
 @torch.no_grad()
@@ -393,14 +512,16 @@ def main() -> None:
     dtype     = getattr(torch, primary.get("dtype", "bfloat16"))
     attn_impl = primary.get("attn_implementation", "sdpa")
 
-    n_val          = int(sanity_cfg.get("n_val_problems",           50))
-    n_z            = int(sanity_cfg.get("n_z_problems",            100))
-    ce_thr         = float(sanity_cfg.get("ce_loss_threshold",      2.0))
-    z_thr          = float(sanity_cfg.get("z_variance_threshold",   0.1))
-    z_trans_thr    = float(sanity_cfg.get("z_transition_margin",   0.02))
-    n_easy_reward  = int(sanity_cfg.get("n_easy_reward_problems",   20))
-    easy_rollouts  = int(sanity_cfg.get("easy_reward_rollouts",      4))
-    easy_reward_thr = float(sanity_cfg.get("easy_reward_threshold", 0.05))
+    n_val               = int(sanity_cfg.get("n_val_problems",           50))
+    n_z                 = int(sanity_cfg.get("n_z_problems",            100))
+    ce_thr              = float(sanity_cfg.get("ce_loss_threshold",      2.0))
+    z_thr               = float(sanity_cfg.get("z_variance_threshold",   0.1))
+    z_trans_thr         = float(sanity_cfg.get("z_transition_margin",   0.02))
+    n_reward_problems   = int(sanity_cfg.get("n_reward_problems",        20))
+    teacher_rollouts    = int(sanity_cfg.get("teacher_reward_rollouts",   4))
+    student_rollouts    = int(sanity_cfg.get("student_reward_rollouts",   4))
+    coverage_threshold  = float(sanity_cfg.get("coverage_threshold",    0.30))
+    min_student_reward  = float(sanity_cfg.get("min_student_reward",    0.10))
 
     chunk_tokens = int(latent_cfg.get("chunk_tokens", 341))
     latent_dim   = int(latent_cfg.get("latent_dim",   LATENT_DIM))
@@ -419,17 +540,29 @@ def main() -> None:
     logger.info("Phase 0 sanity — device: %s", device)
     logger.info("Checkpoint dir: %s", phase0_dir)
 
-    # ── Load student (Phase 0 trained backbone) ────────────────────────────────
-    student_src = str(backbone_dir) if backbone_dir.is_dir() else model_id
-    logger.info("Loading student from %s ...", student_src)
-    student = AutoModelForCausalLM.from_pretrained(
-        student_src, torch_dtype=dtype, device_map="auto",
-        attn_implementation=attn_impl,
-    )
+    # ── Load student (Phase 0 trained backbone, merge LoRA if present) ────────
+    adapter_cfg = backbone_dir / "adapter_config.json"
+    if backbone_dir.is_dir() and adapter_cfg.is_file():
+        logger.info("Phase 0 LoRA adapter found — loading base + merging: %s", backbone_dir)
+        base = AutoModelForCausalLM.from_pretrained(
+            model_id, revision=revision,
+            torch_dtype=dtype, device_map="auto",
+            attn_implementation=attn_impl,
+        )
+        student = PeftModel.from_pretrained(base, str(backbone_dir))
+        student = student.merge_and_unload()
+        logger.info("  LoRA merged into student backbone")
+    else:
+        student_src = str(backbone_dir) if backbone_dir.is_dir() else model_id
+        logger.info("Loading student from %s ...", student_src)
+        student = AutoModelForCausalLM.from_pretrained(
+            student_src, torch_dtype=dtype, device_map="auto",
+            attn_implementation=attn_impl,
+        )
     student.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(
-        student_src, trust_remote_code=True, padding_side="left",
+        model_id, revision=revision, trust_remote_code=True, padding_side="left",
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -462,11 +595,11 @@ def main() -> None:
         all_problems = [json.loads(line) for line in f if line.strip()]
     random.shuffle(all_problems)
 
-    val_problems   = all_problems[:n_val]
-    z_problems     = all_problems[:n_z]
-    easy_problems  = all_problems[:n_easy_reward]
+    val_problems    = all_problems[:n_val]
+    z_problems      = all_problems[:n_z]
+    reward_problems = all_problems[:n_reward_problems]
 
-    # ── Run checks ────────────────────────────────────────────────────────────
+    # ── [Check 1] CE distillation loss ────────────────────────────────────────
     mean_ce = _run_distill_loss_check(
         student, teacher, encoder, tokenizer,
         val_problems, batch_size=min(batch_size, len(val_problems)),
@@ -474,6 +607,7 @@ def main() -> None:
         device=device, threshold=ce_thr,
     )
 
+    # ── [Check 2] z encoder variance ──────────────────────────────────────────
     mean_z_std = _run_z_variance_check(
         student, teacher, encoder, tokenizer,
         z_problems, batch_size=min(batch_size, len(z_problems)),
@@ -481,6 +615,7 @@ def main() -> None:
         device=device, threshold=z_thr,
     )
 
+    # ── [Diagnostic] z-transition (informational, not a gate) ─────────────────
     z_tdelta, z_cvar, z_gap = _run_z_transition_check(
         student, teacher, encoder, tokenizer,
         z_problems, batch_size=min(batch_size, len(z_problems)),
@@ -488,56 +623,101 @@ def main() -> None:
         device=device, margin=z_trans_thr,
     )
 
-    easy_reward_rate = _run_easy_reward_check(
-        student, encoder, tokenizer,
-        easy_problems, chunk_tokens=chunk_tokens,
-        n_rollouts=easy_rollouts, device=device, threshold=easy_reward_thr,
+    # ── [Check 4] Teacher reward baseline ─────────────────────────────────────
+    teacher_rate = _run_teacher_reward_check(
+        teacher, tokenizer,
+        reward_problems,
+        max_new_tokens=chunk_tokens * 3,
+        n_rollouts=teacher_rollouts,
+        temperature=temperature, top_p=top_p,
+        device=device,
     )
 
+    # ── [Check 5] Student vs teacher reward rate ──────────────────────────────
+    student_rate, chunk1_crutch_rate = _run_student_vs_teacher_check(
+        student, encoder, tokenizer,
+        reward_problems,
+        chunk_tokens=chunk_tokens,
+        n_rollouts=student_rollouts,
+        device=device,
+        teacher_rate=teacher_rate,
+        coverage_threshold=coverage_threshold,
+        min_student_reward=min_student_reward,
+    )
+
+    # ── [Qualitative] sample 3-chunk traces ───────────────────────────────────
     qualitative = _run_qualitative_samples(student, encoder, tokenizer, val_problems,
                                            chunk_tokens, device, n_samples=4)
 
     # ── Report ────────────────────────────────────────────────────────────────
-    ce_pass         = mean_ce < ce_thr
-    z_pass          = mean_z_std > z_thr
-    trans_pass      = z_gap > z_trans_thr
-    easy_pass       = easy_reward_rate > easy_reward_thr
-    all_pass        = ce_pass and z_pass and trans_pass and easy_pass
+    ce_pass      = mean_ce < ce_thr
+    z_pass       = mean_z_std > z_thr
+    student_pass = (
+        student_rate >= teacher_rate * coverage_threshold and
+        student_rate >= min_student_reward
+    )
+    # z-transition is informational: included in output but NOT in gate
+    all_pass = ce_pass and z_pass and student_pass
 
     results = {
-        "mean_ce_loss":          mean_ce,
-        "mean_z_std":            mean_z_std,
-        "z_temporal_delta":      z_tdelta,
-        "z_cross_variation":     z_cvar,
-        "z_transition_gap":      z_gap,
-        "easy_reward_rate":      easy_reward_rate,
-        "ce_threshold":          ce_thr,
-        "z_threshold":           z_thr,
-        "z_transition_margin":   z_trans_thr,
-        "easy_reward_threshold": easy_reward_thr,
-        "ce_pass":               ce_pass,
-        "z_pass":                z_pass,
-        "z_transition_pass":     trans_pass,
-        "easy_reward_pass":      easy_pass,
-        "overall_pass":          all_pass,
-        "qualitative_samples":   qualitative,
+        # ── gates ──
+        "mean_ce_loss":            mean_ce,
+        "mean_z_std":              mean_z_std,
+        "teacher_reward_rate":     teacher_rate,
+        "student_reward_rate":     student_rate,
+        "coverage_ratio":          student_rate / max(teacher_rate, 1e-6),
+        "chunk1_crutch_rate":      chunk1_crutch_rate,
+        # ── diagnostic (not a gate) ──
+        "z_temporal_delta":        z_tdelta,
+        "z_cross_variation":       z_cvar,
+        "z_transition_gap":        z_gap,
+        # ── thresholds ──
+        "ce_threshold":            ce_thr,
+        "z_threshold":             z_thr,
+        "coverage_threshold":      coverage_threshold,
+        "min_student_reward":      min_student_reward,
+        "z_transition_margin":     z_trans_thr,
+        # ── pass/fail ──
+        "ce_pass":                 ce_pass,
+        "z_pass":                  z_pass,
+        "student_vs_teacher_pass": student_pass,
+        "z_transition_info":       z_gap > z_trans_thr,
+        "overall_pass":            all_pass,
+        # ── qualitative ──
+        "qualitative_samples":     qualitative,
     }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2))
     logger.info("Results saved → %s", out_path)
 
+    logger.info(
+        "──── Summary ────────────────────────────────────────────────────────\n"
+        "  [1] CE loss:           %.4f nats    (< %.4f)  → %s\n"
+        "  [2] z variance:        %.4f         (> %.4f)  → %s\n"
+        "  [D] z-transition gap:  %.4f         (> %.4f)  → %s (info only)\n"
+        "  [4] teacher rate:      %.4f\n"
+        "  [5] student rate:      %.4f  coverage: %.1f%%  crutch: %.1f%% → %s\n"
+        "  Overall: %s",
+        mean_ce,      ce_thr,      "PASS" if ce_pass      else "FAIL",
+        mean_z_std,   z_thr,       "PASS" if z_pass       else "FAIL",
+        z_gap,        z_trans_thr, "PASS" if z_gap > z_trans_thr else "FAIL",
+        teacher_rate,
+        student_rate, results["coverage_ratio"] * 100, chunk1_crutch_rate * 100,
+                                   "PASS" if student_pass else "FAIL",
+        "PASS ✓" if all_pass else "FAIL ✗",
+    )
+
     if all_pass:
-        logger.info("✓ Phase 0 sanity check PASSED. Safe to proceed to Phase 1.")
+        logger.info("Phase 0 sanity PASSED — safe to proceed to Phase 1.")
         sys.exit(0)
     else:
         failures = [k for k, v in [
-            ("CE loss",         ce_pass),
-            ("z variance",      z_pass),
-            ("z transition",    trans_pass),
-            ("easy reward rate", easy_pass),
+            ("CE loss",              ce_pass),
+            ("z variance",          z_pass),
+            ("student vs teacher",  student_pass),
         ] if not v]
-        logger.error("✗ Phase 0 sanity check FAILED: %s", ", ".join(failures))
+        logger.error("Phase 0 sanity FAILED: %s", ", ".join(failures))
         sys.exit(1)
 
 

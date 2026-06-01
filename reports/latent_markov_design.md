@@ -14,6 +14,16 @@
 | repr_h: mean_pool → last token | Last token of a causal LM has attended over all prior tokens in the chunk — it is the model's own attention-based summary. Mean pooling discards positional/salience structure |
 | Phase 0 described as pretraining, not RL warmup | The right frame: new components (encoder, ZInjector) need to be initialised before RL, just as pretraining initialises the backbone before fine-tuning |
 
+## Changelog (v3 → v4)
+
+| Change | Rationale |
+|---|---|
+| Phase 0 backbone wrapped in LoRA (r=16, all attn+MLP projections) | Full fine-tuning at lr=1e-6 gave the backbone 100× less gradient signal than the encoder/ZInjector at lr=1e-4. Result: backbone didn't learn to condition on z_prefix; chunks 2+3 were incoherent. LoRA adapters at lr=1e-4 match the encoder's learning rate, eliminating the gradient imbalance while keeping base weights frozen (no catastrophic forgetting). |
+| Phase 0 saves LoRA adapter only; Phase 1 merges before GRPO | Keeps Phase 0 checkpoint small (adapter_config.json + adapter weights only). Phase 1 calls merge_and_unload before GRPO so the Phase 1 backbone is a normal merged HF model with no PEFT overhead. |
+| Phase 0 Sanity Check redesigned: z-transition demoted; teacher baseline + student-vs-teacher rate added as final gate | The old suite measured architectural health (z structure, CE loss) but had no functional gate. A model can ace CE under teacher forcing while generating garbage autoregressively. The correct final gate is: student(z_prefix) reward rate ≥ teacher(full context) × coverage_threshold. This is the actual Phase 0 success criterion. |
+| Chunk-1 crutch rate added to sanity diagnostics | Detects whether the student's correct answers come from chunk 1 alone (backbone answering before z kicks in) vs. the full 3-chunk pipeline. Crutch rate > 50% = z_prefix conditioning still broken for chunks 2+3. |
+| Checkpoint bug fixes: LoRA+compile save, eval_passk LoRA merge, eval_markov_diagnostics LoRA merge | PEFT's save_pretrained walks state_dict keys which get ._orig_mod. prefixes from torch.compile. Fixed by temporarily unwrapping compiled inner modules before saving. eval_passk and eval_markov_diagnostics were missing adapter_config.json detection and would silently misload LoRA-only backbone directories. |
+
 ---
 
 ## The Problem This Arm Solves
@@ -334,7 +344,17 @@ exploration specifically.
 `[system_prompt | problem | all_prior_chunks]`). Generates high-quality continuations
 for each chunk using complete information. Teacher weights are never updated.
 
-**Student:** backbone (unfrozen, low lr ~1e-6) + encoder (lr ~1e-4) + ZInjector (lr ~1e-4).
+**Student:** LoRA-wrapped backbone (r=16, lr=1e-4) + encoder (lr=1e-4) + ZInjector (lr=1e-4).
+Base backbone weights are frozen; only LoRA adapters, encoder, and ZInjector receive gradient.
+
+**Why LoRA, not full backbone fine-tuning:**
+Full fine-tuning at lr=1e-6 gave the backbone 100× less gradient signal than the
+encoder/ZInjector at lr=1e-4. The encoder/ZInjector learned to generate z, but the
+backbone never learned to act on it — chunks 2 and 3 remained incoherent.
+LoRA adapters at lr=1e-4 eliminate the gradient imbalance: all three components receive
+comparable signal. The base backbone weights are frozen throughout Phase 0, preventing
+catastrophic forgetting of the backbone's L5 capability (which must come from Phase 1 RL,
+not Phase 0 supervised signal).
 
 **Data:** L1–L4 MATH pool (`data/math_easy_pool.jsonl`), ~4100 problems.
 Level 5 excluded for mutual exclusivity with the RL pool.
@@ -372,11 +392,20 @@ Step 5:  L_phase0 = L_distill_2 + L_distill_3
   project it to a prefix that allows the backbone to continue the solution.
   z must encode "where we are after chunk h" — the backbone's own reasoning state.
 
-- **Backbone:** attend to the z prefix and generate a continuation consistent with
-  the direction encoded in z. Learns the mapping: "z prefix = direction, continue here."
+- **LoRA adapters (backbone):** attend to the z prefix and generate a continuation
+  consistent with the direction encoded in z. Learns the mapping: "z prefix = direction,
+  continue here." LoRA adapts this mapping at lr=1e-4 without touching the base weights
+  (which preserve the backbone's pretrained language abilities).
 
 - **ZInjector:** project 64-dim z into backbone embedding space in a way the backbone
   can read.
+
+**Phase 0 checkpoint format:** saves LoRA adapter weights only (`adapter_config.json` +
+`adapter_model.safetensors`) alongside the encoder. The base backbone weights are not
+saved (they're unchanged and can be reloaded from HF). Phase 1 training loads
+`base_model + LoRA adapter`, calls `merge_and_unload()` to fold the adapter deltas
+into the base weights, and proceeds with the merged model. After merge, Phase 1 has a
+normal Qwen backbone with no PEFT overhead.
 
 **Dense signal:** every training step has signal on every chunk-2 and chunk-3 token
 for every problem in the batch. No sparsity. Contrast with old L_trans + L_out on L1–L4
@@ -538,11 +567,16 @@ the controlled latent baseline eval, and the Phase 1 pass@128 result.
 | Phase 0 type                     | teacher-forced self-supervised distillation| teacher = frozen original Qwen, full context                 |
 | Phase 0 data                     | L1–L4 MATH pool, ~4100 problems            | `data/math_easy_pool.jsonl` (Level 5 excluded)               |
 | Phase 0 max_steps                | ~400                                       | convergence monitored via held-out distillation loss         |
-| Phase 0 backbone lr              | ~1e-6                                      | low; backbone learns to use z without losing L5 capability   |
-| Phase 0 encoder/ZInjector lr     | ~1e-4                                      | higher; learning from scratch                                |
+| Phase 0 backbone                 | LoRA-wrapped (r=16, alpha=32, dropout=0.0) | base weights frozen; only LoRA adapters updated              |
+| Phase 0 LoRA target modules      | q/k/v/o_proj, gate/up/down_proj            | all attention + MLP projections; full residual path covered  |
+| Phase 0 backbone lr (base)       | 1e-6 (unused — base frozen)                | base weights unchanged; LoRA adapters use lr_lora            |
+| Phase 0 lr_lora                  | 1e-4                                       | matches encoder/ZInjector; all three adapting from scratch   |
+| Phase 0 encoder/ZInjector lr     | 1e-4                                       | learning from scratch                                        |
 | Phase 0 loss                     | CE(student_log_probs, teacher_chunk_{2,3}) | dense; no reward needed                                      |
 | Phase 0 generation               | teacher tokens as input (teacher forcing)  | no garbage later-chunk generation; no crutch                 |
 | Phase 0 crutch                   | NONE                                       | strict Markov in student: [z_prefix ‖ teacher_chunk_h]       |
+| Phase 0 checkpoint format        | LoRA adapter + encoder                     | `backbone/adapter_config.json` + adapter weights + tokenizer; `phase0_encoder.pt` |
+| Phase 1 backbone load            | base + LoRA merge (`merge_and_unload`)     | merged before GRPO; Phase 1 uses normal HF model, no PEFT   |
 | Phase 1 max_steps                | 200                                        | budget; matches baseline                                     |
 | Phase 1 batch_size               | 4                                          | matches baseline gradient density                            |
 | Phase 1 G (rollouts per problem) | 128                                        | locked; matches eval pass@128 scale                          |
@@ -596,55 +630,129 @@ Phase 1 rollout generation.
 
 Ordered by dependency. Each step is a gate for the next.
 
-| #   | Deliverable                                                                                                    | File                                   | Status |
-| --- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------- | ------ |
-| 1   | Easy pool: `data/math_easy_pool.jsonl` — L1–L4 (~4100 problems)                                                | `scripts/prepare_easy_pool.py`         | ✅      |
-| 2   | Hard pool: `data/math_level5_hard_pool.jsonl` — Level 5, pass@128=0 filter                                     | `scripts/prepare_math_level5_pool.py`  | ✅      |
-| 3   | `VAEStateEncoder` — encoder (1536→512→128→64) + ZInjector; remove transition net + OutcomeHead; last-token repr | `src/models/vae_state_encoder.py`      | ⬜      |
-| 4   | `pretrain_distill()` — Phase 0: teacher-forcing CE distillation on L1–L4; chunk-by-chunk loop                  | `src/training/grpo_latent.py`          | ⬜      |
-| 5   | `generate_latent_traces()` — strict Markov: `[z_prefix | generate]`; no crutch; stores chunk_ids + reward only | `src/training/grpo_latent.py`          | ⬜      |
-| 6   | `train_latent()` — Phase 1 custom GRPO loop; pure L_RL; adv_clip=20.0; single grad_clip=1.0                   | `src/training/grpo_latent.py`          | ⬜      |
-| 7   | Smoke config (Phase 0: 2 steps distill; Phase 1: 2 steps RL)                                                   | `configs/train_latent_grpo_smoke.yaml` | ⬜      |
-| 8   | Full config (Phase 0: ~400 steps distill; Phase 1: 200 steps L_RL)                                             | `configs/train_latent_grpo.yaml`       | ⬜      |
-| 9   | Latent eval modes in eval_passk.py (`latent_markov`, `latent_markov_pretrained`)                                | `scripts/eval_passk.py`                | ✅      |
-| 10  | **Phase 0 training run** → `runs/latent_grpo/phase0_encoder.pt`                                                 | `scripts/train_latent.py --phase 0`    | ⬜      |
-| 11  | **Phase 0 Sanity Check** — distillation loss convergence + z variance check                                     | `scripts/run_phase0_sanity.py`         | ⬜      |
-| 12  | **Controlled latent baseline eval** (`latent_grpo_pretrained` pass@128 on L5 ≈ 0%)                              | `scripts/eval_passk.py`                | ⬜      |
-| 13  | **Phase 1 training** — 200 steps on Level 5 hard pool                                                           | `scripts/train_latent.py --phase 1`    | ⬜      |
-| 14  | **Phase 1 eval** — pass@128                                                                                     | `scripts/eval_passk.py`                | ⬜      |
-| 15  | **E1 z-consistency diagnostics**                                                                                | `scripts/eval_markov_diagnostics.py`   | ⬜      |
+| #   | Deliverable                                                                                                                | File                                   | Status |
+| --- | -------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- | ------ |
+| 1   | Easy pool: `data/math_easy_pool.jsonl` — L1–L4 (~4100 problems)                                                           | `scripts/prepare_easy_pool.py`         | ✅      |
+| 2   | Hard pool: `data/math_level5_hard_pool.jsonl` — Level 5, pass@128=0 filter                                                | `scripts/prepare_math_level5_pool.py`  | ✅      |
+| 3   | `LatentStateEncoder` — encoder (1536→512→128→64) + ZInjector; last-token repr; no transition net / OutcomeHead            | `src/models/vae_state_encoder.py`      | ✅      |
+| 4   | `pretrain_distill()` — Phase 0: LoRA backbone + encoder; teacher-forcing CE on L1–L4; chunk-by-chunk loop                 | `src/training/grpo_latent.py`          | ✅      |
+| 5   | `generate_latent_traces()` — strict Markov: `[z_prefix \| generate]`; no crutch; stores chunk_ids + reward only          | `src/training/grpo_latent.py`          | ✅      |
+| 6   | `train_latent()` — Phase 1 custom GRPO loop; LoRA merge on load; pure L_RL; adv_clip=20.0; single grad_clip=1.0           | `src/training/grpo_latent.py`          | ✅      |
+| 7   | Smoke config (Phase 0: 2 steps distill; Phase 1: 2 steps RL)                                                              | `configs/train_latent_grpo_smoke.yaml` | ✅      |
+| 8   | Full config (Phase 0: ~400 steps distill + LoRA params; Phase 1: 200 steps L_RL)                                          | `configs/train_latent_grpo.yaml`       | ✅      |
+| 9   | Latent eval modes in eval_passk.py (`latent_markov`, `latent_markov_pretrained`) — LoRA-aware backbone loading             | `scripts/eval_passk.py`                | ✅      |
+| 10  | Phase 0 Sanity Check — 5-check suite: CE loss, z variance, z-transition [info], teacher baseline, student-vs-teacher gate | `scripts/run_phase0_sanity.py`         | ✅      |
+| 11  | **Phase 0 training run** → `artifacts/latent_grpo/<run_id>/phase0/`                                                       | `scripts/train_latent.py --phase 0`    | ⬜      |
+| 12  | **Phase 0 sanity run** → `phase0_sanity.json`; student rate ≥ teacher rate × 0.30                                         | `scripts/run_phase0_sanity.py`         | ⬜      |
+| 13  | **Controlled latent baseline eval** (`latent_grpo_pretrained` pass@128 on L5 ≈ 0%)                                        | `scripts/eval_passk.py`                | ⬜      |
+| 14  | **Phase 1 training** — 200 steps on Level 5 hard pool                                                                     | `scripts/train_latent.py --phase 1`    | ⬜      |
+| 15  | **Phase 1 eval** — pass@128                                                                                                | `scripts/eval_passk.py`                | ⬜      |
+| 16  | **E1 z-consistency diagnostics**                                                                                           | `scripts/eval_markov_diagnostics.py`   | ⬜      |
 
 Note: old deliverables 4 (OutcomeHead), 6 (pretrain_vae_online with L_trans + L_out),
-and 13 (NFR6 UMAP gate) are superseded. NFR6 is replaced by Phase 0 Sanity Check (#11).
+and 13 (NFR6 UMAP gate) are superseded. NFR6 is replaced by Phase 0 Sanity Check (#10).
+Artifact root changed from `runs/` to `artifacts/` (consistent with baseline arm).
 
 ---
 
 ## Phase 0 Sanity Check (replaces NFR6 gate)
 
-**When to run:** after Phase 0 completes (`runs/latent_grpo/phase0_encoder.pt`).
+**When to run:** after Phase 0 completes.
+**Script:** `scripts/run_phase0_sanity.py --config configs/train_latent_grpo.yaml --checkpoint artifacts/latent_grpo/<run_id>/phase0`
+**Output:** `artifacts/latent_grpo/<run_id>/phase0/phase0_sanity.json`
 
-**Check 1 — Distillation loss convergence:**
-Compute held-out CE distillation loss on 50 L1–L4 problems not seen during training.
-Threshold: held-out loss < 2.0 nats (approximately: model is doing better than uniform
-on teacher continuations). A flat or increasing curve means Phase 0 has not converged.
+**Phase 0 success criterion (the core question):**
+> Does `student(z_prefix)` achieve a reward rate on L1–L4 problems that is
+> comparable to `teacher(full context)` on the same problems?
 
-**Check 2 — z variance:**
-Run the Phase 0 pipeline (student + encoder) on 100 L1–L4 problems, collect z_final.
-Compute mean per-dimension std across problems. Threshold: mean std > 0.1.
-Near-zero variance = encoder has collapsed to near-constant z (degenerate).
+If the student with only z_prefix as context can recover a meaningful fraction of the
+teacher's reward rate, the z-prefix mechanism works — the backbone has learned to read
+z, and the encoder has learned to write it. This is the gate for Phase 1.
 
-**Check 3 — Controlled L5 capability (same starting line):**
-Eval `latent_grpo_pretrained` on L5 hard pool after Phase 0.
-Expected: pass@128 ≈ 0% (same as baseline pretrained). Phase 0 on L1–L4 should not
-give any advantage on L5. If pass@128 > 5% after Phase 0, Phase 0 has leaked
-L5-specific supervision — investigate data contamination or excessively high backbone lr.
+---
 
-**If any check fails:** do not proceed to Phase 1.
-- Distillation not converged → increase `phase0.n_steps` or backbone lr
-- z collapsed → increase encoder lr; check ZInjector init; check repr_h extraction
-- L5 capability inflated → reduce backbone lr; verify L1–L4 / L5 pool mutual exclusivity
+**[Check 1 — GATE] CE distillation loss < 2.0 nats**
 
-**Output:** `runs/latent_grpo/phase0_sanity.json` with loss values and z variance stats.
+Compute held-out CE distillation loss on 50 L1–L4 problems (teacher-forced).
+Threshold: loss < 2.0 nats. A flat or increasing curve means Phase 0 has not converged.
+
+*Limitation:* CE is teacher-forced (exposure bias blind spot). Low CE doesn't guarantee
+good autoregressive generation. Necessary but not sufficient.
+
+---
+
+**[Check 2 — GATE] z encoder variance > 0.1**
+
+Compute mean per-dim std of z_1 vectors across 100 problems. Threshold: > 0.1.
+Near-zero variance = encoder collapsed to constant z = architecture dead.
+
+---
+
+**[Diagnostic — INFO ONLY] z-transition gap**
+
+For each problem, compute `temporal_delta` (how much z changes from chunk 1 to chunk 2)
+vs `cross_variation` (how much z_1 varies across different problems). If
+`temporal_delta > cross_variation`, z tracks solution-state transitions rather than
+just problem identity.
+
+This check is **informational only — not a gate.** Structured z can coexist with broken
+generation (the backbone may not be using z well) and vice versa. It is a useful
+diagnostic but gating on it misfires in both directions.
+
+---
+
+**[Check 4 — GATE] Teacher reward baseline on L1–L4**
+
+Run the teacher (original frozen Qwen, standard generation, no z, max_new_tokens=1023)
+on 20 easy problems × 4 rollouts. Record `teacher_rate`.
+
+This anchors Check 5. Without a teacher baseline, a student rate of "10%" has no
+meaning — teacher might be getting 10% (fine) or 80% (catastrophic failure).
+
+---
+
+**[Check 5 — GATE] Student vs teacher reward rate**
+
+Run student in strict Markov mode (z_prefix only, all 3 chunks) on the same 20 problems
+× 4 rollouts. Grade the full 3-chunk concatenated output.
+
+Gate:
+```
+student_rate ≥ teacher_rate × 0.30   (student recovers ≥ 30% of teacher's rate)
+student_rate ≥ 0.10                  (absolute floor regardless of teacher rate)
+```
+
+Strict Markov with lossy z-compression will never perfectly match full-context
+generation. 30% coverage means "the mechanism is functional." If Phase 0 succeeded,
+expect student_rate in the range 20–50% when teacher_rate is 60–80%.
+
+**Chunk-1 crutch rate (diagnostic within Check 5):**
+Tracks what fraction of student wins come from chunk 1 alone (answer already boxed
+before chunk 2 starts). A crutch rate > 50% means chunks 2+3 are still ignored —
+z_prefix conditioning is still broken for the later chunks, even if the overall
+rate passes the gate. This was the specific failure mode that motivated the LoRA change:
+chunk 2 empty, chunk 3 incoherent garbage.
+
+---
+
+**[Qualitative — INFO] Full 3-chunk sample traces**
+
+4 full decoded traces (all 3 chunks) printed to log and saved to JSON.
+Indispensable visual check: are chunks 2 and 3 coherent mathematical text?
+Garbage in chunks 2+3 (wrong language, random tokens, off-topic text) confirms z
+conditioning is broken regardless of what quantitative metrics say.
+
+---
+
+**If any gate fails — do not proceed to Phase 1:**
+
+| Failure | Likely cause | Fix |
+|---|---|---|
+| CE loss high / not converging | too few steps, lr too low | increase `phase0.n_steps`; check encoder lr |
+| z variance collapsed | encoder collapsed; bad repr_h | increase encoder lr; check ZInjector init |
+| student rate < 30% of teacher AND chunk-1 crutch high | backbone still ignoring z for chunks 2+3 | increase `lr_lora`; increase `phase0.n_steps` |
+| student rate < 30% of teacher AND crutch rate low | z is being used but encoding wrong info | check encoder architecture; check repr_h extraction |
+| student rate passes but crutch > 50% | wins are all chunk-1-lucky; z_prefix still not conditioning chunks 2+3 | same as first row — LoRA needs more steps |
 
 ---
 
@@ -662,7 +770,9 @@ not have a head start. With near-zero ZInjector init and Phase 0 restricted to L
 this should hold naturally.
 
 **Evaluation:** `scripts/eval_passk.py --generation-mode latent_markov_pretrained`.
-Loads backbone from HF model ID and encoder from `phase0.checkpoint_path`.
+Loads backbone from `artifacts/latent_grpo/<run_id>/phase0/backbone/`
+(LoRA-aware: detects `adapter_config.json`, merges before eval) and encoder from
+`phase0_encoder.pt` in the same directory.
 
 ---
 
@@ -694,8 +804,10 @@ Latent arm pass@128 vs baseline — covered by the core ablation table.
 | Criterion                                      | Threshold                                                                            |
 | ---------------------------------------------- | ------------------------------------------------------------------------------------ |
 | Smoke test                                     | completes end-to-end < 10 min on 4060                                                |
-| Phase 0 distillation convergence               | held-out CE loss < 2.0 nats                                                          |
-| Phase 0 z variance                             | mean per-dim std > 0.1 across 100 problems                                           |
+| Phase 0 distillation convergence [Check 1]     | held-out CE loss < 2.0 nats                                                          |
+| Phase 0 z variance [Check 2]                   | mean per-dim std > 0.1 across 100 problems                                           |
+| **Phase 0 student vs teacher rate [Check 5]**  | **student_rate ≥ teacher_rate × 0.30 AND student_rate ≥ 0.10** (the actual gate)   |
+| Phase 0 chunk-1 crutch rate [diagnostic]       | < 0.50 (more than half of wins involve chunks 2+3 contributing)                      |
 | Controlled baseline (`latent_grpo_pretrained`) | pass@128 ≤ ~1% on L5 (same starting line as baseline pretrained)                    |
 | Phase 1 logs                                   | L_RL non-zero within first 30 steps; adv_clip=20.0, grad_clip=1.0 confirmed in log  |
 | `latent_grpo` pass@128                         | ≥ baseline_grpo pass@128 + 3pp                                                       |

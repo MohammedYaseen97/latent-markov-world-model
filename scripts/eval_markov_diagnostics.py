@@ -44,6 +44,7 @@ import torch.nn.functional as F
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from peft import PeftModel
 from src.models.vae_state_encoder import HIDDEN_DIM, LATENT_DIM, LatentStateEncoder
 from src.training.grpo_latent import generate_latent_traces, _pipeline_with_grad, _setup_compile
 from src.utils.config_loader import load_yaml_with_extends
@@ -207,22 +208,39 @@ def main() -> None:
 
     # ── Load backbone ──────────────────────────────────────────────────────────
     if args.phase0_only:
+        # Diagnostic mode: use unmodified HF base to isolate encoder quality.
         backbone_src = model_id
+        tok_src      = model_id
         print(f"Loading pretrained backbone {model_id} ...", flush=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            backbone_src, torch_dtype=dtype, device_map="auto",
+            attn_implementation=attn_impl,
+        )
     else:
-        backbone_src = str(args.checkpoint / "backbone")
-        print(f"Loading Phase 1 backbone from {backbone_src} ...", flush=True)
+        backbone_dir = args.checkpoint / "backbone"
+        adapter_cfg  = backbone_dir / "adapter_config.json"
+        print(f"Loading backbone from {backbone_dir} ...", flush=True)
+        if backbone_dir.is_dir() and adapter_cfg.is_file():
+            # Phase 0 LoRA checkpoint pointed at directly — merge before diagnostics.
+            base  = AutoModelForCausalLM.from_pretrained(
+                model_id, revision=revision,
+                torch_dtype=dtype, device_map="auto",
+                attn_implementation=attn_impl,
+            )
+            model = PeftModel.from_pretrained(base, str(backbone_dir))
+            model = model.merge_and_unload()
+            print("  LoRA merged into backbone", flush=True)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                str(backbone_dir), torch_dtype=dtype, device_map="auto",
+                attn_implementation=attn_impl,
+            )
+        tok_src = str(backbone_dir)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        backbone_src, torch_dtype=dtype, device_map="auto",
-        attn_implementation=attn_impl,
-    )
     model.eval()
 
-    tok_src   = backbone_src if not args.phase0_only else model_id
     tokenizer = AutoTokenizer.from_pretrained(
-        tok_src, revision=None if not args.phase0_only else revision,
-        trust_remote_code=True, padding_side="left",
+        tok_src, trust_remote_code=True, padding_side="left",
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

@@ -44,6 +44,11 @@ phase0_sanity:
   ce_loss_threshold: 20.0    # very loose for smoke — just checking it runs
   z_variance_threshold: 0.0
   n_z_problems: 2
+  n_reward_problems: 2
+  teacher_reward_rollouts: 1
+  student_reward_rollouts: 1
+  coverage_threshold: 0.0    # no coverage requirement for smoke
+  min_student_reward: 0.0    # no floor for smoke
 
 training:
   seed: 42

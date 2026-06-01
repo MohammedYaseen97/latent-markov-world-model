@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 
 from src.models.vae_state_encoder import HIDDEN_DIM, LATENT_DIM, LatentStateEncoder
 from src.training.grpo_baseline import SYSTEM_PROMPT, answers_equivalent, extract_answer
@@ -96,9 +97,17 @@ def compute_grpo_advantages(
     return advantages
 
 
+_LATENT_SYSTEM_PROMPT = (
+    "Please reason step by step, completing each reasoning step fully before "
+    "moving to the next. Within any token limit, finish the current step before "
+    "stopping — never break mid-sentence or mid-calculation. "
+    "Put your final answer inside \\boxed{answer}."
+)
+
+
 def format_prompt(problem: dict, tokenizer: AutoTokenizer) -> list[int]:
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": _LATENT_SYSTEM_PROMPT},
         {"role": "user",   "content": problem["prompt"]},
     ]
     text = tokenizer.apply_chat_template(
@@ -161,6 +170,36 @@ def _fwd(
 
 
 from contextlib import contextmanager as _contextmanager
+
+
+def _apply_lora(model: AutoModelForCausalLM, lora_cfg: dict) -> AutoModelForCausalLM:
+    """Wrap model with LoRA adapters for Phase 0 backbone training.
+
+    LoRA targets all attention + MLP projection layers so the backbone learns
+    to use z_prefix embeddings at lr=1e-4 without touching the pretrained base
+    weights — no catastrophic forgetting risk, 100× more gradient signal than
+    full fine-tuning at lr=1e-6.
+    """
+    config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=int(lora_cfg.get("r", 16)),
+        lora_alpha=int(lora_cfg.get("lora_alpha", 32)),
+        lora_dropout=float(lora_cfg.get("lora_dropout", 0.0)),
+        target_modules=lora_cfg.get(
+            "target_modules",
+            ["q_proj", "k_proj", "v_proj", "o_proj",
+             "gate_proj", "up_proj", "down_proj"],
+        ),
+        bias="none",
+    )
+    model = get_peft_model(model, config)
+    trainable, total = model.get_nb_trainable_parameters()
+    logger.info(
+        "  LoRA applied: trainable=%.2fM / total=%.2fM (%.1f%%)",
+        trainable / 1e6, total / 1e6, 100 * trainable / total,
+    )
+    return model
+
 
 def _clean_state_dict(sd: dict) -> dict:
     """Strip ._orig_mod. prefixes that torch.compile injects into state_dict keys."""
@@ -609,12 +648,18 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
         torch_dtype=dtype, device_map="auto",
         attn_implementation=attn_impl,
     )
-    student.train()
     logger.info("  student backbone loaded")
+
+    # Apply LoRA so backbone adapts at lr=1e-4 without touching pretrained
+    # base weights — eliminates catastrophic forgetting while giving the model
+    # enough gradient signal to learn "generate math after z_prefix".
+    lora_cfg = phase0_cfg.get("lora", {})
+    student = _apply_lora(student, lora_cfg)
+    student.train()
 
     if training_cfg.get("gradient_checkpointing", False):
         student.config.use_cache = False
-        student.gradient_checkpointing_enable(
+        student.base_model.model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
         logger.info("  gradient checkpointing enabled")
@@ -627,8 +672,11 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
         _setup_compile(student, encoder)
 
     _fused = {"fused": True} if torch.cuda.is_available() else {}
+    # Only LoRA adapter parameters train — base backbone weights are frozen.
+    # lr_lora defaults to lr_encoder so both adapt at the same rate.
+    lr_lora = float(phase0_cfg.get("lr_lora", lr_encoder))
     optimizer = torch.optim.AdamW([
-        {"params": student.parameters(), "lr": lr_backbone},
+        {"params": [p for p in student.parameters() if p.requires_grad], "lr": lr_lora},
         {"params": encoder.parameters(), "lr": lr_encoder},
     ], **_fused)
 
@@ -1022,15 +1070,29 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
     logger.info("Phase 1 — device: %s  G=%d  adv_clip=%.1f  grad_clip=%.2f",
                 device, G, adv_clip, grad_clip)
 
-    # ── Backbone: load from Phase 0 checkpoint directory ──────────────────────
+    # ── Backbone: load from Phase 0 checkpoint, merging LoRA if present ──────
     backbone_dir = phase0_dir / "backbone"
     if backbone_dir.is_dir():
-        logger.info("Loading backbone from Phase 0 checkpoint: %s", backbone_dir)
-        model = AutoModelForCausalLM.from_pretrained(
-            str(backbone_dir),
-            torch_dtype=dtype, device_map="auto",
-            attn_implementation=attn_impl,
-        )
+        adapter_cfg = backbone_dir / "adapter_config.json"
+        if adapter_cfg.is_file():
+            # Phase 0 saved a LoRA adapter — load base model then merge so
+            # Phase 1 trains the full merged backbone at lr_backbone.
+            logger.info("Phase 0 LoRA adapter found — loading base + merging: %s", backbone_dir)
+            base = AutoModelForCausalLM.from_pretrained(
+                model_id, revision=revision,
+                torch_dtype=dtype, device_map="auto",
+                attn_implementation=attn_impl,
+            )
+            model = PeftModel.from_pretrained(base, str(backbone_dir))
+            model = model.merge_and_unload()
+            logger.info("  LoRA merged into backbone")
+        else:
+            logger.info("Loading backbone from Phase 0 checkpoint: %s", backbone_dir)
+            model = AutoModelForCausalLM.from_pretrained(
+                str(backbone_dir),
+                torch_dtype=dtype, device_map="auto",
+                attn_implementation=attn_impl,
+            )
     else:
         logger.info("Phase 0 backbone dir not found; loading from HF: %s", model_id)
         model = AutoModelForCausalLM.from_pretrained(
@@ -1196,16 +1258,31 @@ def _save_phase0_checkpoint(
     log_history: list[dict],
     tokenizer: AutoTokenizer | None = None,
 ) -> None:
-    """Save Phase 0 backbone + encoder weights and trainer state."""
+    """Save Phase 0 backbone (LoRA adapter) + encoder weights and trainer state."""
     directory.mkdir(parents=True, exist_ok=True)
     torch.save(
         {"encoder": _clean_state_dict(encoder.state_dict()), "step": step},
         directory / "phase0_encoder.pt",
     )
-    with _unwrapped_for_save(model) as m:
-        m.save_pretrained(str(directory / "backbone"))
+    # If the backbone is a PeftModel (LoRA), save only the adapter weights.
+    # Downstream Phase 1 loads the base model + merges adapter before GRPO.
+    #
+    # torch.compile nuance for PeftModel: _setup_compile replaces the inner
+    # base CausalLM's .model and .lm_head (i.e. model.model.{model,lm_head})
+    # with compiled wrappers.  PEFT's state_dict walk traverses model.model.*
+    # and would see _orig_mod.-prefixed keys for those parameters, causing the
+    # saved adapter to be empty or mis-keyed.  We temporarily unwrap those
+    # compiled layers (via _unwrapped_for_save on the inner CausalLM) before
+    # calling save_pretrained so PEFT sees clean parameter names.
+    backbone_dir = str(directory / "backbone")
+    if isinstance(model, PeftModel):
+        with _unwrapped_for_save(model.model):   # unwrap model.model.{model,lm_head}
+            model.save_pretrained(backbone_dir)  # adapter_config.json + adapter weights
+    else:
+        with _unwrapped_for_save(model) as m:
+            m.save_pretrained(backbone_dir)
     if tokenizer is not None:
-        tokenizer.save_pretrained(str(directory / "backbone"))
+        tokenizer.save_pretrained(backbone_dir)
     (directory / "trainer_state.json").write_text(
         json.dumps({"global_step": step, "log_history": log_history}, indent=2)
     )
