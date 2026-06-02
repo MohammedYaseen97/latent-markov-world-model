@@ -762,7 +762,6 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
         # problems to measure whether z-conditioning is working.  This gives
         # early warning of z-ignored failure long before the full sanity check.
         if probe_steps > 0 and (global_step + 1) % probe_steps == 0 and probe_held_out:
-            import random as _random
             probe_sample = _random.sample(
                 probe_held_out, min(probe_problems, len(probe_held_out))
             )
