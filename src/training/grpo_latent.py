@@ -433,11 +433,21 @@ def _distill_loss(
     problems: list[dict],
     teacher_chunks: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     device: torch.device,
+    z_anchor_tokens: int | None = None,
 ) -> torch.Tensor:
     """Compute CE distillation loss for chunks 2 and 3 (teacher-forced).
 
     Student context is strictly Markov: chunk h uses [z_{h-1}_prefix | teacher_chunk_h].
     No raw prior chunk tokens are visible to the student.
+
+    z_anchor_tokens (optional):
+        If set, only compute CE on the first z_anchor_tokens positions of each
+        chunk.  At early positions z_prefix is the primary context; the gradient
+        flows almost entirely through z-conditioning.  Without this restriction
+        the loss is averaged over all 341 positions, diluting the z-conditioning
+        gradient ~341× by the dominant "continue teacher text" signal at later
+        positions — causing the backbone to learn LM-from-teacher-context but
+        not LM-from-z.  Recommended: 32–64 (roughly 10–20% of a 341-token chunk).
 
     Gradient flows:
         loss_2 → backbone (chunk 2 logits) → prefix_1 → injector → z_1 → encoder → backbone (chunk 1 hidden)
@@ -498,6 +508,9 @@ def _distill_loss(
     tgt2 = torch.full((B, max_c2), -100, dtype=torch.long, device=device)
     for i in range(B):
         tgt2[i, :c2_lens[i]] = c2_ids_list[i].to(device)
+    # z-anchor: only supervise positions where z is the primary context.
+    if z_anchor_tokens is not None:
+        tgt2[:, z_anchor_tokens:] = -100
 
     loss_2 = F.cross_entropy(
         logits2[:, :max_c2, :].reshape(B * max_c2, vocab_size),
@@ -525,6 +538,8 @@ def _distill_loss(
     tgt3 = torch.full((B, max_c3), -100, dtype=torch.long, device=device)
     for i in range(B):
         tgt3[i, :c3_lens[i]] = c3_ids_list[i].to(device)
+    if z_anchor_tokens is not None:
+        tgt3[:, z_anchor_tokens:] = -100
 
     loss_3 = F.cross_entropy(
         logits3[:, :max_c3, :].reshape(B * max_c3, vocab_size),
@@ -579,6 +594,17 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
     save_steps   = int(phase0_cfg.get("save_steps",       50))
     pool_path    = Path(phase0_cfg.get("pool_path",        "data/math_easy_pool.jsonl"))
     seed         = int(training_cfg.get("seed", 42))
+    # CE anchor: only supervise the first z_anchor_tokens positions of each
+    # chunk to force z-conditioning gradient.  None = supervise all tokens.
+    _z_anchor_raw = phase0_cfg.get("z_anchor_tokens", None)
+    z_anchor_tokens: int | None = int(_z_anchor_raw) if _z_anchor_raw is not None else None
+
+    # Generation probe: every probe_steps steps, run the student in strict
+    # Markov mode on probe_problems × probe_rollouts to log reward rate.
+    # Off by default (probe_steps=0).
+    probe_steps     = int(phase0_cfg.get("generation_probe_steps",    0))
+    probe_problems  = int(phase0_cfg.get("generation_probe_problems", 10))
+    probe_rollouts  = int(phase0_cfg.get("generation_probe_rollouts",  2))
 
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -686,6 +712,18 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
 
     step_bar = tqdm(total=n_steps, desc="phase0_distill", unit="step", dynamic_ncols=True)
 
+    # Pool slice used for generation probes (different from training problems
+    # to avoid measuring memorisation).
+    probe_pool = problems[-max(probe_problems, 1):] if probe_steps > 0 else []
+
+    if z_anchor_tokens is not None:
+        logger.info(
+            "  z_anchor_tokens=%d — CE supervised on first %d positions per chunk "
+            "(%.0f%% of %d-token chunk)",
+            z_anchor_tokens, z_anchor_tokens,
+            100.0 * z_anchor_tokens / chunk_tokens, chunk_tokens,
+        )
+
     for global_step, (step_problems, teacher_chunks) in enumerate(batches):
         student.train(); encoder.train()
         optimizer.zero_grad()
@@ -693,6 +731,7 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
         loss = _distill_loss(
             student, encoder, tokenizer,
             step_problems, teacher_chunks, device,
+            z_anchor_tokens=z_anchor_tokens,
         )
         loss.backward()
 
@@ -707,13 +746,41 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
 
         if (global_step + 1) % log_steps == 0:
             n = log_steps
-            entry = {
+            entry: dict = {
                 "step": global_step + 1,
                 "loss": pending.get("loss", 0.0) / n,
             }
             log_history.append(entry)
             pending = {}
             logger.info("step %d | distill_loss=%.4f", entry["step"], entry["loss"])
+
+        # ── Generation probe ──────────────────────────────────────────────────
+        # Periodically run the student in strict Markov mode on held-out
+        # problems to measure whether z-conditioning is working.  This gives
+        # early warning of z-ignored failure long before the full sanity check.
+        if probe_steps > 0 and (global_step + 1) % probe_steps == 0 and probe_pool:
+            student.eval(); encoder.eval()
+            with torch.no_grad():
+                traces = generate_latent_traces(
+                    model=student, tokenizer=tokenizer, encoder=encoder,
+                    problems=probe_pool[:probe_problems],
+                    n_rollouts=probe_rollouts,
+                    chunk_tokens=chunk_tokens,
+                    temperature=1.0, top_p=1.0, device=device,
+                )
+            correct = sum(1 for t in traces if t["reward"] > 0)
+            probe_rate = correct / max(len(traces), 1)
+            entry_probe = {
+                "step":       global_step + 1,
+                "probe_rate": probe_rate,
+                "probe_n":    len(traces),
+            }
+            log_history.append(entry_probe)
+            logger.info(
+                "step %d | [PROBE] generation reward rate: %.4f  (%d/%d correct)",
+                global_step + 1, probe_rate, correct, len(traces),
+            )
+            student.train(); encoder.train()
 
         if (global_step + 1) % save_steps == 0:
             _save_phase0_checkpoint(

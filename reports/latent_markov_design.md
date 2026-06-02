@@ -133,7 +133,15 @@ prior chunk tokens. The context reset is complete. z is the only carrier of hist
   │  PHASE 0 LOSS                                                               │
   │                                                                             │
   │  L_phase0 = L_distill_2 + L_distill_3                                       │
-  │             (cross-entropy on teacher tokens for chunks 2 and 3)            │
+  │             (CE on teacher tokens, positions 0..z_anchor_tokens per chunk)  │
+  │                                                                             │
+  │  z_anchor_tokens = 32 (default). Only the first 32 positions of each chunk  │
+  │  are supervised. At position t within a chunk the model has:                │
+  │    t=1:  [z_prefix]                   ← z is everything                     │
+  │    t=32: [z_prefix | 31 teacher toks] ← z still primary                     │
+  │    t=341:[z_prefix | 340 teacher toks]← teacher tokens dominate, z ignored  │
+  │  Supervising only t=1..32 concentrates gradient on z-conditioning.          │
+  │  Without this, CE over all 341 positions dilutes z-gradient ~341×.          │
   │                                                                             │
   │  No L_trans. No L_out. No OutcomeHead. No transition network.               │
   └─────────────────────────────────────────────────────────────────────────────┘
@@ -141,8 +149,8 @@ prior chunk tokens. The context reset is complete. z is the only carrier of hist
   ┌─────────────────────────────────────────────────────────────────────────────┐
   │  GRADIENT ROUTES (Phase 0)                                                  │
   │                                                                             │
-  │  L_distill → backbone (low lr) ✓   ZInjector ✓   encoder ✓                 │
-  │              (dense token-level signal every step; no reward needed)        │
+  │  L_distill → LoRA adapters ✓   ZInjector ✓   encoder ✓                     │
+  │              (targeted z-conditioning signal; no reward needed)              │
   └─────────────────────────────────────────────────────────────────────────────┘
 
 ══════════════════════════════════════════════════════════════════════════════════
@@ -407,9 +415,34 @@ saved (they're unchanged and can be reloaded from HF). Phase 1 training loads
 into the base weights, and proceeds with the merged model. After merge, Phase 1 has a
 normal Qwen backbone with no PEFT overhead.
 
-**Dense signal:** every training step has signal on every chunk-2 and chunk-3 token
-for every problem in the batch. No sparsity. Contrast with old L_trans + L_out on L1–L4
-(which had ~24% reward rate and zero gradient on the other 76% of rollouts via L_out).
+**z-anchor CE loss (`z_anchor_tokens=32`):**
+CE is computed only on the first 32 positions of each chunk. This is the critical
+implementation detail that makes Phase 0 work:
+
+At position t within chunk 2, the model's context is `[z_prefix | teacher_tok_1..t-1]`.
+At t=1 only z is visible. At t=341 there are 340 teacher tokens — far more informative
+than z — competing for attention. If CE is averaged over all 341 positions, the gradient
+from t>32 dominates and the backbone learns "continue teacher text from teacher context"
+while ignoring z entirely. The first-run failure confirmed this: CE converged to 1.48
+nats but student generation rate was 1.25% (2.6% of teacher's 48.75%). The LoRA adapters
+had learned LM-from-teacher but not LM-from-z.
+
+By restricting supervision to t=1..32, the gradient is concentrated where z is the
+primary signal. The backbone must learn to read z to minimize this targeted loss.
+
+Rule of thumb for K: large enough that the model must predict a meaningful mathematical
+phrase (≥8 tokens makes z carry "direction of solution"), small enough that teacher
+tokens don't dominate (≤64 tokens; at t=64, z is 1 of 64 tokens in context). K=32
+is a good middle ground.
+
+**Generation probe (optional):** every `generation_probe_steps` steps the student is
+run in strict Markov mode on held-out problems and the reward rate is logged. This gives
+early warning if z-conditioning is not being learned, long before the 400-step run
+completes and the sanity check fails.
+
+**Dense signal within anchor:** even with K=32, each step supervises 32 positions ×
+2 chunks × 64 problems = 4096 training tokens per step. Contrast with old L_trans +
+L_out on L1–L4 (which had ~24% reward rate and zero gradient on the other 76% via L_out).
 
 **Why teacher forcing transfers to Phase 1 strict Markov generation:**
 
@@ -572,7 +605,9 @@ the controlled latent baseline eval, and the Phase 1 pass@128 result.
 | Phase 0 backbone lr (base)       | 1e-6 (unused — base frozen)                | base weights unchanged; LoRA adapters use lr_lora            |
 | Phase 0 lr_lora                  | 1e-4                                       | matches encoder/ZInjector; all three adapting from scratch   |
 | Phase 0 encoder/ZInjector lr     | 1e-4                                       | learning from scratch                                        |
-| Phase 0 loss                     | CE(student_log_probs, teacher_chunk_{2,3}) | dense; no reward needed                                      |
+| Phase 0 loss                     | CE on first z_anchor_tokens positions only | z-anchor concentrates gradient where z is primary context    |
+| Phase 0 z_anchor_tokens          | 32                                         | positions 0..31 of each chunk; at t=32 z is 1 of 32 tokens  |
+| Phase 0 generation probe         | every 100 steps, 10 problems × 2 rollouts  | mid-training reward rate; early warning of z-ignored failure |
 | Phase 0 generation               | teacher tokens as input (teacher forcing)  | no garbage later-chunk generation; no crutch                 |
 | Phase 0 crutch                   | NONE                                       | strict Markov in student: [z_prefix ‖ teacher_chunk_h]       |
 | Phase 0 checkpoint format        | LoRA adapter + encoder                     | `backbone/adapter_config.json` + adapter weights + tokenizer; `phase0_encoder.pt` |

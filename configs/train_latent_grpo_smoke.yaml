@@ -39,6 +39,9 @@ phase0:
   logging_steps: 1
   save_steps: 10
 
+  z_anchor_tokens: 32
+  generation_probe_steps: 0   # disabled for smoke
+
 phase0_sanity:
   n_val_problems: 2
   ce_loss_threshold: 20.0    # very loose for smoke — just checking it runs

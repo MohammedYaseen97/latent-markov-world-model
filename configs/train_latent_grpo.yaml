@@ -93,6 +93,24 @@ phase0:
       - down_proj
   lr_lora: 1.0e-4   # same as lr_encoder — both adapting from scratch
 
+  # z-anchor CE loss: only supervise the first z_anchor_tokens positions of each
+  # chunk.  At early positions z_prefix is the primary context; the gradient flows
+  # directly through z-conditioning.  Without this, CE is averaged over all 341
+  # positions — teacher tokens dominate at later positions, diluting the z-
+  # conditioning gradient ~341× and causing the backbone to learn "continue teacher
+  # text" but not "generate from z alone".
+  # Rule of thumb: 32 tokens ≈ 10% of the chunk, enough context that z must predict
+  # meaningful mathematical starts; too small risks under-specifying the direction.
+  z_anchor_tokens: 32
+
+  # Generation probe: every generation_probe_steps steps, run the student in strict
+  # Markov mode on held-out problems to measure z-conditioning quality mid-training.
+  # Gives early warning if z is being ignored, long before the full sanity check.
+  # Set to 0 to disable.
+  generation_probe_steps: 100
+  generation_probe_problems: 10    # held-out problems per probe
+  generation_probe_rollouts: 2     # rollouts per problem (10 × 2 = 20 total)
+
 # ---------------------------------------------------------------------------
 # Phase 1 — on-policy GRPO on Level 5 hard pool
 # ---------------------------------------------------------------------------
