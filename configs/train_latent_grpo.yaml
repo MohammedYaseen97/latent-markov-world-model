@@ -63,7 +63,7 @@ latent_markov:
 phase0:
   pool_path: "data/math_easy_pool.jsonl"       # L1–L4 only
 
-  n_steps: 400
+  n_steps: 800
   batch_size: 64             # problems per step; each generates 3 teacher chunks
 
   # Learning rates (two param groups)
@@ -91,7 +91,7 @@ phase0:
       - gate_proj
       - up_proj
       - down_proj
-  lr_lora: 1.0e-4   # same as lr_encoder — both adapting from scratch
+  lr_lora: 3.0e-4   # 3× lr_encoder — compensates for z_anchor reducing gradient positions 34×
 
   # z-anchor CE loss: only supervise the first z_anchor_tokens positions of each
   # chunk.  At early positions z_prefix is the primary context; the gradient flows

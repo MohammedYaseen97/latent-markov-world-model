@@ -1,6 +1,14 @@
-# Latent Markov Arm: Design Document (v3)
+# Latent Markov Arm: Design Document (v5)
 
 ---
+
+## Changelog (v4 → v5)
+
+| Change | Rationale |
+|---|---|
+| `n_steps` 400 → 800 | 400 steps with `z_anchor_tokens=32` is under-trained. CE loss was still declining at step 400 (3.20 → 3.07 over the last 100 steps; target < 2.5 nats). z_anchor concentrates gradient on only 32/341 ≈ 9% of positions per step, so the effective training "mass" (steps × supervised positions) was ~9% of a full-CE run at the same step count. More steps are needed until generation quality emerges. |
+| `lr_lora` 1e-4 → 3e-4 | The same 9% position density means LoRA adapters see proportionally less gradient per step than the encoder/injector. Raising lr_lora 3× partially compensates, bringing the effective learning rate on z-conditioning signal closer to what lr=1e-4 achieved under full-CE supervision. |
+| Probe pool: fixed last-10 → random resample per step | `probe_pool = problems[-10:]` was a fixed slice evaluated at the same 10 problems at every probe. If those problems are systematically harder (common when the pool is ordered by difficulty), probe_rate is always biased low and cannot be used to detect gradual improvement. New behaviour: at each probe step, `probe_problems` problems are sampled randomly from a held-out 20%-tail of the pool, so each probe is an independent unbiased estimate. |
 
 ## Changelog (v2 → v3)
 
@@ -603,11 +611,12 @@ the controlled latent baseline eval, and the Phase 1 pass@128 result.
 | Phase 0 backbone                 | LoRA-wrapped (r=16, alpha=32, dropout=0.0) | base weights frozen; only LoRA adapters updated              |
 | Phase 0 LoRA target modules      | q/k/v/o_proj, gate/up/down_proj            | all attention + MLP projections; full residual path covered  |
 | Phase 0 backbone lr (base)       | 1e-6 (unused — base frozen)                | base weights unchanged; LoRA adapters use lr_lora            |
-| Phase 0 lr_lora                  | 1e-4                                       | matches encoder/ZInjector; all three adapting from scratch   |
+| Phase 0 lr_lora                  | 3e-4                                       | 3× lr_encoder — compensates for z_anchor reducing supervised positions 34× |
 | Phase 0 encoder/ZInjector lr     | 1e-4                                       | learning from scratch                                        |
+| Phase 0 n_steps                  | 800                                        | 400 was under-trained; loss still declining at step 400 (3.07 nats, target < 2.5) |
 | Phase 0 loss                     | CE on first z_anchor_tokens positions only | z-anchor concentrates gradient where z is primary context    |
 | Phase 0 z_anchor_tokens          | 32                                         | positions 0..31 of each chunk; at t=32 z is 1 of 32 tokens  |
-| Phase 0 generation probe         | every 100 steps, 10 problems × 2 rollouts  | mid-training reward rate; early warning of z-ignored failure |
+| Phase 0 generation probe         | every 100 steps, 10 problems × 2 rollouts (random resample) | mid-training reward rate; early warning of z-ignored failure |
 | Phase 0 generation               | teacher tokens as input (teacher forcing)  | no garbage later-chunk generation; no crutch                 |
 | Phase 0 crutch                   | NONE                                       | strict Markov in student: [z_prefix ‖ teacher_chunk_h]       |
 | Phase 0 checkpoint format        | LoRA adapter + encoder                     | `backbone/adapter_config.json` + adapter weights + tokenizer; `phase0_encoder.pt` |

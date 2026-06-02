@@ -712,9 +712,12 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
 
     step_bar = tqdm(total=n_steps, desc="phase0_distill", unit="step", dynamic_ncols=True)
 
-    # Pool slice used for generation probes (different from training problems
-    # to avoid measuring memorisation).
-    probe_pool = problems[-max(probe_problems, 1):] if probe_steps > 0 else []
+    # Held-out slice for generation probes: last 20 % of the pool (never
+    # the same problems across probes — resample fresh at each probe step).
+    # Using a fixed slice like problems[-10:] risks always hitting the same
+    # hard L4 problems, which biases probe_rate low and masks real progress.
+    _held_out_size = max(probe_problems * 3, int(len(problems) * 0.2), 1)
+    probe_held_out = problems[len(problems) - _held_out_size:] if probe_steps > 0 else []
 
     if z_anchor_tokens is not None:
         logger.info(
@@ -758,12 +761,16 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
         # Periodically run the student in strict Markov mode on held-out
         # problems to measure whether z-conditioning is working.  This gives
         # early warning of z-ignored failure long before the full sanity check.
-        if probe_steps > 0 and (global_step + 1) % probe_steps == 0 and probe_pool:
+        if probe_steps > 0 and (global_step + 1) % probe_steps == 0 and probe_held_out:
+            import random as _random
+            probe_sample = _random.sample(
+                probe_held_out, min(probe_problems, len(probe_held_out))
+            )
             student.eval(); encoder.eval()
             with torch.no_grad():
                 traces = generate_latent_traces(
                     model=student, tokenizer=tokenizer, encoder=encoder,
-                    problems=probe_pool[:probe_problems],
+                    problems=probe_sample,
                     n_rollouts=probe_rollouts,
                     chunk_tokens=chunk_tokens,
                     temperature=1.0, top_p=1.0, device=device,
