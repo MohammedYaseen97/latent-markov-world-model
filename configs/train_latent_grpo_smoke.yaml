@@ -27,6 +27,9 @@ latent_markov:
 phase0:
   pool_path: "data/math_easy_pool.jsonl"
 
+  step_tokens: 341
+  max_chunks: 10
+
   n_steps: 2
   batch_size: 2
 
@@ -38,6 +41,14 @@ phase0:
 
   logging_steps: 1
   save_steps: 10
+
+  lora:
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.0
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  lr_lora: 3.0e-4
+  lr_warmdown_steps: 0
 
   z_anchor_tokens: 32
   generation_probe_steps: 0   # disabled for smoke

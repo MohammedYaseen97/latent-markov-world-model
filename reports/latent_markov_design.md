@@ -10,6 +10,13 @@
 | `lr_lora` 1e-4 → 3e-4 | The same 9% position density means LoRA adapters see proportionally less gradient per step than the encoder/injector. Raising lr_lora 3× partially compensates, bringing the effective learning rate on z-conditioning signal closer to what lr=1e-4 achieved under full-CE supervision. |
 | Probe pool: fixed last-10 → random resample per step | `probe_pool = problems[-10:]` was a fixed slice evaluated at the same 10 problems at every probe. If those problems are systematically harder (common when the pool is ordered by difficulty), probe_rate is always biased low and cannot be used to detect gradual improvement. New behaviour: at each probe step, `probe_problems` problems are sampled randomly from a held-out 20%-tail of the pool, so each probe is an independent unbiased estimate. |
 
+## Changelog (v5 → v6)
+
+| Change | Rationale |
+|---|---|
+| Cosine LR warmdown added (`lr_warmdown_steps=200`, `lr_warmdown_final=0.1`) | 800-step run at constant lr=3e-4 showed probe rate peaking at 5% (steps 100-200) then regressing to 0% for steps 300-800, while CE loss plateaued at ~3.0 nats. The improvement-then-degradation pattern is over-adaptation: the LoRA adapters over-specialised on z_anchor positions 0-31, causing their modified attention weights to over-attend to `z_prefix` at positions 300-341 where the backbone should instead be attending to recent math context and producing `\boxed{answer}`. Cosine decay from lr=3e-4 to lr=3e-5 over the last 200 steps preserves the fast early z-conditioning learning while preventing the late-stage adapter drift that destroys answer-format generation. |
+| Best checkpoint strategy: sanity-check `checkpoint-200` | Since the probe peaked at step 200 in the 800-step run, `checkpoint-200` is the best artifact from that run. The full sanity check (80 rollouts) will give a cleaner estimate of the true student rate than the 20-rollout probes. |
+
 ## Changelog (v2 → v3)
 
 | Change | Rationale |

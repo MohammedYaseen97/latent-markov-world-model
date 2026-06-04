@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random as _random
+import re
 from pathlib import Path
 from typing import Any
 
@@ -98,11 +100,65 @@ def compute_grpo_advantages(
 
 
 _LATENT_SYSTEM_PROMPT = (
-    "Please reason step by step, completing each reasoning step fully before "
-    "moving to the next. Within any token limit, finish the current step before "
-    "stopping — never break mid-sentence or mid-calculation. "
-    "Put your final answer inside \\boxed{answer}."
+    "You are given a math problem, and possibly some steps already taken towards solving that problem."
+    "I want you to take just one more step towards solving the problem. Then stop. "
+    "If your step solves the problem, write \\boxed{answer} and stop."
 )
+
+# ── \boxed{} detection ─────────────────────────────────────────────────────────
+
+_BOXED_START_RE = re.compile(r'\\boxed\{')
+
+
+def _find_boxed(text: str) -> int | None:
+    """Return char index after the first complete \\boxed{...}, or None.
+
+    Handles nested braces by counting depth.
+    """
+    m = _BOXED_START_RE.search(text)
+    if m is None:
+        return None
+    depth = 0
+    i = m.start() + len('\\boxed{')
+    while i < len(text):
+        ch = text[i]
+        if ch == '\\':
+            i += 1
+        elif ch == '{':
+            depth += 1
+        elif ch == '}':
+            if depth == 0:
+                return i + 1
+            depth -= 1
+        i += 1
+    return None
+
+
+def _has_boxed(token_ids: torch.Tensor, tokenizer: AutoTokenizer) -> bool:
+    """Return True if the decoded tokens contain a complete ``\\boxed{...}``."""
+    if token_ids.numel() == 0:
+        return False
+    return _find_boxed(
+        tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)
+    ) is not None
+
+
+def _truncate_at_boxed(
+    token_ids: torch.Tensor, tokenizer: AutoTokenizer
+) -> torch.Tensor:
+    """Truncate token IDs at the first ``\\boxed{...}`` boundary, or keep as-is."""
+    if token_ids.numel() == 0:
+        return token_ids
+    text = tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)
+    end = _find_boxed(text)
+    if end is None:
+        return token_ids
+    truncated = text[:end].rstrip()
+    if not truncated:
+        return torch.tensor([], dtype=torch.long)
+    return torch.tensor(
+        tokenizer.encode(truncated, add_special_tokens=False), dtype=torch.long
+    )
 
 
 def format_prompt(problem: dict, tokenizer: AutoTokenizer) -> list[int]:
@@ -159,10 +215,10 @@ def _fwd(
     """
     transformer, lm_head = _get_transformer_and_head(model)
     out         = transformer(
-        input_ids=input_ids,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-    )
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
     last_hidden = out.last_hidden_state
     if bypass_lm_head:
         return None, last_hidden
@@ -329,101 +385,77 @@ def _generate_teacher_chunks(
     teacher: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     problems: list[dict],
-    chunk_tokens: int,
+    step_tokens: int,
+    max_chunks: int,
     temperature: float,
     top_p: float,
     device: torch.device,
-) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Teacher generates 3 chunks per problem with full context.
+) -> list[list[torch.Tensor]]:
+    """Teacher generates reasoning step-by-step until ``\\boxed{}`` appears.
 
-    The teacher is the original frozen Qwen with access to all prior tokens:
-        chunk1: generate([sys_prompt | problem])
-        chunk2: generate([sys_prompt | problem | chunk1])
-        chunk3: generate([sys_prompt | problem | chunk1 | chunk2])
+    Each generation call asks the model for exactly ONE reasoning step.
+    The model is prompted with the system instruction + problem + all prior
+    steps, and generates ``step_tokens`` tokens (or fewer if EOS is hit).
+    The output is **not** truncated — model EOS is the boundary.
 
-    Args:
-        teacher:  original frozen backbone in eval mode.
-        problems: list of B problem dicts.
+    Loop ends when:
+        - ``\\boxed{answer}`` appears in the latest step, or
+        - ``max_chunks`` steps have been generated.
 
     Returns:
-        List of B tuples (chunk1_ids, chunk2_ids, chunk3_ids), all CPU tensors.
-        Lengths are ≤ chunk_tokens (shorter if EOS fired early).
+        List of B lists, each containing 1..max_chunks CPU tensors.
+        The last tensor in each list always contains ``\\boxed{...}``
+        (or is the max_chunks-th step).
     """
     pad_id = tokenizer.eos_token_id
     B      = len(problems)
 
-    # ── Chunk 1 ───────────────────────────────────────────────────────────────
+    # Per-problem buffers: accumulated prior-step token sequences
     prompt_ids_list = [format_prompt(p, tokenizer) for p in problems]
-    max_prompt      = max(len(p) for p in prompt_ids_list)
+    accumulated: list[list[int]] = [[] for _ in range(B)]  # prior step tokens
+    all_chunks:   list[list[torch.Tensor]] = [[] for _ in range(B)]
 
-    input_ids = torch.full((B, max_prompt), pad_id, dtype=torch.long, device=device)
-    attn_mask = torch.zeros(B, max_prompt, dtype=torch.long, device=device)
-    for i, pids in enumerate(prompt_ids_list):
-        off = max_prompt - len(pids)      # left-pad
-        input_ids[i, off:] = torch.tensor(pids, dtype=torch.long, device=device)
-        attn_mask[i, off:] = 1
+    for step_idx in range(max_chunks):
+        # ── Build batched inputs: each is [prompt | accumulated_prior_steps] ─
+        total_lens = [
+            len(prompt_ids_list[i]) + len(accumulated[i])
+            for i in range(B)
+        ]
+        max_total = max(total_lens)
 
-    gen1 = teacher.generate(
-        input_ids, attention_mask=attn_mask,
-        max_new_tokens=chunk_tokens, do_sample=(temperature > 0),
-        temperature=temperature if temperature > 0 else 1.0,
-        top_p=top_p, pad_token_id=pad_id,
-    )
-    chunk1_ids = [gen1[i, max_prompt:].cpu() for i in range(B)]
-    del gen1, input_ids, attn_mask
+        input_ids = torch.full((B, max_total), pad_id, dtype=torch.long, device=device)
+        attn_mask = torch.zeros(B, max_total, dtype=torch.long, device=device)
+        for i in range(B):
+            off = max_total - total_lens[i]
+            seq = prompt_ids_list[i] + accumulated[i]
+            input_ids[i, off:] = torch.tensor(seq, dtype=torch.long, device=device)
+            attn_mask[i, off:] = 1
 
-    # ── Chunk 2: full context [prompt | chunk1] ───────────────────────────────
-    prompt_lens = [len(p) for p in prompt_ids_list]
-    c1_lens     = [c.shape[0] for c in chunk1_ids]
-    full2_lens  = [prompt_lens[i] + c1_lens[i] for i in range(B)]
-    max_full2   = max(full2_lens)
+        # ── Generate ONE step ────────────────────────────────────────────────
+        gen = teacher.generate(
+            input_ids, attention_mask=attn_mask,
+            max_new_tokens=step_tokens, do_sample=(temperature > 0),
+            temperature=temperature if temperature > 0 else 1.0,
+            top_p=top_p, pad_token_id=pad_id,
+        )
+        del input_ids, attn_mask
 
-    ctx2      = torch.full((B, max_full2), pad_id, dtype=torch.long, device=device)
-    ctx2_mask = torch.zeros(B, max_full2, dtype=torch.long, device=device)
-    for i in range(B):
-        off = max_full2 - full2_lens[i]   # left-pad
-        p   = torch.tensor(prompt_ids_list[i], dtype=torch.long, device=device)
-        c1  = chunk1_ids[i].to(device)
-        ctx2[i, off:off + prompt_lens[i]] = p
-        ctx2[i, off + prompt_lens[i]:off + full2_lens[i]] = c1
-        ctx2_mask[i, off:off + full2_lens[i]] = 1
+        for i in range(B):
+            new_ids = gen[i, max_total:].cpu()
+            all_chunks[i].append(new_ids)
+            # Append to accumulated context for the next step
+            accumulated[i].extend(new_ids.tolist())
 
-    gen2 = teacher.generate(
-        ctx2, attention_mask=ctx2_mask,
-        max_new_tokens=chunk_tokens, do_sample=(temperature > 0),
-        temperature=temperature if temperature > 0 else 1.0,
-        top_p=top_p, pad_token_id=pad_id,
-    )
-    chunk2_ids = [gen2[i, max_full2:].cpu() for i in range(B)]
-    del gen2, ctx2, ctx2_mask
+        del gen
 
-    # ── Chunk 3: full context [prompt | chunk1 | chunk2] ─────────────────────
-    c2_lens    = [c.shape[0] for c in chunk2_ids]
-    full3_lens = [full2_lens[i] + c2_lens[i] for i in range(B)]
-    max_full3  = max(full3_lens)
+        # ── Check who has ``\\boxed{}`` in the latest step ───────────────────
+        done_mask = [
+            _has_boxed(all_chunks[i][-1], tokenizer) for i in range(B)
+        ]
+        if all(done_mask):
+            break
 
-    ctx3      = torch.full((B, max_full3), pad_id, dtype=torch.long, device=device)
-    ctx3_mask = torch.zeros(B, max_full3, dtype=torch.long, device=device)
-    for i in range(B):
-        off  = max_full3 - full3_lens[i]   # left-pad
-        seqi = torch.cat([
-            torch.tensor(prompt_ids_list[i], dtype=torch.long, device=device),
-            chunk1_ids[i].to(device),
-            chunk2_ids[i].to(device),
-        ])
-        ctx3[i, off:off + full3_lens[i]] = seqi
-        ctx3_mask[i, off:off + full3_lens[i]] = 1
-
-    gen3 = teacher.generate(
-        ctx3, attention_mask=ctx3_mask,
-        max_new_tokens=chunk_tokens, do_sample=(temperature > 0),
-        temperature=temperature if temperature > 0 else 1.0,
-        top_p=top_p, pad_token_id=pad_id,
-    )
-    chunk3_ids = [gen3[i, max_full3:].cpu() for i in range(B)]
-    del gen3, ctx3, ctx3_mask
-
-    return list(zip(chunk1_ids, chunk2_ids, chunk3_ids))
+    return all_chunks
 
 
 def _distill_loss(
@@ -431,48 +463,54 @@ def _distill_loss(
     encoder: LatentStateEncoder,
     tokenizer: AutoTokenizer,
     problems: list[dict],
-    teacher_chunks: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    teacher_chunks: list[list[torch.Tensor]],
     device: torch.device,
     z_anchor_tokens: int | None = None,
 ) -> torch.Tensor:
-    """Compute CE distillation loss for chunks 2 and 3 (teacher-forced).
+    """Compute CE distillation loss for chunks 2..n (teacher-forced).
 
-    Student context is strictly Markov: chunk h uses [z_{h-1}_prefix | teacher_chunk_h].
+    Student context is strictly Markov: chunk k uses [z_{k-1}_prefix | teacher_chunk_k].
     No raw prior chunk tokens are visible to the student.
+
+    teacher_chunks[k][i] is the k-th chunk for the i-th problem.
+    Each problem may have a different number of chunks (1..max_chunks).
 
     z_anchor_tokens (optional):
         If set, only compute CE on the first z_anchor_tokens positions of each
-        chunk.  At early positions z_prefix is the primary context; the gradient
-        flows almost entirely through z-conditioning.  Without this restriction
-        the loss is averaged over all 341 positions, diluting the z-conditioning
-        gradient ~341× by the dominant "continue teacher text" signal at later
-        positions — causing the backbone to learn LM-from-teacher-context but
-        not LM-from-z.  Recommended: 32–64 (roughly 10–20% of a 341-token chunk).
-
-    Gradient flows:
-        loss_2 → backbone (chunk 2 logits) → prefix_1 → injector → z_1 → encoder → backbone (chunk 1 hidden)
-        loss_3 → backbone (chunk 3 logits) → prefix_2 → injector → z_2 → encoder → backbone (chunk 2 hidden)
+        chunk.
 
     Returns:
-        loss: scalar tensor (loss_2 + loss_3), differentiable.
+        loss: scalar tensor, sum of CE on chunks 2..n per problem.
     """
     B           = len(problems)
     dtype       = next(student.parameters()).dtype
     embed_layer = student.get_input_embeddings()
     vocab_size  = student.config.vocab_size
 
+    # Max number of chunks across the batch
+    n_chunks = max(len(ch) for ch in teacher_chunks)
+    if n_chunks < 2:
+        # Every sample has only 1 chunk — no z-transition to train.
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
     prompt_ids_list = [format_prompt(p, tokenizer) for p in problems]
     prompt_lens     = [len(p) for p in prompt_ids_list]
-    c1_ids_list     = [teacher_chunks[i][0] for i in range(B)]
-    c2_ids_list     = [teacher_chunks[i][1] for i in range(B)]
-    c3_ids_list     = [teacher_chunks[i][2] for i in range(B)]
-    c1_lens         = [c.shape[0] for c in c1_ids_list]
-    c2_lens         = [c.shape[0] for c in c2_ids_list]
-    c3_lens         = [c.shape[0] for c in c3_ids_list]
+
+    # ── Build batched chunk lists for all positions ──────────────────────────
+    # All chunks indexed 0..n_chunks-1 across the batch.
+    # Samples with fewer chunks get an empty tensor.
+    all_chunk_ids: list[list[torch.Tensor]] = [
+        [teacher_chunks[i][k] if k < len(teacher_chunks[i])
+         else torch.tensor([], dtype=torch.long)
+         for i in range(B)]
+        for k in range(n_chunks)
+    ]
 
     # ── Chunk 1: [prompt | teacher_chunk1] → repr_1 (no CE loss) ─────────────
-    full1_lens = [prompt_lens[i] + c1_lens[i] for i in range(B)]
-    max_full1  = max(full1_lens)
+    c1_ids_list = all_chunk_ids[0]
+    c1_lens     = [c.shape[0] for c in c1_ids_list]
+    full1_lens  = [prompt_lens[i] + c1_lens[i] for i in range(B)]
+    max_full1   = max(full1_lens)
 
     fi1 = torch.zeros(B, max_full1, dtype=torch.long, device=device)
     fa1 = torch.zeros(B, max_full1, dtype=torch.long, device=device)
@@ -485,70 +523,55 @@ def _distill_loss(
         fi1[i, :L] = seq
         fa1[i, :L] = 1
 
-    # bypass lm_head — no CE loss on chunk 1
     _, hidden1 = _fwd(student, input_ids=fi1, attention_mask=fa1, bypass_lm_head=True)
     del fi1, fa1
 
-    # last real token = last token of teacher_chunk1 (not prompt)
-    last1 = torch.tensor([full1_lens[i] - 1 for i in range(B)], device=device)
-    repr_1 = _last_token_repr(hidden1, last1)
+    last1  = torch.tensor([full1_lens[i] - 1 for i in range(B)], device=device)
+    repr_h = _last_token_repr(hidden1, last1)
     del hidden1
 
-    z_1      = encoder.encode(repr_1)
-    prefix_1 = encoder.inject(z_1)
+    z  = encoder.encode(repr_h)
+    pf = encoder.inject(z)
 
-    # ── Chunk 2: [prefix_1 | teacher_chunk2] → CE loss + repr_2 ──────────────
-    max_c2 = max(c2_lens)
-    ie2, am2, _ = _build_prefix_embeds(embed_layer, prefix_1, c2_ids_list, device, dtype)
+    # ── Chunks 2..n: iterate with prefix → CE loss → extract repr ────────────
+    total_loss = torch.tensor(0.0, device=device)
 
-    logits2, hidden2 = _fwd(student, inputs_embeds=ie2, attention_mask=am2)
-    del ie2, am2
+    for k in range(1, n_chunks):
+        ck_ids_list = all_chunk_ids[k]
+        ck_lens     = [c.shape[0] for c in ck_ids_list]
+        max_ck      = max(ck_lens)
 
-    # logits2[:, j, :] predicts teacher_chunk2_token[j]  (j = 0 .. max_c2-1)
-    tgt2 = torch.full((B, max_c2), -100, dtype=torch.long, device=device)
-    for i in range(B):
-        tgt2[i, :c2_lens[i]] = c2_ids_list[i].to(device)
-    # z-anchor: only supervise positions where z is the primary context.
-    if z_anchor_tokens is not None:
-        tgt2[:, z_anchor_tokens:] = -100
+        if max_ck == 0:
+            # No sample has content for this chunk index.
+            break
 
-    loss_2 = F.cross_entropy(
-        logits2[:, :max_c2, :].reshape(B * max_c2, vocab_size),
-        tgt2.reshape(B * max_c2),
-        ignore_index=-100,
-    )
-    del logits2
+        ie, am, _ = _build_prefix_embeds(embed_layer, pf, ck_ids_list, device, dtype)
+        logits, hidden = _fwd(student, inputs_embeds=ie, attention_mask=am)
+        del ie, am
 
-    # repr_2 = last real token of chunk2 in [prefix | chunk2] sequence
-    # prefix at position 0, chunk tokens at positions 1..c2_len
-    last2  = torch.tensor(c2_lens, device=device)       # position = c2_len (0-indexed)
-    repr_2 = _last_token_repr(hidden2, last2)
-    del hidden2
+        tgt = torch.full((B, max_ck), -100, dtype=torch.long, device=device)
+        for i in range(B):
+            tgt[i, :ck_lens[i]] = ck_ids_list[i].to(device)
+        if z_anchor_tokens is not None:
+            tgt[:, z_anchor_tokens:] = -100
 
-    z_2      = encoder.encode(repr_2)
-    prefix_2 = encoder.inject(z_2)
+        total_loss = total_loss + F.cross_entropy(
+            logits[:, :max_ck, :].reshape(B * max_ck, vocab_size),
+            tgt.reshape(B * max_ck),
+            ignore_index=-100,
+        )
+        del logits
 
-    # ── Chunk 3: [prefix_2 | teacher_chunk3] → CE loss ───────────────────────
-    max_c3 = max(c3_lens)
-    ie3, am3, _ = _build_prefix_embeds(embed_layer, prefix_2, c3_ids_list, device, dtype)
+        # Prepare prefix for next chunk from this chunk's last hidden state
+        last_idx = torch.tensor(ck_lens, device=device)
+        repr_h   = _last_token_repr(hidden, last_idx)
+        del hidden
 
-    logits3, _ = _fwd(student, inputs_embeds=ie3, attention_mask=am3)
-    del ie3, am3
+        if k < n_chunks - 1:
+            z  = encoder.encode(repr_h)
+            pf = encoder.inject(z)
 
-    tgt3 = torch.full((B, max_c3), -100, dtype=torch.long, device=device)
-    for i in range(B):
-        tgt3[i, :c3_lens[i]] = c3_ids_list[i].to(device)
-    if z_anchor_tokens is not None:
-        tgt3[:, z_anchor_tokens:] = -100
-
-    loss_3 = F.cross_entropy(
-        logits3[:, :max_c3, :].reshape(B * max_c3, vocab_size),
-        tgt3.reshape(B * max_c3),
-        ignore_index=-100,
-    )
-    del logits3
-
-    return loss_2 + loss_3
+    return total_loss
 
 
 def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
@@ -588,6 +611,8 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
     temperature  = float(phase0_cfg.get("temperature",    1.0))
     top_p        = float(phase0_cfg.get("top_p",          1.0))
     chunk_tokens = int(latent_cfg.get("chunk_tokens",     341))
+    step_tokens  = int(phase0_cfg.get("step_tokens",      341))
+    max_chunks   = int(phase0_cfg.get("max_chunks",        10))
     latent_dim   = int(latent_cfg.get("latent_dim",  LATENT_DIM))
     hidden_dim   = int(latent_cfg.get("hidden_dim",  HIDDEN_DIM))
     log_steps    = int(phase0_cfg.get("logging_steps",    10))
@@ -644,9 +669,10 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
     _setup_compile(teacher)
     logger.info("  teacher loaded, frozen and compiled")
     pool_order: list[int] = []
-    batches: list[tuple[list[dict], list]] = []
+    batches: list[tuple[list[dict], list[list[torch.Tensor]]]] = []
 
-    logger.info("Pre-generating teacher chunks for %d steps (batch=%d) …", n_steps, batch_size)
+    logger.info("Pre-generating teacher chunks for %d steps (batch=%d, step_tokens=%d, max_chunks=%d) …",
+                n_steps, batch_size, step_tokens, max_chunks)
     gen_bar = tqdm(total=n_steps, desc="teacher_gen", unit="step", dynamic_ncols=True)
     for _ in range(n_steps):
         while len(pool_order) < batch_size:
@@ -656,7 +682,7 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
         step_problems = [problems[pool_order.pop(0)] for _ in range(batch_size)]
         teacher_chunks = _generate_teacher_chunks(
             teacher, tokenizer, step_problems,
-            chunk_tokens=chunk_tokens,
+            step_tokens=step_tokens, max_chunks=max_chunks,
             temperature=temperature, top_p=top_p, device=device,
         )
         batches.append((step_problems, teacher_chunks))
@@ -701,9 +727,20 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
     # Only LoRA adapter parameters train — base backbone weights are frozen.
     # lr_lora defaults to lr_encoder so both adapt at the same rate.
     lr_lora = float(phase0_cfg.get("lr_lora", lr_encoder))
+
+    # LR warmdown: cosine decay from lr → lr * warmdown_final over the last
+    # warmdown_steps steps.  Prevents LoRA adapters from over-specialising on
+    # z_anchor positions at the expense of the backbone's natural generation
+    # ability (answer format, mathematical coherence at positions 32-341).
+    # Set warmdown_steps=0 to disable.
+    lr_warmdown_steps = int(phase0_cfg.get("lr_warmdown_steps", 0))
+    lr_warmdown_final = float(phase0_cfg.get("lr_warmdown_final", 0.1))
+
     optimizer = torch.optim.AdamW([
-        {"params": [p for p in student.parameters() if p.requires_grad], "lr": lr_lora},
-        {"params": encoder.parameters(), "lr": lr_encoder},
+        {"params": [p for p in student.parameters() if p.requires_grad],
+         "lr": lr_lora,   "_base_lr": lr_lora},
+        {"params": encoder.parameters(),
+         "lr": lr_encoder, "_base_lr": lr_encoder},
     ], **_fused)
 
     # ── Student training ───────────────────────────────────────────────────────
@@ -741,6 +778,18 @@ def pretrain_distill(config: dict[str, Any], run_dir: Path) -> None:
         all_params = list(student.parameters()) + list(encoder.parameters())
         torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
         optimizer.step()
+
+        # ── LR warmdown ───────────────────────────────────────────────────────
+        if lr_warmdown_steps > 0:
+            warmdown_start = n_steps - lr_warmdown_steps
+            if global_step >= warmdown_start:
+                t = (global_step - warmdown_start) / lr_warmdown_steps
+                lr_scale = (
+                    0.5 * (1.0 + math.cos(math.pi * t)) * (1.0 - lr_warmdown_final)
+                    + lr_warmdown_final
+                )
+                for pg in optimizer.param_groups:
+                    pg["lr"] = pg["_base_lr"] * lr_scale
 
         loss_val = loss.detach().item()
 
@@ -874,7 +923,10 @@ def generate_latent_traces(
         temperature=temperature if temperature > 0 else 1.0,
         top_p=top_p, pad_token_id=pad_id,
     )
-    chunk1_ids = [gen1[i, max_prompt_len:].cpu() for i in range(B)]
+    chunk1_ids = [
+        _truncate_at_boxed(gen1[i, max_prompt_len:].cpu(), tokenizer)
+        for i in range(B)
+    ]
     del gen1, input_ids, attn_mask
 
     # ── Repr 1: [prompt | chunk1] → last-token hidden → z_1 → prefix_1 ───────
@@ -919,7 +971,10 @@ def generate_latent_traces(
         top_p=top_p, pad_token_id=pad_id,
     )
     # gen2[:, 0] is placeholder for the prefix embedding position; skip it
-    chunk2_ids = [gen2[i, 1:].cpu() for i in range(B)]
+    chunk2_ids = [
+        _truncate_at_boxed(gen2[i, 1:].cpu(), tokenizer)
+        for i in range(B)
+    ]
     del gen2
 
     # ── Repr 2: [prefix_1 | chunk2] → last-token hidden → z_2 → prefix_2 ─────
@@ -946,7 +1001,10 @@ def generate_latent_traces(
         temperature=temperature if temperature > 0 else 1.0,
         top_p=top_p, pad_token_id=pad_id,
     )
-    chunk3_ids = [gen3[i, 1:].cpu() for i in range(B)]
+    chunk3_ids = [
+        _truncate_at_boxed(gen3[i, 1:].cpu(), tokenizer)
+        for i in range(B)
+    ]
     del gen3, prefix_2, am_pfx
 
     # ── Grade and assemble traces ──────────────────────────────────────────────
@@ -1161,11 +1219,11 @@ def train_latent(config: dict[str, Any], run_dir: Path) -> None:
             logger.info("  LoRA merged into backbone")
         else:
             logger.info("Loading backbone from Phase 0 checkpoint: %s", backbone_dir)
-            model = AutoModelForCausalLM.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(
                 str(backbone_dir),
                 torch_dtype=dtype, device_map="auto",
                 attn_implementation=attn_impl,
-            )
+        )
     else:
         logger.info("Phase 0 backbone dir not found; loading from HF: %s", model_id)
         model = AutoModelForCausalLM.from_pretrained(

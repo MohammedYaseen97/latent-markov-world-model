@@ -63,8 +63,14 @@ latent_markov:
 phase0:
   pool_path: "data/math_easy_pool.jsonl"       # L1–L4 only
 
+  # Step-by-step generation: the teacher is asked to complete ONE reasoning
+  # step per generation call and stop.  The model's EOS defines the boundary.
+  # Repeat until \boxed{} appears or max_chunks is reached.
+  step_tokens: 341             # generous upper bound — model self-stops via EOS most of the time
+  max_chunks: 10               # max steps per problem (stop early at \boxed{})
+
   n_steps: 800
-  batch_size: 64             # problems per step; each generates 3 teacher chunks
+  batch_size: 64             # problems per step; each generates variable teacher chunks
 
   # Learning rates (two param groups)
   lr_backbone: 1.0e-6        # backbone: low — learns to use z without forgetting
@@ -92,6 +98,14 @@ phase0:
       - up_proj
       - down_proj
   lr_lora: 3.0e-4   # 3× lr_encoder — compensates for z_anchor reducing gradient positions 34×
+
+  # Cosine LR warmdown for LoRA adapters: prevents over-adaptation that
+  # disrupts the backbone's natural answer-format generation at late positions.
+  # Empirically: probe rate peaked at 5% (step 100-200) then regressed to 0%
+  # when adapters over-specialised on z_anchor positions at constant lr=3e-4.
+  # Warmdown decays lr from 3e-4 → 3e-5 over the last 200 steps.
+  lr_warmdown_steps: 200   # cosine decay starts at step (n_steps - warmdown_steps)
+  lr_warmdown_final: 0.1   # final lr = lr_lora * warmdown_final = 3e-5
 
   # z-anchor CE loss: only supervise the first z_anchor_tokens positions of each
   # chunk.  At early positions z_prefix is the primary context; the gradient flows
