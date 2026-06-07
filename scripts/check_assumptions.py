@@ -56,8 +56,8 @@ DEFAULT_REVISION = "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
 # chain-of-thought.  We use /no_think so output is direct reasoning text, not
 # wrapped in <think>…</think> blocks that would confuse chunk parsing.
 # Unpin the revision once you know which commit you want.
-# DEFAULT_MODEL    = "Qwen/Qwen3-8B"
-# DEFAULT_REVISION = None  # or pin to a specific commit hash
+DEFAULT_MODEL    = "Qwen/Qwen3-8B"
+DEFAULT_REVISION = None  # or pin to a specific commit hash
 
 DEFAULT_POOL     = REPO_ROOT / "data" / "math_easy_pool.jsonl"
 
