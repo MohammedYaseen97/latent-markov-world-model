@@ -24,7 +24,7 @@ Options:
     --model          HF repo id                    (default: Qwen/Qwen2.5-1.5B-Instruct)
     --revision       pinned commit                 (default: see base_model.yaml)
     --max-chunks     max reasoning steps per prob  (default: 12)
-    --max-step-tok   max tokens per step           (default: 256)
+    --max-step-tok   max tokens per step           (default: 512)
     --min-step-tok   min tokens per step           (default: 10)
     --out            path to write JSON            (optional)
 """
@@ -271,10 +271,32 @@ def _generate_atomic_chunks(
         if stopped_by == "boxed":
             break
 
-        # Ask for the next intermediate result.  Keep it minimal — a long user
-        # turn here tends to prompt the model to restate the previous result
-        # rather than advance the solution.
-        messages.append({"role": "user", "content": "Next intermediate result."})
+        # Continuation message — explicitly gives the model permission to terminate.
+        # "Next intermediate result." was wrong here: it's an imperative that forces
+        # the model to produce something new, contradicting the system-prompt rule
+        # "the moment the result IS the final answer, write \boxed{} and stop."
+        #
+        # After many turns the urgency escalates:
+        #   turns 1..max_chunks-3  →  standard continuation (allows stop)
+        #   last 2 turns           →  urgent: box if you have the answer
+        #
+        # Conversation shape at step N:
+        #   [system] Solve one step at a time… rules…
+        #   [user]   <problem>
+        #   [asst]   <step 1>
+        #   [user]   "Next step — or \boxed{answer} if done."
+        #   [asst]   <step 2>
+        #   [user]   "Next step — or \boxed{answer} if done."
+        #   [asst]   <step N>    ← now generating
+        steps_remaining = max_chunks - (chunk_idx + 1)
+        if steps_remaining <= 2:
+            continuation = (
+                "If you have the final answer, write \\boxed{answer} now and stop. "
+                "Otherwise, one more step only."
+            )
+        else:
+            continuation = "Next step — or \\boxed{answer} if done."
+        messages.append({"role": "user", "content": continuation})
 
     else:
         # max_chunks exhausted without \\boxed{}
@@ -439,7 +461,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # atomic generation
     p.add_argument("--max-chunks",    type=int, default=12, dest="max_chunks",
                    help="Max reasoning steps per problem before giving up.")
-    p.add_argument("--max-step-tok",  type=int, default=256, dest="max_step_tokens",
+    p.add_argument("--max-step-tok",  type=int, default=512, dest="max_step_tokens",
                    help="Max tokens per reasoning step.")
     p.add_argument("--min-step-tok",  type=int, default=10,  dest="min_step_tokens",
                    help="Min tokens per reasoning step (prevents immediate EOS).")
