@@ -63,12 +63,18 @@ def answers_equivalent(pred: str, gold: str) -> bool:
     Handles LaTeX, fractions, radicals, symbolic and numeric equivalence.
     math-verify's own signal.alarm() timeout prevents hangs on pathological
     inputs — it must run on the main thread (signal.alarm requires it).
-    Falls back to normalised string equality on any failure.
+    Falls back to normalised string equality on any failure or when either
+    expression cannot be parsed (e.g. symbolic constants like \\pi that
+    math-verify's parser returns None for).
     """
     try:
-        return bool(mv_verify(mv_parse(pred), mv_parse(gold)))
+        p, g = mv_parse(pred), mv_parse(gold)
+        if p is not None and g is not None:
+            return bool(mv_verify(p, g))
     except Exception:
-        return pred.strip().lower() == gold.strip().lower()
+        pass
+    # Fallback: normalised string equality (handles identical LaTeX like \frac{\pi}{3})
+    return pred.strip() == gold.strip()
 
 
 # ---------------------------------------------------------------------------

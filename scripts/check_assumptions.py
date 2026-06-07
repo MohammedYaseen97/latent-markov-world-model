@@ -95,12 +95,21 @@ def _load_pool(paths: list[Path], levels: list[int] | None, n: int, seed: int) -
     """
     rng = random.Random(seed)
     all_problems: list[dict] = []
+    n_skipped_asy = 0
     for path in paths:
         with open(path) as f:
             for line in f:
                 prob = json.loads(line)
-                if levels is None or prob.get("difficulty") in levels:
-                    all_problems.append(prob)
+                if levels is not None and prob.get("difficulty") not in levels:
+                    continue
+                # Skip problems that embed Asymptote diagrams — LLMs cannot
+                # reliably parse layout code to reconstruct the figure.
+                if "[asy]" in prob.get("prompt", ""):
+                    n_skipped_asy += 1
+                    continue
+                all_problems.append(prob)
+    if n_skipped_asy:
+        print(f"[info] skipped {n_skipped_asy} problem(s) with [asy] diagrams", flush=True)
     if not all_problems:
         raise ValueError(
             f"No problems found in {[str(p) for p in paths]} "
@@ -205,12 +214,19 @@ def _generate_atomic_chunks(
     chunks: list[dict] = []
 
     for chunk_idx in range(max_chunks):
-        # Encode the current conversation context
-        prompt_text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        # Encode the current conversation context.
+        # enable_thinking=False suppresses Qwen3's <think> blocks so output is
+        # plain reasoning text.  Qwen2.5 doesn't support this kwarg, so we fall
+        # back gracefully.
+        try:
+            prompt_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            prompt_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
         input_ids = tokenizer(prompt_text, return_tensors="pt").input_ids.to(device)
 
         # Generate one step — let EOS stop it naturally
