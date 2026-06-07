@@ -73,8 +73,11 @@ def answers_equivalent(pred: str, gold: str) -> bool:
             return bool(mv_verify(p, g))
     except Exception:
         pass
-    # Fallback: normalised string equality (handles identical LaTeX like \frac{\pi}{3})
-    return pred.strip() == gold.strip()
+    # Fallback: normalised string equality.
+    # Normalise display-style variants so e.g. \dfrac and \frac compare equal.
+    def _norm(s: str) -> str:
+        return s.strip().replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+    return _norm(pred) == _norm(gold)
 
 
 # ---------------------------------------------------------------------------
