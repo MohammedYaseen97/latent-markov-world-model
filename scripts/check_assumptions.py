@@ -276,10 +276,6 @@ def _generate_atomic_chunks(
         # the model to produce something new, contradicting the system-prompt rule
         # "the moment the result IS the final answer, write \boxed{} and stop."
         #
-        # After many turns the urgency escalates:
-        #   turns 1..max_chunks-3  →  standard continuation (allows stop)
-        #   last 2 turns           →  urgent: box if you have the answer
-        #
         # Conversation shape at step N:
         #   [system] Solve one step at a time… rules…
         #   [user]   <problem>
@@ -288,15 +284,7 @@ def _generate_atomic_chunks(
         #   [asst]   <step 2>
         #   [user]   "Next step — or \boxed{answer} if done."
         #   [asst]   <step N>    ← now generating
-        steps_remaining = max_chunks - (chunk_idx + 1)
-        if steps_remaining <= 2:
-            continuation = (
-                "If you have the final answer, write \\boxed{answer} now and stop. "
-                "Otherwise, one more step only."
-            )
-        else:
-            continuation = "Next step — or \\boxed{answer} if done."
-        messages.append({"role": "user", "content": continuation})
+        messages.append({"role": "user", "content": "Next step — or \\boxed{answer} if done."})
 
     else:
         # max_chunks exhausted without \\boxed{}
