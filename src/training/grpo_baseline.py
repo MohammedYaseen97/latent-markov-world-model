@@ -63,31 +63,42 @@ def answers_equivalent(pred: str, gold: str) -> bool:
     Handles LaTeX, fractions, radicals, symbolic and numeric equivalence.
     math-verify's own signal.alarm() timeout prevents hangs on pathological
     inputs — it must run on the main thread (signal.alarm requires it).
-    Falls back to normalised string equality on any failure or when either
-    expression cannot be parsed (e.g. symbolic constants like \\pi that
-    math-verify's parser returns None for).
+    Falls back to normalised string equality on any failure.
+
+    Root-cause note: mv_parse() returns [] on parse failure, NOT None.
+    The check must be truthiness (`if p and g`) not `if p is not None and g is not None`,
+    otherwise mv_verify is called as mv_verify(expr, []) which always returns False,
+    silently bypassing the string fallback that would have matched.
     """
-    try:
-        p, g = mv_parse(pred), mv_parse(gold)
-        if p is not None and g is not None:
-            return bool(mv_verify(p, g))
-    except Exception:
-        pass
-    # Fallback: normalised string equality.
-    # Each transform is targeted at a known grader failure mode:
-    #   \dfrac / \tfrac  — display-style variants of \frac
-    #   \sqrt5 vs \sqrt{5} — unbraced single-char sqrt arg (LaTeX shorthand)
-    #   spaces around + / - — "x - 1" vs "x-1" inside LaTeX expressions
-    #   ", " inside tuples — "(4, 112)" vs "(4,112)"
     def _norm(s: str) -> str:
         import re as _re
         s = s.strip()
+        # Display-style fraction variants
         s = s.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
-        s = _re.sub(r"\\sqrt([0-9a-zA-Z])", r"\\sqrt{\1}", s)   # \sqrt5 → \sqrt{5}
-        s = _re.sub(r"\s*([+\-])\s*", r"\1", s)                 # "a - b" → "a-b"
-        s = _re.sub(r",\s+", ",", s)                             # "(4, 112)" → "(4,112)"
+        # Unbraced \frac shorthand: \frac16 -> \frac{1}{6}
+        s = _re.sub(r"\\frac([0-9a-zA-Z])([0-9a-zA-Z])", r"\\frac{\1}{\2}", s)
+        # Unbraced \sqrt shorthand: \sqrt5 -> \sqrt{5}
+        s = _re.sub(r"\\sqrt([0-9a-zA-Z])", r"\\sqrt{\1}", s)
+        # LaTeX thin-space commands used as number separators
+        s = s.replace(r"\!", "").replace(r"\,", "")
+        # Thousands-comma in numbers: 75,075 -> 75075
+        s = _re.sub(r"(?<=\d),(\d{3})(?!\d)", r"\1", s)
+        # Strip all remaining whitespace (not significant in LaTeX math)
+        s = _re.sub(r"\s+", "", s)
         return s
-    return _norm(pred) == _norm(gold)
+
+    # Normalise both sides before parsing so mv_parse sees canonical forms.
+    # This fixes \dfrac, \frac16 shorthand, 75\!075, and whitespace variants
+    # before the symbolic verifier ever runs.
+    pred_n, gold_n = _norm(pred), _norm(gold)
+    try:
+        p, g = mv_parse(pred_n), mv_parse(gold_n)
+        # mv_parse returns [] on failure, not None — use truthiness
+        if p and g:
+            return bool(mv_verify(p, g))
+    except Exception:
+        pass
+    return pred_n == gold_n
 
 
 # ---------------------------------------------------------------------------
