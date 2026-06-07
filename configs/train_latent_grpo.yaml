@@ -63,14 +63,8 @@ latent_markov:
 phase0:
   pool_path: "data/math_easy_pool.jsonl"       # L1–L4 only
 
-  # Step-by-step generation: the teacher is asked to complete ONE reasoning
-  # step per generation call and stop.  The model's EOS defines the boundary.
-  # Repeat until \boxed{} appears or max_chunks is reached.
-  step_tokens: 341             # generous upper bound — model self-stops via EOS most of the time
-  max_chunks: 10               # max steps per problem (stop early at \boxed{})
-
   n_steps: 800
-  batch_size: 64             # problems per step; each generates variable teacher chunks
+  batch_size: 64             # problems per step; each generates 3 teacher chunks
 
   # Learning rates (two param groups)
   lr_backbone: 1.0e-6        # backbone: low — learns to use z without forgetting

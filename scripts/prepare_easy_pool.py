@@ -97,6 +97,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--output-dir", type=Path, default=REPO_ROOT / "data")
     p.add_argument(
+        "--output", type=Path, default=None,
+        help="Full output path (overrides --output-dir + auto filename).",
+    )
+    p.add_argument(
         "--levels", type=int, nargs="+", default=[1, 2, 3, 4],
         help="Difficulty levels to include (1–5). Default: 1 2 3 4 (Level 5 excluded — mutual exclusivity with hard pool).",
     )
@@ -123,7 +127,14 @@ def main() -> None:
     args = parse_args()
 
     level_set = {f"Level {n}" for n in args.levels}
-    out_path = args.output_dir / "math_easy_pool.jsonl"
+
+    # Auto-name: L5-only → math_level5_pool.jsonl, mixed → math_easy_pool.jsonl
+    if args.output is not None:
+        out_path = args.output
+    elif args.levels == [5]:
+        out_path = args.output_dir / "math_level5_pool.jsonl"
+    else:
+        out_path = args.output_dir / "math_easy_pool.jsonl"
 
     print(f"Loading {HF_DATASET} (levels {args.levels}, splits {args.splits})...", file=sys.stderr)
 
@@ -197,10 +208,11 @@ def main() -> None:
     all_records.sort(key=lambda r: (r["_level_int"], r["topic"], r["prompt"]))
 
     # Assign sequential IDs and strip internal bookkeeping fields
+    id_prefix = "math_l5" if args.levels == [5] else "math_easy"
     final_records = []
     for i, r in enumerate(all_records):
         final_records.append({
-            "problem_id": f"math_easy_{i:04d}",
+            "problem_id": f"{id_prefix}_{i:04d}",
             "source_index": i,
             "prompt": r["prompt"],
             "ground_truth": r["ground_truth"],

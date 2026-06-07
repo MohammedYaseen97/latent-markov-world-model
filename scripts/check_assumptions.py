@@ -1,14 +1,32 @@
-"""Assumption-checking script for the latent Markov arm.
+"""check_assumptions.py — Incremental assumption testing for the latent Markov arm.
 
-Run incrementally — each section is gated behind --check <name>.
+Run locally on RTX 4060 (8 GB VRAM).  Each step can be run independently.
+Steps are added incrementally as the investigation deepens.
 
-Checks (added progressively):
-  traces      — A0/A1/A9/A10: print 20 raw teacher traces to inspect
-                chunk quality, boundary alignment, and problem coverage.
+Usage:
+    python scripts/check_assumptions.py --step traces [options]
 
-Usage (local, RTX 4060 8 GB):
-  python scripts/check_assumptions.py --check traces
-  python scripts/check_assumptions.py --check traces --n 5 --difficulties 1 2
+Steps implemented:
+    traces   — A0/A1/A9: generate atomic-step teacher traces and inspect them.
+               Each chunk = one complete reasoning step ended by a natural EOS.
+               Stops when \\boxed{} appears or max_chunks is reached.
+               What we're checking:
+                 A0  — does the teacher produce multiple distinct reasoning steps?
+                 A1  — do chunk boundaries fall at natural semantic step ends?
+                 A9  — does the teacher solve the problem correctly overall?
+                 (implicit) — will the model follow the "one step, then stop" prompt?
+
+Options:
+    --n              number of problems            (default: 20)
+    --seed           random seed                   (default: 42)
+    --pool           path to JSONL pool            (default: data/math_easy_pool.jsonl)
+    --levels         difficulty levels to sample   (default: 1 2 3 4)
+    --model          HF repo id                    (default: Qwen/Qwen2.5-1.5B-Instruct)
+    --revision       pinned commit                 (default: see base_model.yaml)
+    --max-chunks     max reasoning steps per prob  (default: 12)
+    --max-step-tok   max tokens per step           (default: 256)
+    --min-step-tok   min tokens per step           (default: 10)
+    --out            path to write JSON            (optional)
 """
 from __future__ import annotations
 
@@ -22,245 +40,406 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# ── Repo root on sys.path ──────────────────────────────────────────────────────
+# ── repo root on sys.path ──────────────────────────────────────────────────────
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.training.grpo_latent import (
-    _LATENT_SYSTEM_PROMPT,
-    _find_boxed,
-    _has_boxed,
-    format_prompt,
-)
 from src.training.grpo_baseline import answers_equivalent, extract_answer
-from src.utils.config_loader import load_yaml_with_extends
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-DEFAULT_CONFIG  = REPO_ROOT / "configs" / "train_latent_grpo.yaml"
-DEFAULT_POOL    = REPO_ROOT / "data" / "math_easy_pool.jsonl"
-CHUNK_TOKENS    = 341   # matches train config
-SEP             = "─" * 72
+# ── defaults ──────────────────────────────────────────────────────────────────
+# Qwen2.5-1.5B — local RTX 4060 (fits in bfloat16, 8 GB VRAM)
+DEFAULT_MODEL    = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_REVISION = "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
+
+# Qwen3-8B — cloud / GPU with ≥20 GB VRAM (bfloat16), or local in 4-bit quant.
+# Qwen3 supports a /think and /no_think suffix in the system prompt to toggle
+# chain-of-thought.  We use /no_think so output is direct reasoning text, not
+# wrapped in <think>…</think> blocks that would confuse chunk parsing.
+# Unpin the revision once you know which commit you want.
+# DEFAULT_MODEL    = "Qwen/Qwen3-8B"
+# DEFAULT_REVISION = None  # or pin to a specific commit hash
+
+DEFAULT_POOL     = REPO_ROOT / "data" / "math_easy_pool.jsonl"
+
+# ── atomic-step system prompt ──────────────────────────────────────────────────
+# Rule-list style: explicit STOP, box-on-same-step, no multi-step packing.
+# Granularity hint gives the model a concrete example of what "one step" means.
+# /no_think disables Qwen3's internal <think> wrapper (harmless on Qwen2.5).
+_ATOMIC_SYSTEM_PROMPT = """\
+Solve this problem one step at a time. /no_think
+
+A step is: derive one new intermediate result and state it explicitly before stopping.
+  - One step = one new fact established (one value computed, one rule applied, one equation reduced).
+  - The step ends with that result written out as a complete sentence or expression — not mid-derivation.
+  - Example of ONE step: "Applying the quadratic formula to x²+5x+6=0 gives roots x=-2 and x=-3."
+  - NOT one step: solving the whole problem in a single response.
+  - NOT one step: stopping mid-calculation before the intermediate result is stated.
+
+Rules:
+- Each response: perform exactly one step as defined above, state the result, then STOP.
+- The moment the stated result IS the final answer, write \\boxed{answer} at the end of
+  THAT SAME response and STOP. Do not save the box for a separate response.
+- Never write "Step 1:", "Step 2:" headers — just write the step content directly.\
+"""
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  Shared helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
-def load_model_local(
-    model_id: str = "Qwen/Qwen2.5-1.5B-Instruct",
-    revision: str = "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
-) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
-    """Load Qwen2.5-1.5B in bfloat16 on CUDA (or CPU fallback).
+def _load_pool(paths: list[Path], levels: list[int] | None, n: int, seed: int) -> list[dict]:
+    """Load problems from one or more JSONL pool files.
 
-    Fits inside 8 GB VRAM at batch_size=1 with no KV-cache accumulation.
-    torch.compile and vLLM are off — this is a diagnostic script.
+    levels=None means accept all difficulty values found in the pool.
+    Multiple paths are merged before sampling.
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading {model_id} (revision={revision[:8]}…) on {device} …", flush=True)
+    rng = random.Random(seed)
+    all_problems: list[dict] = []
+    for path in paths:
+        with open(path) as f:
+            for line in f:
+                prob = json.loads(line)
+                if levels is None or prob.get("difficulty") in levels:
+                    all_problems.append(prob)
+    if not all_problems:
+        raise ValueError(
+            f"No problems found in {[str(p) for p in paths]} "
+            f"at levels {levels}. Check --pool and --levels."
+        )
+    if len(all_problems) < n:
+        print(f"[warn] pool only has {len(all_problems)} problems "
+              f"(levels={levels}); using all {len(all_problems)}")
+        return all_problems
+    return rng.sample(all_problems, n)
 
-    tok = AutoTokenizer.from_pretrained(
-        model_id, revision=revision, trust_remote_code=True, padding_side="left",
-    )
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, revision=revision,
+def _load_model(model_id: str, revision: str | None, device: torch.device
+                ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
+    rev_label = revision[:8] if revision else "latest"
+    print(f"Loading {model_id} @ {rev_label}… (bfloat16, device_map=auto)", flush=True)
+    kwargs: dict = dict(
         torch_dtype=torch.bfloat16,
-        device_map="auto",          # lets HF place layers given available VRAM
+        device_map="auto",
         attn_implementation="sdpa",
     )
+    if revision is not None:
+        kwargs["revision"] = revision
+    model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
     model.eval()
-    print("  model loaded.\n", flush=True)
+    tok_kwargs = {"revision": revision} if revision is not None else {}
+    tok = AutoTokenizer.from_pretrained(model_id, **tok_kwargs)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    print(f"  loaded — {sum(p.numel() for p in model.parameters()) / 1e6:.0f}M params",
+          flush=True)
     return model, tok
 
 
-def load_pool(
-    pool_path: Path,
-    difficulties: list[int] | None = None,
-    n: int = 20,
-    seed: int = 42,
-) -> list[dict]:
-    """Sample n problems from the JSONL pool, optionally filtered by difficulty."""
-    problems = []
-    with open(pool_path) as f:
-        for line in f:
-            p = json.loads(line)
-            if difficulties is None or p.get("difficulty") in difficulties:
-                problems.append(p)
-    rng = random.Random(seed)
-    return rng.sample(problems, min(n, len(problems)))
+def _wrap(text: str, width: int = 100, indent: str = "    ") -> str:
+    lines = []
+    for para in text.split("\n"):
+        if para.strip() == "":
+            lines.append("")
+        else:
+            lines.extend(textwrap.wrap(para, width=width,
+                                       initial_indent=indent, subsequent_indent=indent))
+    return "\n".join(lines)
 
+
+def _boundary_quality(text: str) -> str:
+    """Heuristic: does the chunk end at a natural stopping point?"""
+    stripped = text.rstrip()
+    if not stripped:
+        return "EMPTY"
+    last = stripped[-1]
+    if last in ".!?":    return "GOOD (sentence end)"
+    if last in "}])":    return "OK   (bracket/brace)"
+    if last in ",:;":    return "POOR (mid-list)"
+    if "\\boxed{" in stripped: return "FINAL (has \\boxed)"
+    return f"UNKNOWN ('{last}')"
+
+
+def _has_boxed(text: str) -> bool:
+    return "\\boxed{" in text or r"\boxed{" in text
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Atomic-step teacher generation
+#  One reasoning step per call, terminated by natural EOS.
+# ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def generate_teacher_steps_single(
+def _generate_atomic_chunks(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     problem: dict,
-    step_tokens: int,
     max_chunks: int,
-    device: str,
-) -> list[str]:
-    """Generate reasoning one step at a time until ``\\boxed{}`` appears.
+    max_step_tokens: int,
+    min_step_tokens: int,
+    device: torch.device,
+) -> list[dict]:
+    """Generate reasoning chunks for one problem using atomic-step prompting.
 
-    Each generation call produces exactly one reasoning step.
-    Returns a list of decoded step texts (length 1..max_chunks).
+    The model is asked to produce exactly one reasoning step per turn, then stop.
+    Context grows turn-by-turn (teacher has full history as in the original design).
+    Stops when:
+      - a chunk contains \\boxed{} (answer found — natural termination), or
+      - max_chunks is reached (model failed to converge).
+
+    Returns:
+        list of dicts, one per chunk:
+          {
+            "text":    decoded text of the step,
+            "n_tokens": number of generated tokens,
+            "stopped_by": "boxed" | "eos" | "max_tokens" | "max_chunks",
+          }
     """
     pad_id = tokenizer.eos_token_id
-    prompt_ids = torch.tensor(
-        [format_prompt(problem, tokenizer)], dtype=torch.long
-    )
-    # Accumulated token IDs from prior steps (just the generated tokens, not prompt)
-    accumulated: list[int] = []
-    steps: list[str] = []
 
-    for _ in range(max_chunks):
-        total_ids = prompt_ids[0].tolist() + accumulated
-        input_ids = torch.tensor([total_ids], dtype=torch.long)
-        attn = torch.ones_like(input_ids)
-        out = model.generate(
-            input_ids.to(device), attention_mask=attn.to(device),
-            max_new_tokens=step_tokens,
-            do_sample=True, temperature=1.0, top_p=1.0,
-            pad_token_id=pad_id,
+    # Build the initial prompt: system + user (problem statement)
+    messages: list[dict] = [
+        {"role": "system",    "content": _ATOMIC_SYSTEM_PROMPT},
+        {"role": "user",      "content": problem["prompt"]},
+    ]
+
+    chunks: list[dict] = []
+
+    for chunk_idx in range(max_chunks):
+        # Encode the current conversation context
+        prompt_text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
-        new_ids = out[0, input_ids.shape[1]:].cpu()
-        step_text = tokenizer.decode(new_ids.tolist(), skip_special_tokens=True)
-        steps.append(step_text)
-        accumulated.extend(new_ids.tolist())
+        input_ids = tokenizer(prompt_text, return_tensors="pt").input_ids.to(device)
 
-        if _find_boxed(step_text) is not None:
+        # Generate one step — let EOS stop it naturally
+        output = model.generate(
+            input_ids,
+            max_new_tokens=max_step_tokens,
+            min_new_tokens=min_step_tokens,
+            do_sample=True,
+            temperature=0.5,
+            top_p=0.9,
+            pad_token_id=pad_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+        # Extract only the newly generated tokens
+        new_ids    = output[0, input_ids.shape[1]:]
+        n_tokens   = new_ids.shape[0]
+        step_text  = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+
+        # Determine why generation stopped
+        last_token = new_ids[-1].item()
+        if last_token == tokenizer.eos_token_id:
+            stopped_by = "eos"
+        elif n_tokens >= max_step_tokens:
+            stopped_by = "max_tokens"
+        else:
+            stopped_by = "eos"  # generate() can stop early for other reasons
+
+        if _has_boxed(step_text):
+            stopped_by = "boxed"
+
+        chunks.append({
+            "text":       step_text,
+            "n_tokens":   n_tokens,
+            "stopped_by": stopped_by,
+        })
+
+        # Extend the conversation context with the model's response
+        messages.append({"role": "assistant", "content": step_text})
+
+        # If the model produced the final answer, we're done
+        if stopped_by == "boxed":
             break
 
-    return steps
+        # Ask for the next intermediate result.  Keep it minimal — a long user
+        # turn here tends to prompt the model to restate the previous result
+        # rather than advance the solution.
+        messages.append({"role": "user", "content": "Next intermediate result."})
+
+    else:
+        # max_chunks exhausted without \\boxed{}
+        if chunks:
+            chunks[-1]["stopped_by"] = "max_chunks"
+
+    return chunks
 
 
-def print_trace(
-    idx: int,
-    problem: dict,
-    steps: list[str],
-    ground_truth: str,
-) -> None:
-    full = "".join(steps)
-    pred = extract_answer(full)
-    reward = int(pred is not None and answers_equivalent(pred, ground_truth))
-    status = "✅ CORRECT" if reward else "❌ WRONG"
-    pred_s = repr(pred) if pred else "None"
+# ══════════════════════════════════════════════════════════════════════════════
+#  Step: traces
+# ══════════════════════════════════════════════════════════════════════════════
 
-    print(SEP)
-    print(f"[{idx+1}] {status}  |  gt={ground_truth!r}  pred={pred_s}")
-    print(f"     diff={problem.get('difficulty','?')}  topic={problem.get('topic','?')}")
-    print(f"     problem: {problem['prompt'][:120]}")
-    print(f"     steps: {len(steps)}")
-    print()
+def run_traces(args: argparse.Namespace) -> None:
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    problems = _load_pool(args.pool, args.levels, args.n, args.seed)
+    model, tok = _load_model(args.model, args.revision, device)
+    print(f"  Pool: {[str(p) for p in args.pool]}", flush=True)
+    diff_counts: dict[int, int] = {}
+    for prob in problems:
+        d = prob.get("difficulty", "?")
+        diff_counts[d] = diff_counts.get(d, 0) + 1
+    print(f"  Sampled difficulties: {dict(sorted(diff_counts.items()))}", flush=True)
 
-    for k, text in enumerate(steps):
-        label = f"STEP {k+1}" if k < len(steps) - 1 or _find_boxed(text) is None else f"STEP {k+1} (final)"
-        print(f"  ── {label} ({len(text.split())} words) ──")
-        if len(text) > 450:
-            head = text[:300].replace("\n", " ")
-            tail = text[-120:].replace("\n", " ")
-            print("  " + textwrap.fill(head, 80, subsequent_indent="  "))
-            print("  …")
-            print("  " + textwrap.fill(tail, 80, subsequent_indent="  "))
-        else:
-            print("  " + textwrap.fill(text.replace("\n", " "), 80, subsequent_indent="  "))
-        print()
-    print()
+    print(f"\nGenerating atomic-step teacher traces for {len(problems)} problems", flush=True)
+    print(f"  max_chunks={args.max_chunks}  "
+          f"max_step_tokens={args.max_step_tokens}  "
+          f"min_step_tokens={args.min_step_tokens}", flush=True)
+    print(f"  System prompt:\n{_wrap(_ATOMIC_SYSTEM_PROMPT, width=90)}\n", flush=True)
 
+    all_records: list[dict] = []
 
-# ── Check: traces ──────────────────────────────────────────────────────────────
+    for idx, prob in enumerate(problems):
+        print(f"{'─'*80}", flush=True)
+        print(f"[{idx+1:02d}/{len(problems)}]  difficulty={prob.get('difficulty','?')}  "
+              f"id={prob['problem_id']}", flush=True)
+        print(f"  PROBLEM: {prob['prompt'][:160]}{'…' if len(prob['prompt'])>160 else ''}",
+              flush=True)
+        print(f"  ANSWER:  {prob['ground_truth']}", flush=True)
 
-def check_traces(args: argparse.Namespace) -> None:
-    """A0/A1/A9/A10: inspect teacher traces with one-step-at-a-time generation.
-
-    What to look for:
-      A0 — Does each step end cleanly (model self-stops)?
-      A1 — Are steps complete reasoning units, or cut mid-sentence?
-      A9 — Is the teacher's reasoning coherent and correct?
-      A10 — Could a reader resume from the start of step 2/3/…?
-    """
-    pool_path   = Path(args.pool) if args.pool else DEFAULT_POOL
-    difficulties = args.difficulties or None
-    n           = args.n
-    seed        = args.seed
-    step_tokens = args.step_tokens
-    max_chunks  = args.max_chunks
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, tokenizer = load_model_local()
-
-    problems = load_pool(pool_path, difficulties=difficulties, n=n, seed=seed)
-    print(f"Sampled {len(problems)} problems from {pool_path.name}")
-    print(f"step_tokens={step_tokens}  max_chunks={max_chunks}\n")
-
-    correct = 0
-    total_steps = 0
-    for i, prob in enumerate(problems):
-        print(f"\nGenerating step-by-step trace {i+1}/{len(problems)} …", end=" ", flush=True)
-        steps = generate_teacher_steps_single(
-            model, tokenizer, prob, step_tokens, max_chunks, device,
+        chunks = _generate_atomic_chunks(
+            model=model, tokenizer=tok,
+            problem=prob,
+            max_chunks=args.max_chunks,
+            max_step_tokens=args.max_step_tokens,
+            min_step_tokens=args.min_step_tokens,
+            device=device,
         )
-        total_steps += len(steps)
-        full = "".join(steps)
-        pred = extract_answer(full)
-        reward = int(pred is not None and answers_equivalent(pred, prob["ground_truth"]))
-        correct += reward
-        print(f"done ({len(steps)} steps)", flush=True)
 
-        print_trace(i, prob, steps, prob["ground_truth"])
+        # Grade: concatenate all chunk texts
+        full_text = "\n".join(c["text"] for c in chunks)
+        pred      = extract_answer(full_text)
+        reward    = int(pred is not None and answers_equivalent(pred, prob["ground_truth"]))
 
-    avg_steps = total_steps / len(problems)
-    print(SEP)
-    print(f"\nTeacher reward rate: {correct}/{len(problems)} = {correct/len(problems):.1%}")
-    print(f"Average steps per problem: {avg_steps:.1f}")
-    print("\nThings to note per trace:")
-    print("  A0  — does each step end cleanly (model self-stops at step boundary)?")
-    print("  A1  — is each step a complete reasoning unit?")
-    print("  A9  — is teacher reasoning coherent and step-by-step?")
-    print("  A10 — could a reader resume from the start of step 2?")
+        # Print each chunk
+        for ci, chunk in enumerate(chunks, 1):
+            bq = _boundary_quality(chunk["text"])
+            print(f"\n  ── Step {ci}  ({chunk['n_tokens']} tokens)  "
+                  f"stopped_by={chunk['stopped_by']}  boundary={bq}", flush=True)
+            snippet = chunk["text"][:500] + ("…" if len(chunk["text"]) > 500 else "")
+            print(_wrap(snippet), flush=True)
+
+        print(f"\n  ── Grade", flush=True)
+        print(f"     n_chunks:  {len(chunks)}", flush=True)
+        print(f"     predicted: {pred!r}", flush=True)
+        print(f"     expected:  {prob['ground_truth']!r}", flush=True)
+        print(f"     reward:    {'✅' if reward else '❌'}", flush=True)
+        print(f"     total_tokens: {sum(c['n_tokens'] for c in chunks)}", flush=True)
+        stop_reason = chunks[-1]["stopped_by"] if chunks else "none"
+        print(f"     final stop: {stop_reason}", flush=True)
+
+        all_records.append({
+            "problem_id":   prob["problem_id"],
+            "difficulty":   prob.get("difficulty"),
+            "prompt":       prob["prompt"],
+            "ground_truth": prob["ground_truth"],
+            "n_chunks":     len(chunks),
+            "chunks":       chunks,
+            "predicted":    pred,
+            "reward":       reward,
+        })
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    n_correct     = sum(r["reward"]   for r in all_records)
+    n_chunks_list = [r["n_chunks"]    for r in all_records]
+    stop_reasons  = [r["chunks"][-1]["stopped_by"] for r in all_records if r["chunks"]]
+
+    print(f"\n{'═'*80}", flush=True)
+    print(f"SUMMARY  —  {n_correct}/{len(all_records)} correct  "
+          f"({100*n_correct/max(len(all_records),1):.1f}%)", flush=True)
+
+    # Per-difficulty breakdown
+    by_diff: dict[int, list[int]] = {}
+    for r in all_records:
+        by_diff.setdefault(r["difficulty"], []).append(r["reward"])
+    for d in sorted(by_diff):
+        rw = by_diff[d]
+        print(f"  L{d}: {sum(rw)}/{len(rw)}", flush=True)
+
+    print(f"\nChunk count distribution:", flush=True)
+    from collections import Counter
+    for n, cnt in sorted(Counter(n_chunks_list).items()):
+        print(f"  {n} chunks: {cnt} problems", flush=True)
+    print(f"  avg: {sum(n_chunks_list)/max(len(n_chunks_list),1):.1f} chunks/problem",
+          flush=True)
+
+    print(f"\nFinal-chunk stop reason distribution:", flush=True)
+    for reason, cnt in sorted(Counter(stop_reasons).items()):
+        print(f"  {reason}: {cnt}", flush=True)
+    print(flush=True)
+    print("What to look for:", flush=True)
+    print("  boxed    = model found answer naturally    → GOOD", flush=True)
+    print("  eos      = model stopped at step end       → GOOD (if n_chunks > 1)", flush=True)
+    print("  max_tok  = model ran to token limit        → model ignoring stop instruction", flush=True)
+    print("  max_chks = never produced \\boxed{}         → model can't solve or ran away", flush=True)
+
+    # Per-chunk step token stats
+    all_step_tokens = [c["n_tokens"] for r in all_records for c in r["chunks"]]
+    if all_step_tokens:
+        print(f"\nStep token stats across all chunks:", flush=True)
+        print(f"  min={min(all_step_tokens)}  "
+              f"max={max(all_step_tokens)}  "
+              f"mean={sum(all_step_tokens)/len(all_step_tokens):.0f}", flush=True)
+        at_max = sum(1 for t in all_step_tokens if t >= args.max_step_tokens)
+        print(f"  {at_max}/{len(all_step_tokens)} steps hit the max_step_tokens cap "
+              f"(model may be ignoring stop instruction)", flush=True)
+
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(all_records, f, indent=2)
+        print(f"\nRecords written to {out_path}", flush=True)
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLI
+# ══════════════════════════════════════════════════════════════════════════════
 
-def parse_args() -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Incrementally test latent Markov design assumptions (local, 8 GB)."
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument(
-        "--check", required=True,
-        choices=["traces"],
-        help="Which assumption check to run.",
-    )
-    p.add_argument(
-        "--n", type=int, default=20,
-        help="Number of problems to sample (default: 20).",
-    )
-    p.add_argument(
-        "--difficulties", type=int, nargs="+", default=None,
-        help="Filter pool by difficulty levels e.g. --difficulties 1 2 3 4",
-    )
-    p.add_argument(
-        "--pool", type=str, default=None,
-        help="Path to JSONL pool (default: data/math_easy_pool.jsonl).",
-    )
-    p.add_argument(
-        "--step_tokens", type=int, default=341,
-        help="Max tokens per generation step (default: 341).",
-    )
-    p.add_argument(
-        "--max_chunks", type=int, default=10,
-        help="Max reasoning steps before stopping (default: 10).",
-    )
-    p.add_argument("--seed", type=int, default=42)
-    return p.parse_args()
+    p.add_argument("--step", choices=["traces"], required=True,
+                   help="Which assumption check to run.")
+
+    # data
+    p.add_argument("--n",      type=int,  default=20)
+    p.add_argument("--seed",   type=int,  default=42)
+    p.add_argument("--pool",   type=Path, nargs="+", default=[DEFAULT_POOL],
+                   help="One or more JSONL pool files (merged before sampling). "
+                        "Default: data/math_easy_pool.jsonl")
+    p.add_argument("--levels", type=int,  nargs="+", default=None,
+                   help="Difficulty levels to sample (e.g. --levels 3 4). "
+                        "Default: all levels found in the pool.")
+
+    # model
+    p.add_argument("--model",    default=DEFAULT_MODEL)
+    p.add_argument("--revision", default=DEFAULT_REVISION)
+
+    # atomic generation
+    p.add_argument("--max-chunks",    type=int, default=12, dest="max_chunks",
+                   help="Max reasoning steps per problem before giving up.")
+    p.add_argument("--max-step-tok",  type=int, default=256, dest="max_step_tokens",
+                   help="Max tokens per reasoning step.")
+    p.add_argument("--min-step-tok",  type=int, default=10,  dest="min_step_tokens",
+                   help="Min tokens per reasoning step (prevents immediate EOS).")
+
+    # output
+    p.add_argument("--out", type=str, default=None,
+                   help="Optional JSON output path.")
+    return p
 
 
 def main() -> None:
-    args = parse_args()
-
-    if args.check == "traces":
-        check_traces(args)
+    args = _build_parser().parse_args()
+    if args.step == "traces":
+        run_traces(args)
     else:
-        print(f"Unknown check: {args.check}", file=sys.stderr)
+        print(f"Unknown step: {args.step}")
         sys.exit(1)
 
 

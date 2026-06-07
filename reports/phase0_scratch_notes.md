@@ -1,204 +1,52 @@
 # Phase 0 — Unofficial Scratch Notes
 
-**Not canonical.** Working notes from debugging Phase 0 distillation (latent Markov arm).
+**Not canonical.** Working notes from debugging Phase 0 distillation (latent Markov arm).  
 For the official design, see `reports/latent_markov_design.md`.
 
-Last updated: 2026-06-04
-
-**Current status: Phase 0 training giving bad results → revisiting assumptions.**
+Last updated: 2026-06-02
 
 ---
 
-## Published results (from lossfunk_proposal_draft.pdf)
+## Phase 0 success criterion (agreed)
 
-These are from **v2** of the architecture — the last version with `L_trans` (transition loss)
-and `L_out` (calibration loss), frozen backbone, and no LoRA. The Phase 1 failure at 8.42%
-triggered the v2→v3 redesign (teacher-forced CE distillation), which began this conversation.
+Student (LoRA + encoder + Z-injector) must generate full 3-chunk reasoning on L1–L4 **from `z_prefix` only**, with reward rate comparable to teacher. CE loss alone is insufficient — the final gate is **student vs teacher reward rate** on held-out easy problems.
 
-| Component | Status | Key finding |
-|-----------|--------|-------------|
-| Baseline GRPO (200 steps) | complete | **pass@128 = 16.20%** |
-| Latent Markov encoder (Phase 0, 400 steps) | complete | Structured latent space with outcome-correlated geometry (UMAP: 1.4× enrichment) |
-| Phase 1 joint RL | **complete — fail** | **pass@128 = 8.42%** (below Phase 0 floor; encoder instability diagnosed) |
-| Token-Markov arm | pending | — |
-
-### Design timeline
-
-| Design | Phase 0 approach | Phase 1 result |
-|--------|-----------------|----------------|
-| **v2** — PDF numbers | `L_trans` + `L_out`, frozen backbone, 400 steps | **pass@128 = 8.42%** — below baseline ceiling (16.20%), encoder instability |
-| **v3** — teacher-forced CE | Replaced L_trans/L_out with CE distillation, frozen backbone | pass@128 = all 0s; Phase 1 reward 0.4%, 13/20 dead steps |
-| **v4** — +LoRA | Added LoRA (r=16), CE distillation | Student reward **1.25%**, gradient dilution |
-| **v5** — +z_anchor, +steps | z_anchor=32, 800 steps, lr=3e-4 | Probe peaked at 5%, regressed to 0%; best checkpoint student 1.25% |
-| **v6** — +warmdown, step-by-step | LR warmdown, variable-length teacher chunks | **Not yet run** |
-
-### ⚠️ Important caveat on v2 numbers
-
-v2 had a **crutch** in Phase 1: the student could see prior chunk tokens directly
-in addition to z_prefix. This made z **optional** — the backbone could ignore z
-and read prior chunk text. The v2→v3 changelog explicitly states: "Crutch made z
-optional — backbone could ignore z and read prior chunk text directly."
-
-Both v2 results are contaminated:
-
-- **UMAP 1.4× enrichment** — the structured latent space may be an artifact of the
-  backbone doing the reasoning while z was along for the ride
-- **pass@128 = 8.42%** — not pure latent-arm performance; includes crutch-assisted
-  generations where z may have contributed nothing
-
-This means the 8.42% is an **upper bound** on what the crutch-assisted pipeline
-could do, not a lower bound on what z alone can do. The true z-only performance
-of v2's latent space is unknown, and likely closer to the 1.25% seen in later
-crutch-free versions.
+Sanity thresholds (`phase0_sanity`):
+- `coverage_threshold: 0.30` — student rate ≥ 30% of teacher rate
+- `min_student_reward: 0.10` — absolute floor 10%
+- `chunk1_crutch_rate` — diagnostic only; high crutch = answers from chunk 1, z broken for chunks 2–3
 
 ---
 
-## Assumptions being tested (chronological, in order of architectural dependency)
+## Run history & key observations
 
-### A0 — Step boundaries are clean
-The teacher's generation steps end at complete reasoning units, not mid-sentence.
-**Status:** Partially confirmed. With the new "one step at a time" prompt and
-`step_tokens=341`, most steps end naturally. At `step_tokens=200`, steps were cut
-mid-LaTeX. Bumped to 341 — re-verify.
+### Run 1 — LoRA, full CE, 400 steps, lr_lora=1e-4
 
-### A1 — z_prefix encodes "position in solution space"
-The 64-dim latent vector z, extracted from the last token of a chunk, captures
-enough information about where we are in the solution to guide the next step.
-**Status:** Not tested directly yet. Negative z-transition gap (-0.027) suggests
-it may not. The plan is to increase `latent_dim` if this fails.
+- CE passed; z variance healthy
+- Student reward ~1.25% vs teacher ~49%
+- Chunk-1 crutch ~0% (LoRA fixed “garbage chunk” issue)
+- Diagnosis: **gradient dilution** — CE averaged over all 341 tokens; teacher context dominates at late positions; model learns “continue teacher text” not “generate from z”
 
-### A2 — CE loss on z-anchor positions is sufficient signal
-Supervising only the first 32 tokens (z_anchor_tokens) of each chunk provides
-enough gradient to train the encoder + LoRA to produce useful z prefixes.
-**Status: Failing.** CE passes (~1.5 nats) but student reward is 1.25% — 8× below
-the 10% threshold. The model learns teacher-forced next-token prediction but cannot
-generalize to autoregressive generation.
+### Run 2 — z_anchor_tokens=32, 400 steps, lr_lora=1e-4
 
-### A3 — Teacher-forced CE transfers to autoregressive generation
-The model trained with teacher-chunk context at positions 0–31 will produce the
-same text when generating autoregressively from z_prefix alone.
-**Status: Strongly contradicted.** This is the exposure-bias problem. CE passes
-(1.5 nats) but generation fails (1.25% reward). The gap between train-time context
-(teacher tokens) and inference-time context (own generated tokens) breaks the pipeline.
+- All generation probes: **0%**
+- Loss still declining at step 400 (~3.07 nats)
+- Diagnosis: **under-training** at z_anchor density + fixed biased probe pool
 
-### A4 — 64-dim z is expressive enough for L1–L4 math
-The 1536→64 compression (24× reduction) preserves enough information to represent
-where a solution is in "solution space."
-**Status: Questionable.** The negative z-transition gap (-0.027) suggests z is not
-tracking solution progress. Increasing latent_dim to 128 or 256 is the planned fix.
+### Run 3 — z_anchor=32, 800 steps, lr_lora=3e-4, probe resample
 
-### A5 — LoRA rank 16 is sufficient
-Backbone adapters at r=16 with 32 z_anchor positions provide enough capacity to
-learn the z→text mapping.
-**Status: Unclear.** CE passes (1.5 nats) → LoRA can memorize under teacher forcing.
-But generation fails → capacity may be sufficient, the bottleneck is elsewhere.
+| Step | Loss | Probe (20 rollouts) |
+|------|------|---------------------|
+| 100  | 3.30 | 5%                  |
+| 200  | 3.29 | 5%                  |
+| 300+ | ~3.0 | 0%                  |
 
-### A6 — min_new_tokens=170 doesn't poison generation
-Forcing chunks 2–3 to generate at least 170 tokens, even when the model is lost,
-doesn't accumulate errors that kill chunk 3 quality.
-**Status: Likely hurting.** The forced 170 tokens on broken z_2 produces garbage
-that feeds into z_3 → garbage. Plan: reduce to 32 or remove.
+- Loss plateau ~3.0 nats by step 500
+- Probe **peaked early then regressed** while loss kept falling
+- Diagnosis: **over-adaptation** — LoRA over-specialises on z_anchor positions; disrupts late-position behavior (`\boxed{}`, answer format)
 
-### A7 — Teacher quality is sufficient for distillation
-The 1.5B Qwen teacher, with "one step at a time" prompting, produces good-enough
-traces for the student to learn from.
-**Status: Verified.** Teacher reward rate ~60% on L1–L4 with 2.1 avg steps/problem.
-Not perfect but better than pre-redesign (which had hallucinated steps mid-chunk).
-The 40% incorrect traces will be learned by the student — Phase 1 RL is expected
-to correct this, but it means the Phase 0 student starts as a noisy copy.
+### Sanity on `checkpoint-200` (best of Run 3)
 
-### A8 — Variable-length chunks train correctly
-The new distill_loss supports 1..max_chunks per problem. Samples with 1 chunk
-(problem solved in one step) return 0 loss as expected.
-**Status: Not yet run.** Implementation complete but not tested in a training run.
-
----
-
-## Official numbers — all Phase 0 runs
-
-### Phase 0 v1 (no LoRA, 400 steps, full CE on all 341 tokens)
-
-**Training loss (teacher forcing):**
-```
-Step 10:   14.64
-Step 20:   2.34
-Step 30:   1.89
-Step 40:   1.89
-Step 50:   1.80
-Step 60:   1.87
-Step 70:   1.88
-Step 80:   1.89
-...
-Step 400:  ~1.60
-```
-CE converged. z variance healthy (0.64). All architectural gates passed.
-
-**Sanity results:**
-```
-mean_ce_loss:          1.61   ✅ (threshold 2.0)
-mean_z_std:            0.64   ✅ (threshold 0.1)
-z_transition_gap:      0.089  ✅ (threshold 0.02)
-easy_reward_rate:      7.5%   ✅ (threshold 5%)
-overall_pass:          true
-```
-Passed — but `easy_reward_rate` was entirely chunk-1 crutch (answer visible in
-the prompt chunk; z pipeline was never exercised).
-
-**Phase 1 training (post v1):**
-```
-Steps with non-zero gradient:  7 / 20  (35%)
-Steps with zero gradient:     13 / 20  (65%)
-Peak reward_rate:            ~0.004   (0.4%)
-```
-Model produced 0 correct answers for 13/20 steps. Phase 1 dead on arrival.
-
-**Phase 1 eval (L5 hard pool):** All zeros. No correct generations across any rollout.
-
----
-
-### Phase 0 v2 — LoRA, 400 steps, lr_lora=1e-4, full CE
-
-**Sanity results:**
-```
-mean_ce_loss:          1.6   ✅
-mean_z_std:            0.64  ✅
-teacher_reward_rate:   49%      (on 80 rollouts)
-student_reward_rate:   1.25%  ❌ (need ≥10%)
-coverage_ratio:        2.6%   ❌ (need ≥30% of teacher)
-overall_pass:          false
-```
-Chunk-1 crutch ~0% — LoRA fixed the "garbage chunk" issue, but z pipeline still
-broken for chunks 2–3. Diagnosis: **gradient dilution** — CE averaged over 341
-positions; teacher context dominates at late positions (>32).
-
----
-
-### Phase 0 v3 — z_anchor_tokens=32, 400 steps, lr_lora=1e-4
-
-**Training probes:**
-```
-All generation probes: 0% correct
-Loss at step 400:      ~3.07 nats (still declining)
-```
-Diagnosis: under-training at z_anchor density + fixed biased probe pool
-(always sampling the same 10 hard L4 problems).
-
----
-
-### Phase 0 v4 — z_anchor=32, 800 steps, lr_lora=3e-4, probe resample
-
-**Training probes:**
-| Step | Loss  | Probe (20 rollouts) |
-|------|-------|---------------------|
-| 100  | 3.30  | 5%                  |
-| 200  | 3.29  | 5%                  |
-| 300+ | ~3.0  | 0%                  |
-
-Loss plateaued at ~3.0 nats by step 500. Probe peaked early then regressed
-while CE continued falling. Diagnosis: **over-adaptation** — LoRA over-specialised
-on z_anchor positions, disrupting late-position behavior (`\boxed{}`, answer format).
-
-**Sanity on checkpoint-200 (best of v4):**
 ```
 mean_ce_loss:          1.48   ✅ (threshold 2.0)
 mean_z_std:            0.40   ✅ (threshold 0.1)
@@ -210,21 +58,9 @@ z_transition_gap:      -0.027 ❌ (z not tracking solution progress)
 overall_pass:          false
 ```
 
-Qualitative: chunk 1 sometimes starts OK; chunks 2–3 collapse into unrelated math,
-broken LaTeX, HTML junk, repetition. **Not Phase 1 ready.**
+Qualitative: chunk 1 sometimes starts OK; chunks 2–3 collapse into unrelated math, broken LaTeX, HTML junk, repetition. **Not Phase 1 ready.**
 
----
-
-### Phase 0 v5 (current, not yet run) — step-by-step teacher, variable chunks
-
-Changes from v4:
-- **Step-based teacher generation** with "Complete one reasoning step, then stop" prompt
-- **Variable-length chunk lists** — distill_loss handles 1..max_chunks per problem
-- `step_tokens=341`, `max_chunks=10`
-- `\boxed{}` detection as the stop signal (no hardcoded `--- STATE:` markers)
-- Teacher reward ~60% on L1–L4 with avg 2.1 steps/problem (verified via check_assumptions.py)
-
-**Status:** not yet run. Pending after assumption verification.
+Probe 5% at step 200 was noise on 20 rollouts; sanity 80 rollouts → true rate ~1.25%.
 
 ---
 
@@ -243,9 +79,62 @@ Changes from v4:
 | `lr_lora: 3e-4` | config | Compensate for 32/341 supervised positions |
 | Cosine LR warmdown | `grpo_latent.py`, config | Last 200 steps: 3e-4 → 3e-5; addresses over-adaptation |
 | `_random` UnboundLocalError | `grpo_latent.py` | Removed inline `import random` inside probe block |
-| Step-by-step teacher generation | `_generate_teacher_chunks`, `_LATENT_SYSTEM_PROMPT` | "Complete one reasoning step, then stop"; model EOS = boundary; loop until `\boxed{}` or max_chunks |
-| Variable-length distill loss | `_distill_loss` | Handles 1..max_chunks per problem instead of fixed 3 |
-| `_truncate_at_boxed` | `generate_latent_traces` | Phase 1 truncation at `\boxed{}` only |
+
+---
+
+## Fixes — discussed, not yet implemented
+
+### Training / loss
+
+| Idea | Rationale | Suggested values |
+|------|-----------|------------------|
+| **`z_tail_tokens`** | z_anchor supervises 0–31 only; tokens 32–340 never trained; `\boxed{}` lives in tail | Supervise last 32 positions of chunks 2–3 in addition to z_anchor |
+| **Hybrid CE** | Middle tokens (32–309) unsupervised to avoid diluting z signal; head + tail both matter | `z_anchor_tokens=32`, `z_tail_tokens=32` |
+| **Scheduled sampling** | Close teacher-forcing vs autoregressive gap after token K | Gradually mix student tokens into positions > z_anchor |
+| **Full CE on chunk 1** | Chunk 1 has full prompt context; no z yet — could stabilize repr_h | Optional; chunk 1 currently no CE |
+| **LR warmup** | Stabilize early steps when encoder/LoRA cold-start | e.g. 50 steps 0 → lr |
+| **Early stop / best-probe checkpoint** | Best generative quality was ~step 200, not step 800 | Save/copy checkpoint when `probe_rate` is max |
+| **z_anchor curriculum** | Start K=16, grow to 32 over training | Softer than jumping to full anchor |
+
+### Architecture / capacity
+
+| Idea | Rationale | Suggested values |
+|------|-----------|------------------|
+| **`latent_dim` ↑** | 1536→64 compression may lose “position in solution space” for hard L4 math | 128 or 256 (`latent_markov.latent_dim`) |
+| **LoRA rank ↑** | Backbone needs capacity to *use* richer z prefix | r=32, alpha=64, **with** higher z_dim |
+| **`lora_dropout`** | More capacity → easier over-fit | 0.05 when increasing rank |
+| **Lower peak `lr_lora`** | Pair with capacity increase | 2e-4 instead of 3e-4 |
+| **Multiple prefix tokens** | Still one virtual token today; richer z → one 1536-dim vector only | Larger arch change; inject K tokens from z |
+
+**Consensus from discussion:** increase `latent_dim` and LoRA rank **together**, not one alone. Pair with regularization (warmdown, dropout, lower peak lr).
+
+### Generation (inference)
+
+| Idea | Rationale | Suggested values |
+|------|-----------|------------------|
+| **Reduce `min_new_tokens`** | Currently `chunk_tokens // 2` (=170) forces long garbage when model is lost; garbage → bad z_2 → worse chunk 3 | Try 32 or remove once z works |
+| **Probe / sanity rollout count** | 20-rollout probes are high-variance | Probes misleading vs 80-rollout sanity |
+
+Location: `generate_latent_traces()` — `min_new_tokens=chunk_tokens // 2` on chunks 2 and 3.
+
+### Eval / ops
+
+| Idea | Notes |
+|------|-------|
+| Sanity on `checkpoint-200` not final dir | Best artifact from Run 3 may not be `phase0/` root |
+| `torch.compile` warning | “reduce-overhead compiled saved, loading default” — likely compile mode mismatch on load; checkpoint fixes address LoRA keys, not necessarily compile mode |
+| Phase 1 optimizer not restored from checkpoint | `phase1_latent.pt["optimizer"]` saved but not loaded — noted in audit |
+
+---
+
+## Rejected or deferred (for now)
+
+| Idea | Why deferred |
+|------|--------------|
+| **Classical simulated annealing** | Doesn’t map to gradient CE training; LR warmdown is the relevant “annealing” |
+| **LoRA rank ↑ alone** | Run showed early probe success then regression — dynamics > capacity; rank alone may worsen over-adaptation |
+| **LoRA rank ↑ without warmdown/dropout** | Same reason |
+| **Increase rank before warmdown run** | Sequential debugging: isolate warmdown first, then capacity |
 
 ---
 
@@ -265,16 +154,69 @@ Contributing factors:
   6. LoRA may lack capacity to condition on prefix (secondary)
 ```
 
-Chunk-1 crutch 0% → failure is **in the Markov pipeline**, not "answer in chunk 1."
+Chunk-1 crutch 0% → failure is **in the Markov pipeline**, not “answer in chunk 1.”
+
+---
+
+## Proposed next run (sketch — not committed)
+
+```yaml
+latent_markov:
+  latent_dim: 128   # or 256
+
+phase0:
+  n_steps: 800
+  lora:
+    r: 32
+    lora_alpha: 64
+    lora_dropout: 0.05
+  lr_lora: 2.0e-4
+  lr_warmdown_steps: 250
+  lr_warmdown_final: 0.1
+  z_anchor_tokens: 32
+  z_tail_tokens: 32          # NOT IMPLEMENTED — add to _distill_loss
+  # optional: lr_warmup_steps: 50
+  # optional: save best probe checkpoint
+```
+
+Also consider lowering `min_new_tokens` in `generate_latent_traces` once tail loss is in place.
+
+---
+
+## Commands (reference)
+
+```bash
+# Phase 0 train
+python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 0
+
+# Sanity — use best intermediate checkpoint if probes peaked early
+python scripts/run_phase0_sanity.py \
+    --config configs/train_latent_grpo.yaml \
+    --checkpoint artifacts/latent_grpo/<run_id>/phase0/checkpoint-200
+
+# Full Phase 0 eval (pass@k, pretrained)
+python scripts/eval_passk.py --generation-mode latent_markov_pretrained \
+    --train-config configs/train_latent_grpo.yaml \
+    --checkpoint artifacts/latent_grpo/<run_id>/phase0 \
+    --arm latent_grpo_pretrained
+```
+
+---
+
+## Open questions
+
+1. Is 128-dim z enough, or do we need 256 + multi-token injection?
+2. Can `z_tail_tokens` alone fix `\boxed{}` without full middle supervision?
+3. Should Phase 0 add a small amount of **on-policy** loss (mix own rollouts into CE) before Phase 1?
+4. Should sanity gate on **median** problem reward, not mean, given heavy-tailed easy pool?
+5. Is z-transition worth reviving as a soft loss once `latent_dim` increases?
 
 ---
 
 ## Related files
 
 - Official design: `reports/latent_markov_design.md`
-- Official results: `reports/ablation_core.md`
 - Training: `src/training/grpo_latent.py`
 - Sanity: `scripts/run_phase0_sanity.py`
 - Config: `configs/train_latent_grpo.yaml`
-- Assumption testing: `scripts/check_assumptions.py`
 - Encoder: `src/models/vae_state_encoder.py` (1536→512→128→z_dim)
