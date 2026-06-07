@@ -74,9 +74,19 @@ def answers_equivalent(pred: str, gold: str) -> bool:
     except Exception:
         pass
     # Fallback: normalised string equality.
-    # Normalise display-style variants so e.g. \dfrac and \frac compare equal.
+    # Each transform is targeted at a known grader failure mode:
+    #   \dfrac / \tfrac  — display-style variants of \frac
+    #   \sqrt5 vs \sqrt{5} — unbraced single-char sqrt arg (LaTeX shorthand)
+    #   spaces around + / - — "x - 1" vs "x-1" inside LaTeX expressions
+    #   ", " inside tuples — "(4, 112)" vs "(4,112)"
     def _norm(s: str) -> str:
-        return s.strip().replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+        import re as _re
+        s = s.strip()
+        s = s.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+        s = _re.sub(r"\\sqrt([0-9a-zA-Z])", r"\\sqrt{\1}", s)   # \sqrt5 → \sqrt{5}
+        s = _re.sub(r"\s*([+\-])\s*", r"\1", s)                 # "a - b" → "a-b"
+        s = _re.sub(r",\s+", ",", s)                             # "(4, 112)" → "(4,112)"
+        return s
     return _norm(pred) == _norm(gold)
 
 
