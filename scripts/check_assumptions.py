@@ -316,29 +316,6 @@ def _generate_atomic_chunks(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Training-readiness gate
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _is_training_ready(record: dict) -> bool:
-    """True when a trace is safe to use as a training example.
-
-    Conditions (all must hold):
-      1. reward == 1            — correct final answer.
-      2. No max_tokens chunk    — every chunk ended at a natural boundary (EOS or
-                                  boxed), not at the token cap.  A chunk cut by the
-                                  token limit produces a mid-sentence boundary that
-                                  violates A1 (semantic step ends).
-      Note: loop_break and max_chunks always imply reward==0, so condition 1
-      already excludes them; they are not checked separately.
-    """
-    if record.get("reward") != 1:
-        return False
-    if any(c.get("stopped_by") == "max_tokens" for c in record.get("chunks", [])):
-        return False
-    return True
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  Step: traces
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -400,7 +377,17 @@ def run_traces(args: argparse.Namespace) -> None:
         stop_reason = chunks[-1]["stopped_by"] if chunks else "none"
         print(f"     final stop: {stop_reason}", flush=True)
 
-        record = {
+        # A trace is clean (usable for training) only when:
+        #   1. reward=1  (correct answer)
+        #   2. no chunk was cut by max_tokens  (A1: every boundary is semantic)
+        #   3. no chunk triggered the loop detector  (A0: no repetition loop)
+        bad_stops = {"max_tokens", "loop_break"}
+        clean_trace = bool(
+            reward == 1
+            and not any(c["stopped_by"] in bad_stops for c in chunks)
+        )
+
+        all_records.append({
             "problem_id":   prob["problem_id"],
             "difficulty":   prob.get("difficulty"),
             "prompt":       prob["prompt"],
@@ -409,36 +396,29 @@ def run_traces(args: argparse.Namespace) -> None:
             "chunks":       chunks,
             "predicted":    pred,
             "reward":       reward,
-        }
-        record["training_ready"] = _is_training_ready(record)
-        # Print why a correct trace was excluded from training (useful at L4/L5)
-        if reward == 1 and not record["training_ready"]:
-            mt = [i+1 for i, c in enumerate(chunks) if c["stopped_by"] == "max_tokens"]
-            print(f"     ⚠ training_ready=False  (reward=1 but max_tokens on chunks {mt})",
-                  flush=True)
-        all_records.append(record)
+            "clean_trace":  clean_trace,
+        })
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    n_correct       = sum(r["reward"]          for r in all_records)
-    n_train_ready   = sum(r["training_ready"]  for r in all_records)
-    n_chunks_list   = [r["n_chunks"]    for r in all_records]
-    stop_reasons    = [r["chunks"][-1]["stopped_by"] for r in all_records if r["chunks"]]
+    n_correct     = sum(r["reward"]      for r in all_records)
+    n_clean       = sum(r["clean_trace"] for r in all_records)
+    n_chunks_list = [r["n_chunks"]       for r in all_records]
+    stop_reasons  = [r["chunks"][-1]["stopped_by"] for r in all_records if r["chunks"]]
 
     print(f"\n{'═'*80}", flush=True)
     print(f"SUMMARY  —  {n_correct}/{len(all_records)} correct  "
-          f"({100*n_correct/max(len(all_records),1):.1f}%)  |  "
-          f"training_ready={n_train_ready}/{len(all_records)}  "
-          f"({100*n_train_ready/max(len(all_records),1):.1f}%)", flush=True)
+          f"({100*n_correct/max(len(all_records),1):.1f}%)", flush=True)
+    print(f"           {n_clean}/{len(all_records)} clean traces  "
+          f"(reward=1 AND no max_tokens cut AND no loop_break)  "
+          f"→ usable for training", flush=True)
 
-    # Per-difficulty breakdown (correct | training-ready)
-    by_diff: dict[int, list] = {}
+    # Per-difficulty breakdown
+    by_diff: dict[int, list[int]] = {}
     for r in all_records:
-        by_diff.setdefault(r["difficulty"], []).append(r)
+        by_diff.setdefault(r["difficulty"], []).append(r["reward"])
     for d in sorted(by_diff):
-        rs = by_diff[d]
-        n_ok  = sum(r["reward"]         for r in rs)
-        n_tr  = sum(r["training_ready"] for r in rs)
-        print(f"  L{d}: {n_ok}/{len(rs)} correct  {n_tr}/{len(rs)} training_ready", flush=True)
+        rw = by_diff[d]
+        print(f"  L{d}: {sum(rw)}/{len(rw)}", flush=True)
 
     print(f"\nChunk count distribution:", flush=True)
     from collections import Counter
@@ -471,19 +451,9 @@ def run_traces(args: argparse.Namespace) -> None:
     if args.out:
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        # Full dump (all records, including reward=0 and non-training-ready) — for diagnostics.
         with open(out_path, "w") as f:
             json.dump(all_records, f, indent=2)
-        print(f"\nAll records written to {out_path}", flush=True)
-
-        # Training-ready subset: reward=1, no max_tokens chunk.
-        # This is the file the training pipeline should consume.
-        train_path = out_path.with_stem(out_path.stem + "_training")
-        training_records = [r for r in all_records if r["training_ready"]]
-        with open(train_path, "w") as f:
-            json.dump(training_records, f, indent=2)
-        print(f"Training-ready records ({len(training_records)}) written to {train_path}",
-              flush=True)
+        print(f"\nRecords written to {out_path}", flush=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

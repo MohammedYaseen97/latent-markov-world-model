@@ -6,163 +6,156 @@ epistemic state models for RL post-training. The full proposal is in
 
 ---
 
-RL post-training (GRPO, PPO, RLVR) improves reasoning models by running them on hard
-problems and rewarding correct answers. It works — up to a point. Yue et al. (NeurIPS 2025)
-documented a capability ceiling: RLVR gets better at finding paths the base model could
-already take, but stops expanding what the model can actually solve. Yuan et al. (2026)
-traced the root cause to the state representation. The policy's state is the full token
-history — an ever-growing sequence of everything generated so far. This is not a Markov
-state. It gives the policy no compact model of *where it is* in the solution process, only
-*what it has said*. Yuan et al. showed that introducing an explicit Markov state breaks
-the ceiling — but only by constructing it by hand from symbolic task structure. For open-ended
-reasoning like mathematics, there is no symbolic structure to construct from. The Markov
-state has to be *discovered*.
+RL post-training (GRPO, PPO, RLVR) improves reasoning models — up to a point. Yue et al.
+(NeurIPS 2025) documented a capability ceiling: RLVR gets better at finding paths the base
+model could already take, but stops expanding what the model can actually solve. Yuan et al.
+(2026) traced this to the state representation. The policy's state is the full token history —
+an ever-growing sequence with no compact model of *where it is* in the solution. They showed
+that introducing an explicit Markov state breaks the ceiling, but only by constructing it by
+hand from symbolic task structure. For open-ended reasoning like mathematics, there is no
+symbolic structure to extract. The Markov state has to be *discovered*.
 
 **This project tests whether a learned latent state, extracted from the model's own hidden
 representations, can serve as that Markov state and break the ceiling on hard mathematics.**
 
 ---
 
-## The Experiment
+## Experimental Design
 
-The core claim is that if you compress what the model has generated so far into a compact
-latent vector `z`, and condition each new reasoning chunk on that vector instead of the
-full token history, the policy gains a navigable representation of solution-space position.
-To test this claim in isolation from confounds, the project runs four arms — identical
-in every dimension except the state representation:
+Four arms, identical in every dimension except the state representation:
 
 | Arm | State fed to the policy |
 |-----|------------------------|
 | `baseline_grpo` | Full token history (standard RLVR — the documented ceiling) |
 | `token_markov_grpo` | Textual Markov state carryover in token space (Markovian Thinker, ICLR 2026) |
 | `latent_grpo` | Learned compact latent `z_h`, injected as a soft prefix at each chunk boundary |
-| `latent_grpo_uncertainty` | Same as above, plus a KL-based intrinsic exploration bonus |
+| `latent_grpo_uncertainty` | Same as above, plus a KL-based intrinsic exploration bonus (runs after Arm 3 Phase 1) |
 
-The token-Markov arm is the critical ablation: it has the same chunked generation
-structure and explicit Markov state as the latent arm, but entirely in text space with
-no encoder. Whatever the token-Markov arm improves over baseline is attributable to
-chunking and approximate Markov structure. Whatever the latent arm improves beyond that
-is attributable to the latent representation alone.
+The token-Markov arm is the critical ablation: it tests whether Markov structure in text space
+alone (no encoder, no latent) accounts for any gains. Whatever the latent arm improves beyond
+that is attributable to the latent representation alone.
 
-All arms train on Qwen2.5-1.5B-Instruct, evaluated on a pool of MATH Level 5 problems
-for which the pretrained model scores `pass@128 = 0` — problems the base model
-genuinely cannot solve. **Primary metric: `pass@128`.**
+All arms train on Qwen2.5-1.5B-Instruct, evaluated on a held-out pool of MATH Level 5 problems
+for which the base model scores `pass@128 = 0`. **Primary metric: `pass@128`.**
 
 ---
 
-## How the Latent Arm Works
+## Architecture
 
-Each reasoning trace is broken into chunks. After generating chunk `h`, the model's
-final-layer hidden state at the last token is passed through a small learned encoder
-that compresses it into a 64-dimensional latent vector `z_h`. At the start of chunk
-`h+1`, that vector is projected into a single soft prefix embedding and prepended to
-the model's input. The model never sees prior chunk tokens — only the prefix.
+Each reasoning trace is broken into chunks. After generating chunk `h`, the model's final-layer
+hidden state at the last token is passed through a small learned encoder into a compact vector
+`z_h`. At the start of chunk `h+1`, that vector is projected into a single soft prefix embedding
+prepended to the model's input. The model never sees prior chunk tokens — only the prefix.
 
 ```
-chunk h:    backbone([sys_prompt | problem | chunk_1 | ... | chunk_h])
-              └── last_token(final hidden layer)
-                     └── Encoder (1536 → 512 → 128 → 64)
-                            └── z_h  [64-dim]
-                                   └── ZInjector (64 → 1536)
-                                          └── prefix_embed  [1 × 1536]
+chunk h:   backbone([sys_prompt | problem | chunk_1 | ... | chunk_h])
+             └── last_token(final hidden layer)
+                    └── Encoder (1536 → 512 → 128 → z_dim)
+                           └── z_h
+                                  └── ZInjector (z_dim → 1536)
+                                         └── prefix_embed  [1 × 1536]
 
-chunk h+1:  backbone([prefix_embed | generate...])   ← no prior tokens visible
+chunk h+1: backbone([prefix_embed | generate...])   ← no prior tokens visible
 ```
 
-This enforces the Markov property structurally at the code level — not as a regularizer
-or a loss term, but as a hard constraint on what the policy can condition on. The vector
-`z_h` must carry all information needed to continue reasoning; if it doesn't, the policy
-fails. This is the hypothesis under test.
+This enforces the Markov property structurally — not as a regulariser or a loss term, but as a
+hard constraint on what the policy can condition on. `z_h` must carry all information needed to
+continue reasoning; if it doesn't, the policy fails. This is the hypothesis under test.
 
 Training has two phases:
 
-**Phase 0 — Encoder pretraining:** The frozen teacher (Qwen, full context access)
-generates step-by-step reasoning traces on easy problems (MATH L1–L4). The student
-trains to predict teacher tokens conditioned on `z_prefix` using cross-entropy loss,
-with LoRA adapters (r=16) on the backbone. This initialises the encoder and injector
-before any RL signal is available. Without this step, z is random noise and Phase 1
-GRPO produces zero-gradient steps from the start.
+**Phase 0 — Encoder pretraining:** A stronger teacher (Qwen3-8B, full context access) generates
+semantic step-by-step traces on easy problems (MATH L1–L4). The student (Qwen2.5-1.5B) trains to
+predict teacher tokens conditioned on `z_prefix` using cross-entropy loss, with LoRA adapters on
+the backbone.
 
-**Phase 1 — On-policy GRPO:** The fully-initialised model trains on the MATH Level 5
-hard pool with strict Markov generation — no prior tokens, only `z_prefix`. No crutch,
-no shortcuts.
+**Phase 1 — On-policy GRPO:** The fully-initialised model trains on the hard Level 5 pool under
+strict Markov generation — no prior tokens, only `z_prefix`.
 
 ---
 
-## Current Results
+## Progress
 
-**Baseline GRPO** (Arm 1) is complete: `pass@128 = 16.20%` on the Level 5 hard pool
-after 200 training steps. This is the ceiling to beat.
+### Arm 1 — Baseline GRPO (complete)
 
-**Latent arm** (Arm 3) is in active development. Phase 0 is the current blocker.
+`pass@128 = 16.19%` on the Level 5 hard pool after 200 GRPO steps. This is the ceiling to beat.
 
-The encoder and LoRA adapters converge cleanly under teacher forcing — cross-entropy
-reaches ~1.5 nats on held-out L1–L4 problems. But when the student is switched to
-autoregressive generation conditioned on `z_prefix` alone, reward rate collapses to
-~1.25% on L1–L4 problems that the teacher solves at ~60%. This is the exposure-bias
-gap: the model learns to predict the next token given teacher-provided context, but
-has not learned to generate coherently from its own context. CE loss and autoregressive
-reward measure fundamentally different capabilities.
+### Arm 2 — Token-Markov GRPO (implemented, not yet run)
 
-### What we've ruled out
+Code complete. Serves as the critical ablation once latent Phase 1 results are available.
 
-Systematic debugging over five training runs has eliminated the following explanations:
+### Arm 3 — Latent arm (Phase 0 in progress — at a specific diagnosed decision point)
 
-| Hypothesis tested | Outcome |
-|------------------|---------|
-| Gradient dilution — CE averaged over all ~300 tokens per chunk dilutes the z-conditioning gradient, so the encoder never receives a strong training signal | Introduced `z_anchor_tokens`: supervise only the first 32 positions where `z_prefix` dominates. CE still converges (~3 nats at anchor), generation still fails. |
-| Under-training — 400 steps insufficient at reduced supervision density | Doubled to 800 steps with `lr_lora=3e-4`. Mid-training probes peaked at 5% then regressed to 0% by step 300. Under-training is not the bottleneck. |
-| Over-adaptation — LoRA over-specialises on anchor positions, destroying answer-format generation at late positions | Cosine LR warmdown implemented (3e-4 → 3e-5 over last 200 steps). Under evaluation. |
-| Teacher data quality — hard-cut 341-token chunks produce mid-sentence boundaries, poisoning training data | Redesigned teacher to generate one step at a time until model EOS; confirmed clean boundaries at ~60% teacher accuracy. |
-| Probe bias — generation probes always tested the same hard problems, masking real progress | Changed to random resample from held-out pool at each probe step. Probe variance confirmed not the issue. |
-| Results inflated by crutch — earlier architecture gave backbone access to prior chunk tokens alongside z, making z optional | Removed in v3 (now strictly `z_prefix` only). Chunk-1 crutch rate = 0% confirmed across all recent runs. |
+Phase 0 is the current blocker. Here is the full history.
 
-### The key architectural question
+**v1 — VAE-ELBO.** The original architecture used a full VAE with a KL term. KL weight = 1.0
+was too aggressive: the encoder learned to output `σ² ≈ 1.0` everywhere (posterior collapse to
+prior), making z near-constant. `L_trans = 0.015` — trivially low because z barely changed,
+not because transitions were clean. Decision: the decoder is unnecessary machinery. Drop the KL,
+switch to a deterministic `z = μ`, and fix the benchmark resolution (40 problems / pass@1024 →
+350 problems / pass@128).
 
-The predecessor architecture (v2) — which had `L_trans` (a Markov consistency loss
-on latent trajectories), `L_out` (a calibration loss), and a generation-time crutch
-— reached `pass@128 = 8.42%`. That result is contaminated: the crutch meant z was
-optional, so the backbone likely solved most problems without using z at all. The UMAP
-latent geometry and pass@128 numbers from v2 cannot be trusted as evidence of z
-encoding anything.
+**v2 — L_trans + L_out + crutch.** Redesigned Phase 0 with Markov consistency loss (`L_trans`),
+an outcome head (`L_out`), and CE distillation. Result: `pass@128 = 8.42%`. On closer
+inspection this number is contaminated: the generation-time context was `[z_prefix | prev_chunk |
+generate]` — the backbone could attend to prior chunk tokens and ignore `z` entirely. z was
+optional. 8.42% is also below the baseline (16.19%), which is expected: without the crutch
+removed, the model had no reason to use z, so it essentially ran as a weaker version of
+standard generation. Decision: remove the crutch. Force strict Markov: `[z_prefix | generate]`
+only. If z doesn't encode enough, the model fails. This is what makes z mandatory and the
+hypothesis testable. The drop in reward from crutch to strict Markov is expected — it is the
+cost of making the constraint real.
 
-When the crutch was removed and `L_trans` replaced with teacher-forced CE distillation
-(v3 onward), performance dropped to ≤1.25% student reward. The open question is whether
-`L_trans` was enforcing a structural prior on latent trajectories that CE distillation
-alone cannot replicate — not because the capacity is wrong, but because CE provides no
-direct signal about temporal consistency of z across chunks.
+**v3 — Strict Markov, CE distillation (current).** Crutch removed. `L_trans` and `L_out`
+dropped — without the crutch, later-chunk representations are uninformative at the start of
+training; CE distillation from a reliable teacher provides dense signal regardless. Three Phase 0
+runs:
 
-### What's next
+| Run | Config | Student reward | Diagnosis |
+|-----|--------|---------------|-----------|
+| 1 | Full CE, 400 steps | ~1.25% | **Gradient dilution** — CE averaged over 341 tokens/chunk; z-conditioning gradient diluted ~341× by the LM-from-context signal at later positions |
+| 2 | z_anchor=32, 400 steps | 0% | **Under-training** — at z_anchor density, 400 steps × 32 supervised positions is too sparse; probe pool was also fixed (always same problems, masking progress) |
+| 3 | z_anchor=32, 800 steps, lr=3e-4, probe resample | peaked 5%, regressed to 0% | **Over-adaptation** — LoRA over-specialises on z_anchor positions, disrupting `\boxed{}` generation at tail positions; LR warmdown implemented |
 
-The assumption list is being re-evaluated in dependency order
-(see `reports/phase0_scratch_notes.md` for the full A0–A8 list and complete run history).
-Primary candidates:
+After three runs failing the sanity gate (`student_reward_rate ≥ 10%`, `coverage_ratio ≥ 30%`
+of teacher), the pattern was clear: CE loss converges (~1.5 nats) but autoregressive generation
+from `z_prefix` alone fails. The gap between teacher-forced training and autoregressive inference
+is not closing. Rather than run again on unvalidated foundations, the decision was made to stop
+and verify the ground assumptions of the data pipeline first.
 
-1. Reinstate a lightweight transition objective alongside CE — does latent temporal
-   consistency need to be directly supervised, or does CE on z-conditioned generations
-   imply it?
-2. Increase `latent_dim` beyond 64 — the 1536→64 compression is 24×. If z cannot
-   represent solution-space position at 64 dims, no amount of training fixes it.
-3. Close the exposure-bias gap explicitly — scheduled sampling (gradually mixing
-   student-generated tokens into teacher-forced positions) or on-policy CE mixing.
+**Assumption verification.** A standalone harness (`scripts/check_assumptions.py`) was built
+to test every ground assumption before running again. 90 traces from Qwen3-8B across L1–L5.
 
----
+| ID | Assumption | Status |
+|----|-----------|--------|
+| A0 | Teacher generates multiple distinct reasoning steps | ✅ Confirmed |
+| A1 | Chunk boundaries fall at natural semantic step-ends | ✅ Confirmed |
+| A9 | Teacher accuracy sufficient for data generation | ✅ Confirmed — 97% / 83% (L1–L3 / L4) |
+| A-prompt | Teacher reliably follows "one step then stop" | ✅ Confirmed |
+| A-cont | Continuation message allows natural termination | ✅ Confirmed |
+| A-grader | `answers_equivalent` correctly scores all LaTeX variants | ✅ Confirmed |
+| A-filter | Clean traces are identifiable and separable from corrupted ones | ✅ Confirmed |
+| A2 | Last-token hidden state `repr_h` encodes position in solution space | ⏳ Pending |
+| A3 | Encoder produces diverse z vectors (no collapse) | ⏳ Pending |
+| A4 | Student generates coherent step N+1 from `z_prefix` alone | ⏳ Pending — this IS Phase 0 |
+| A5 | z_dim sufficient for multi-step reasoning | ⚠️ Partial — `z_transition_gap = -0.027`; 64-dim too compressed |
+| A3-pool | Last-token repr is sufficient; mean-pool not needed | ⏳ Pending (low priority) |
+| A7 | One virtual prefix token is sufficient | ⏳ Pending (low priority) |
+| A8 | Linear Z-injector is expressive enough | ⏳ Pending (low priority) |
+| A-enc-ag | Same encoder weights generalise across all chunk transitions | ⏳ Pending (low priority) |
+| A-lora | LoRA r=16 has capacity for z-conditioning | ⚠️ Partial — near-zero probe rate across all runs |
+| A6 | Exposure bias is manageable; teacher forcing transfers to generation | 🔍 Primary open blocker — Phase 0 |
+| A-markov | z is a sufficient statistic; context reset loses nothing | 🔍 Core claim, unproven — Phase 1 |
+| A-reset | Context reset is lossless (not destructive) | 🔍 Design choice, unproven — Phase 1 |
+| A-repr2 | `repr_h` under teacher forcing matches `repr_h` at inference | 🔍 Known exposure-bias risk — Phase 1 |
+| A-mlen | First-order Markov length is sufficient | ⏳ Pending (deferred to Phase 1) |
 
-## Scaling to Larger Models
-
-A separate architectural issue has emerged that motivates scaling the entire experiment
-to 7B or 14B models. The step-by-step teacher prompt instructs the model to "complete
-one reasoning step, then stop" — using the model's own EOS as the chunk boundary.
-This is the right mechanism: it avoids hard token-count cuts that split mid-LaTeX and
-corrupt training data. But it requires the model to self-regulate step length, which
-demands reliable instruction-following capacity. The 1.5B model cannot do this
-consistently — it runs into the token limit mid-calculation, reverting to the same
-hard-boundary problem we designed around.
-
-This is not a motivation to scale for performance. It is a confound: the latent Markov
-hypothesis cannot be cleanly tested if the teacher data is corrupted by boundary
-artifacts that a larger model would not produce. The planned shift to 7B/14B applies
-uniformly to the baseline and all arms, preserving the ablation's comparative structure.
+The confirmed assumptions (A0–A-filter) rule out the data pipeline as the failure source. The
+⏳ architecture assumptions (A2, A3, A4, A3-pool, A7, A8, A-enc-ag, A-mlen) are the Phase 0
+and Phase 1 test plan — they are pending by design, not by oversight. The ⚠️ and 🔍 rows
+(A5, A-lora, A6) point directly to the next run: `latent_dim: 128`, `lora_r: 32`,
+`z_tail_tokens: 32`. The teacher was also upgraded to Qwen3-8B for verification, confirming
+cleaner semantic traces from a stronger model — justifying it for data generation going forward.
 
 ---
 
@@ -174,26 +167,22 @@ configs/
   train_baseline_grpo.yaml         Baseline arm
   train_token_markov_grpo.yaml     Token-Markov arm
   train_latent_grpo.yaml           Latent arm (Phase 0 + Phase 1)
-  train_latent_grpo_smoke.yaml     Smoke test (2 steps, end-to-end validation)
 
 data/
-  math_easy_pool.jsonl             MATH L1–L4, Phase 0 pretraining (built by script)
-  math_level5_hard_pool.jsonl      MATH L5, pass@128=0 filter (built by script)
+  math_easy_pool.jsonl             MATH L1–L4, Phase 0 pretraining
+  math_level5_hard_pool.jsonl      MATH L5, pass@128=0 filter
 
 reports/
   latent_markov_design.md          Full architecture specification
-  phase0_scratch_notes.md          Debugging log: assumptions, run history, all numbers
+  latent_arm_worklog.md            Full run history, assumptions, root-cause map, next run plan
   ablation_core.md                 Official results table
 
 scripts/
   train_latent.py                  Phase 0 pretraining + Phase 1 GRPO
   train_baseline.py                Baseline GRPO
-  train_token_markov.py            Token-Markov GRPO
+  check_assumptions.py             Teacher trace verification harness
   eval_passk.py                    pass@k evaluation (all arms)
-  run_phase0_sanity.py             Phase 0 gate: CE, z-variance, student vs teacher
-  eval_markov_diagnostics.py       z-consistency diagnostics
-  check_assumptions.py             Teacher trace inspection, assumption verification
-  run_ablation_table.py            Aggregate artifacts/ into results table
+  run_phase0_sanity.py             Phase 0 gate: CE, z-variance, student vs teacher reward
   prepare_easy_pool.py             Build Phase 0 pool (MATH L1–L4)
   prepare_math_level5_pool.py      Build eval pool (MATH L5, filtered)
 
@@ -202,15 +191,9 @@ src/
     vae_state_encoder.py           LatentStateEncoder + ZInjector
     token_markov_state.py          Token-space Markov state
   training/
-    grpo_baseline.py               Baseline GRPO loop
+    grpo_baseline.py               Baseline GRPO loop + reward grader
     grpo_token_markov.py           Token-Markov GRPO loop
     grpo_latent.py                 Latent arm: Phase 0 distillation + Phase 1 GRPO
-    reward_bonus.py                KL intrinsic bonus (stub, arm 4)
-  utils/
-    config_loader.py               YAML extends + deep merge
-    seeding.py                     Deterministic seeding
-
-artifacts/                         Per-run directories (created at runtime)
 ```
 
 ---
@@ -220,17 +203,15 @@ artifacts/                         Per-run directories (created at runtime)
 ```bash
 pip install -r requirements.txt
 
-# Build data pools (one-time, ~2h)
+# Build data pools (one-time)
 python scripts/prepare_easy_pool.py --levels 1 2 3 4
 python scripts/prepare_math_level5_pool.py \
     --model-id Qwen/Qwen2.5-1.5B-Instruct \
     --output data/math_level5_hard_pool.jsonl
 
-# Smoke test — verify pipeline end-to-end, minimal compute
-python scripts/train_latent.py --config configs/train_latent_grpo_smoke.yaml --phase 0
-
-# Inspect teacher traces (what training data looks like)
-python scripts/check_assumptions.py --n 20 --step_tokens 341 --max_chunks 10
+# Verify teacher trace quality before training
+python scripts/check_assumptions.py --step traces --n 30 --max-step-tok 512 \
+    --model Qwen/Qwen3-8B --levels 1 2 3 4 --out reports/traces_check.json
 
 # Phase 0 pretraining
 python scripts/train_latent.py --config configs/train_latent_grpo.yaml --phase 0
@@ -259,6 +240,6 @@ python scripts/eval_passk.py \
 |--|--|
 | **Yue et al. NeurIPS 2025** | Documents the RLVR capability ceiling empirically. The problem this experiment is designed to break. |
 | **Yuan et al. 2026 — Markov States** | Shows explicit Markov states break the ceiling on symbolic tasks. Motivates learning the state instead of constructing it. |
-| **Markovian Thinker (ICLR 2026)** | Textual Markov state carryover via RL. Arm 2 is the direct ablation: same Markov structure, no latent. |
-| **Coconut (Meta, 2024)** | Continuous thought tokens for reasoning. Inference-time adaptation only; no world model; no RL exploration signal. |
+| **Markovian Thinker (ICLR 2026)** | Textual Markov state carryover via RL. Arm 2 is the direct ablation: same structure, no latent. |
+| **Coconut (Meta, 2024)** | Continuous thought tokens for reasoning. Inference-time only; no world model; no RL exploration signal. |
 | **Dreamer / DIAMOND / JEPA** | Latent world models for physical environments. Same architectural DNA — but they model external state; this models the agent's epistemic state over the problem. |
